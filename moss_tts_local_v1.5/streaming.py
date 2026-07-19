@@ -14,6 +14,7 @@ import json
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -59,6 +60,13 @@ class StreamingRuntime:
     attn_implementation: str
     codec_weight_dtype: str
     codec_compute_dtype: str
+    reference_audio_cache: OrderedDict[tuple[str, int, int, int], torch.Tensor] = field(
+        default_factory=OrderedDict, repr=False
+    )
+    reference_audio_cache_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    codec_execution_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    reference_audio_cache_hits: int = 0
+    reference_audio_cache_misses: int = 0
 
 
 @dataclass
@@ -289,6 +297,7 @@ def _sample_next_token_topk_subspace(
     top_p: Optional[float],
     seen_mask: Optional[torch.Tensor] = None,
     repetition_penalty: float = 1.0,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.LongTensor:
     scores = logits.float()
     scores = _apply_repetition_penalty_with_seen_mask(scores, seen_mask, repetition_penalty)
@@ -310,10 +319,11 @@ def _sample_next_token_topk_subspace(
             remove_mask[..., 0] = False
             top_values = top_values.masked_fill(remove_mask, -torch.inf)
         probs = torch.softmax(top_values, dim=-1)
-        sampled_offsets = torch.multinomial(probs, num_samples=1)
+        sampled_offsets = torch.multinomial(probs, num_samples=1, generator=generator)
         return top_indices.gather(dim=-1, index=sampled_offsets).squeeze(-1)
 
-    return model._sample_next_token(
+    return _sample_next_token_with_generator(
+        model=model,
         logits=scores,
         do_sample=do_sample,
         temperature=temperature,
@@ -321,7 +331,60 @@ def _sample_next_token_topk_subspace(
         top_p=top_p,
         previous_token_ids=None,
         repetition_penalty=1.0,
+        generator=generator,
     )
+
+
+def _sample_next_token_with_generator(
+    *,
+    model: Any,
+    logits: torch.Tensor,
+    do_sample: bool,
+    temperature: float,
+    top_k: Optional[int],
+    top_p: Optional[float],
+    previous_token_ids: Optional[torch.LongTensor] = None,
+    repetition_penalty: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+) -> torch.LongTensor:
+    scores = logits.float()
+    scores = model._apply_repetition_penalty(scores, previous_token_ids, repetition_penalty)
+    if not do_sample:
+        return torch.argmax(scores, dim=-1)
+    if float(temperature) <= 0:
+        raise ValueError("temperature must be positive when do_sample=True.")
+    scores = scores / float(temperature)
+    scores = model._filter_logits(scores, top_k=top_k, top_p=top_p)
+    probs = torch.softmax(scores, dim=-1)
+    return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+
+
+def _sample_next_assistant_text_token_with_generator(
+    *,
+    model: Any,
+    local_hidden_states: torch.Tensor,
+    do_sample: bool,
+    temperature: float,
+    top_k: Optional[int],
+    top_p: Optional[float],
+    generator: Optional[torch.Generator],
+) -> torch.LongTensor:
+    if model._use_binary_local_text_head() and model.local_text_lm_head is not None:
+        logits = model.local_text_lm_head(local_hidden_states)
+    else:
+        candidate_ids = model._local_text_candidate_ids(local_hidden_states.device)
+        logits = model.text_lm_head(local_hidden_states).index_select(dim=-1, index=candidate_ids)
+    sampled_indices = _sample_next_token_with_generator(
+        model=model,
+        logits=logits,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        generator=generator,
+    )
+    candidate_ids = model._local_text_candidate_ids(logits.device)
+    return candidate_ids[sampled_indices]
 
 
 def build_processor_inputs(
@@ -350,9 +413,10 @@ def build_processor_inputs(
 
     prompt_audio_codes: Optional[torch.Tensor] = None
     if mode == "voice_clone":
+        reference_codes = cached_reference_audio_codes(runtime, prompt_audio_path)
         conversation = [
             processor.build_user_message(
-                reference=[prompt_audio_path],
+                reference=[reference_codes],
                 **user_kwargs,
             )
         ]
@@ -383,6 +447,30 @@ def build_processor_inputs(
     return _move_batch_to_device(batch, runtime.tts_device), prompt_audio_codes, processor_mode
 
 
+def cached_reference_audio_codes(runtime: StreamingRuntime, prompt_audio_path: str) -> torch.Tensor:
+    """Encode a clone reference once and reuse its CPU audio codes across requests."""
+    resolved = Path(prompt_audio_path).resolve(strict=True)
+    stat = resolved.stat()
+    key = (str(resolved), int(stat.st_mtime_ns), int(stat.st_size), int(runtime.n_vq))
+    with runtime.reference_audio_cache_lock:
+        cached = runtime.reference_audio_cache.get(key)
+        if cached is not None:
+            runtime.reference_audio_cache.move_to_end(key)
+            runtime.reference_audio_cache_hits += 1
+            return cached
+
+        with runtime.codec_execution_lock:
+            encoded = runtime.processor.encode_audios_from_path(str(resolved), n_vq=runtime.n_vq)[0]
+        encoded = encoded.contiguous().cpu().long()
+        for old_key in [item for item in runtime.reference_audio_cache if item[0] == str(resolved)]:
+            runtime.reference_audio_cache.pop(old_key, None)
+        runtime.reference_audio_cache[key] = encoded
+        while len(runtime.reference_audio_cache) > 32:
+            runtime.reference_audio_cache.popitem(last=False)
+        runtime.reference_audio_cache_misses += 1
+        return encoded
+
+
 @torch.inference_mode()
 def iter_generate_frames(
     model: Any,
@@ -399,6 +487,7 @@ def iter_generate_frames(
     audio_top_k: int,
     audio_repetition_penalty: float,
     use_kv_cache: bool = True,
+    sampling_generator: Optional[torch.Generator] = None,
 ) -> Generator[StreamingEvent, None, None]:
     n_vq = int(model.config.n_vq)
     max_new_frames = int(max_new_frames)
@@ -473,12 +562,14 @@ def iter_generate_frames(
             local_global_hidden_states.unsqueeze(1)
         )
         local_hidden_states = local_prefix_hidden_states[:, -1, :]
-        next_text_tokens = model._sample_next_assistant_text_token(
+        next_text_tokens = _sample_next_assistant_text_token_with_generator(
+            model=model,
             local_hidden_states=local_hidden_states,
             do_sample=do_sample,
             temperature=text_temperature,
             top_k=text_top_k,
             top_p=text_top_p,
+            generator=sampling_generator,
         )
         should_continue = next_text_tokens.eq(int(model.config.audio_assistant_slot_token_id)) & ~finished
         finished = finished | next_text_tokens.eq(int(model.config.audio_end_token_id))
@@ -502,9 +593,11 @@ def iter_generate_frames(
                         else seen_audio_token_masks[channel_index]
                     ),
                     repetition_penalty=audio_repetition_penalty,
+                    generator=sampling_generator,
                 )
             else:
-                channel_token = model._sample_next_token(
+                channel_token = _sample_next_token_with_generator(
+                    model=model,
                     logits=channel_logits,
                     do_sample=do_sample,
                     temperature=audio_temperature,
@@ -516,6 +609,7 @@ def iter_generate_frames(
                         else generated_audio_history[:, :generated_frame_count, channel_index]
                     ),
                     repetition_penalty=audio_repetition_penalty,
+                    generator=sampling_generator,
                 )
             next_frame_tokens.append(channel_token)
             if seen_audio_token_masks is not None:
@@ -648,8 +742,9 @@ def warmup_streaming_runtime(runtime: StreamingRuntime, *, codec_frames: int = 4
     try:
         frames = max(1, int(codec_frames))
         dummy_codes = torch.zeros((frames, runtime.n_vq), dtype=torch.long)
-        with StatefulCodecDecoder(runtime.processor.audio_tokenizer, n_vq=runtime.n_vq) as decoder:
-            _ = decoder.decode_codes(dummy_codes.to(device=decoder.device, dtype=torch.long))
+        with runtime.codec_execution_lock:
+            with StatefulCodecDecoder(runtime.processor.audio_tokenizer, n_vq=runtime.n_vq) as decoder:
+                _ = decoder.decode_codes(dummy_codes.to(device=decoder.device, dtype=torch.long))
         if runtime.codec_device.type == "cuda":
             torch.cuda.synchronize(runtime.codec_device)
     except Exception as exc:  # noqa: BLE001
@@ -738,10 +833,10 @@ def synthesize_stream(
     *,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> Generator[StreamingEvent, None, None]:
+    sampling_generator: Optional[torch.Generator] = None
     if request.seed is not None and int(request.seed) >= 0:
-        torch.manual_seed(int(request.seed))
-        if runtime.tts_device.type == "cuda" or runtime.codec_device.type == "cuda":
-            torch.cuda.manual_seed_all(int(request.seed))
+        sampling_generator = torch.Generator(device=runtime.tts_device)
+        sampling_generator.manual_seed(int(request.seed))
 
     batch, prompt_audio_codes, processor_mode = build_processor_inputs(runtime, request)
     output_dir = Path(output_dir)
@@ -775,29 +870,30 @@ def synthesize_stream(
     first_audio_emitted_at: Optional[float] = None
     generated_frames_at_first_audio = 0
     final_audio_token_ids: Optional[torch.Tensor] = None
-    decode_input_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=8)
+    decode_input_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue()
     decode_output_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
     def _codec_worker() -> None:
         try:
-            with StatefulCodecDecoder(runtime.processor.audio_tokenizer, n_vq=runtime.n_vq) as decoder:
-                if prompt_audio_codes is not None and prompt_audio_codes.numel() > 0:
-                    _ = decoder.decode_codes(prompt_audio_codes.to(device=decoder.device, dtype=torch.long))
-                while True:
-                    item = decode_input_queue.get()
-                    if item is None:
-                        break
-                    codes = item["codes"]
-                    audio = decoder.decode_codes(codes.to(device=decoder.device, dtype=torch.long))
-                    decode_output_queue.put(
-                        {
-                            "type": "audio",
-                            "waveform": audio.detach().cpu(),
-                            "generated_frames": int(item["generated_frames"]),
-                            "lead_seconds": float(item.get("lead_seconds", 0.0)),
-                            "chunk_frames": int(codes.shape[0]),
-                        }
-                    )
+            with runtime.codec_execution_lock:
+                with StatefulCodecDecoder(runtime.processor.audio_tokenizer, n_vq=runtime.n_vq) as decoder:
+                    if prompt_audio_codes is not None and prompt_audio_codes.numel() > 0:
+                        _ = decoder.decode_codes(prompt_audio_codes.to(device=decoder.device, dtype=torch.long))
+                    while True:
+                        item = decode_input_queue.get()
+                        if item is None:
+                            break
+                        codes = item["codes"]
+                        audio = decoder.decode_codes(codes.to(device=decoder.device, dtype=torch.long))
+                        decode_output_queue.put(
+                            {
+                                "type": "audio",
+                                "waveform": audio.detach().cpu(),
+                                "generated_frames": int(item["generated_frames"]),
+                                "lead_seconds": float(item.get("lead_seconds", 0.0)),
+                                "chunk_frames": int(codes.shape[0]),
+                            }
+                        )
         except BaseException as exc:  # noqa: BLE001
             decode_output_queue.put({"type": "error", "error": repr(exc)})
         finally:
@@ -912,6 +1008,7 @@ def synthesize_stream(
             audio_top_k=int(request.top_k),
             audio_repetition_penalty=float(request.repetition_penalty),
             use_kv_cache=True,
+            sampling_generator=sampling_generator,
         ):
             for audio_event in _drain_decoder_outputs(block=False):
                 yield audio_event

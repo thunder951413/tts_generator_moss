@@ -49,6 +49,14 @@ torch-runtime = [
     "accelerate>=1.10.1",
 ]
 
+# Local FastAPI UI and reproducible Windows deployment helpers.
+local-app = [
+    "fastapi==0.139.2",
+    "uvicorn[standard]==0.51.0",
+    "python-multipart==0.0.32",
+    "huggingface-hub>=1.0.0",
+]
+
 # llama.cpp backend — torch-free core
 llama-cpp = [
     "numpy>=2.0",

@@ -212,5 +212,11 @@ dev/*
 
 # Weights
 weights
+models/
+
+# Local Windows runtimes and service state
+.ffmpeg-runtime/
+logs/
+moss-tts.pid
 
 outputs/*

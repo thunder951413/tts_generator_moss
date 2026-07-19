@@ -10,11 +10,12 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -39,6 +40,7 @@ from streaming import (
     load_runtime,
     synthesize_stream,
 )
+from document_projects import DocumentProjectManager
 
 
 torch.backends.cuda.enable_cudnn_sdp(False)
@@ -47,6 +49,7 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 
 DEFAULT_UPLOAD_DIR = Path("outputs/moss_tts_local_v1_5_uploads")
+DEFAULT_DOCUMENT_PROJECT_DIR = REPO_ROOT / "outputs" / "moss_tts_document_projects"
 DEFAULT_MAX_NEW_TOKENS = 7500
 MODE_CLONE = "Clone"
 MODE_CONTINUE = "Continuation"
@@ -58,6 +61,7 @@ ZH_TOKENS_PER_CHAR = 3.098411951313033
 EN_TOKENS_PER_CHAR = 0.8673376262755219
 REFERENCE_AUDIO_DIR = REPO_ROOT / "assets" / "audio"
 EXAMPLE_TEXTS_JSONL_PATH = REPO_ROOT / "assets" / "text" / "moss_tts_example_texts.jsonl"
+BAILIAN_VOICES_TSV_PATH = REFERENCE_AUDIO_DIR / "bailian" / "voices.tsv"
 LANGUAGE_TAG_AUTO = "Auto (omit)"
 LANGUAGE_TAG_CHOICES = [
     LANGUAGE_TAG_AUTO,
@@ -139,6 +143,30 @@ def build_example_rows() -> list[dict[str, str]]:
 
 
 EXAMPLE_ROWS = build_example_rows()
+
+
+def build_bailian_voice_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if not BAILIAN_VOICES_TSV_PATH.exists():
+        return rows
+    with open(BAILIAN_VOICES_TSV_PATH, "r", encoding="utf-8-sig") as f:
+        header = next(f, "")
+        for line in f:
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) < 3:
+                continue
+            name, description, filename = parts[:3]
+            audio_path = BAILIAN_VOICES_TSV_PATH.parent / filename
+            if audio_path.exists():
+                rows.append({"name": name, "description": description, "audio_path": str(audio_path)})
+    return rows
+
+
+BAILIAN_VOICE_ROWS = build_bailian_voice_rows()
+DEFAULT_CLONE_AUDIO_PATH = next(
+    (row["audio_path"] for row in BAILIAN_VOICE_ROWS if row["name"] == "龙嫱"),
+    BAILIAN_VOICE_ROWS[0]["audio_path"] if BAILIAN_VOICE_ROWS else "",
+)
 
 
 def _normalize_language(language_tag: str | None) -> str:
@@ -269,6 +297,9 @@ class RuntimeManager:
             "codec_compute_dtype": self.codec_compute_dtype,
             "n_vq": None if self._runtime is None else int(self._runtime.n_vq),
             "sample_rate": None if self._runtime is None else int(self._runtime.sample_rate),
+            "reference_cache_entries": 0 if self._runtime is None else len(self._runtime.reference_audio_cache),
+            "reference_cache_hits": 0 if self._runtime is None else int(self._runtime.reference_audio_cache_hits),
+            "reference_cache_misses": 0 if self._runtime is None else int(self._runtime.reference_audio_cache_misses),
         }
 
     def preload_async(self) -> None:
@@ -309,6 +340,65 @@ class RuntimeManager:
                     raise
                 self._set_status(state="ready")
             return self._runtime
+
+
+class GpuGenerationScheduler:
+    """Bound GPU inference concurrency and prioritize interactive requests."""
+
+    def __init__(self, max_parallel: int = 1) -> None:
+        self.max_parallel = max(1, int(max_parallel))
+        self._condition = threading.Condition()
+        self._active = 0
+        self._waiting_interactive = 0
+        self._waiting_document = 0
+
+    def _acquire(self, priority: str) -> None:
+        interactive = priority == "interactive"
+        with self._condition:
+            if interactive:
+                self._waiting_interactive += 1
+            else:
+                self._waiting_document += 1
+            try:
+                while self._active >= self.max_parallel or (
+                    not interactive and self._waiting_interactive > 0
+                ):
+                    self._condition.wait()
+                self._active += 1
+            finally:
+                if interactive:
+                    self._waiting_interactive -= 1
+                else:
+                    self._waiting_document -= 1
+
+    def _release(self) -> None:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._condition.notify_all()
+
+    def __enter__(self) -> GpuGenerationScheduler:
+        self._acquire("document")
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self._release()
+
+    @contextmanager
+    def interactive_slot(self):
+        self._acquire("interactive")
+        try:
+            yield
+        finally:
+            self._release()
+
+    def status(self) -> dict[str, int]:
+        with self._condition:
+            return {
+                "max_parallel": self.max_parallel,
+                "active": self._active,
+                "waiting_interactive": self._waiting_interactive,
+                "waiting_document": self._waiting_document,
+            }
 
 
 class StreamingJob:
@@ -392,6 +482,7 @@ def create_app(
     codec_compute_dtype: str = "bf16",
     warmup: bool = True,
     preload: bool = True,
+    max_parallel_generations: int = 2,
 ) -> FastAPI:
     runtime_manager = RuntimeManager(
         model_dir=str(model_dir),
@@ -410,6 +501,16 @@ def create_app(
     upload_dir = Path(upload_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     upload_dir.mkdir(parents=True, exist_ok=True)
+    generation_scheduler = GpuGenerationScheduler(max_parallel=max_parallel_generations)
+    ffmpeg_path = shutil.which("ffmpeg") or str(REPO_ROOT / ".ffmpeg-runtime" / "Library" / "bin" / "ffmpeg.exe")
+    document_projects = DocumentProjectManager(
+        root_dir=DEFAULT_DOCUMENT_PROJECT_DIR,
+        runtime_getter=runtime_manager.get,
+        synthesize_fn=synthesize_stream,
+        request_cls=StreamingRequest,
+        generation_lock=generation_scheduler,
+        ffmpeg_path=ffmpeg_path,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -430,6 +531,7 @@ def create_app(
             _html(
                 defaults=defaults,
                 examples=EXAMPLE_ROWS,
+                voices=BAILIAN_VOICE_ROWS,
                 languages=LANGUAGE_TAG_CHOICES,
                 runtime=runtime_manager.status(),
             )
@@ -455,57 +557,58 @@ def create_app(
                 mode=mode_name,
                 streaming_generation=streaming_generation,
             )
-            runtime = runtime_manager.get()
-            job.update(state="running", sample_rate=runtime.sample_rate, channels=2, n_vq=runtime.n_vq)
-            for event in synthesize_stream(runtime, request, output_dir=output_dir):
-                with job.status_lock:
-                    if job.is_closed:
-                        break
-                if event.type == "metadata":
-                    job.update(**event.data)
-                elif event.type == "progress":
-                    job.update(**event.data)
-                elif event.type == "audio":
-                    waveform = event.data["waveform"]
-                    channels = 1 if waveform.ndim == 1 else int(min(2, waveform.shape[0]))
+            with generation_scheduler.interactive_slot():
+                runtime = runtime_manager.get()
+                job.update(state="running", sample_rate=runtime.sample_rate, channels=2, n_vq=runtime.n_vq)
+                for event in synthesize_stream(runtime, request, output_dir=output_dir):
                     with job.status_lock:
-                        if job.status.get("first_audio_at") is None:
-                            job.status["first_audio_at"] = time.time()
-                    if streaming_generation:
-                        _put_stream_audio(job, _pcm16le_bytes(waveform))
-                    job.update(
-                        generated_frames=event.data.get("generated_frames", job.snapshot().get("generated_frames", 0)),
-                        emitted_audio_seconds=event.data.get("emitted_audio_seconds", 0.0),
-                        generated_audio_seconds=event.data.get("generated_audio_seconds", 0.0),
-                        sample_rate=event.data.get("sample_rate", runtime.sample_rate),
-                        channels=channels,
-                        lead_seconds=event.data.get("lead_seconds", 0.0),
-                        generation_lead_seconds=event.data.get("generation_lead_seconds", 0.0),
-                        playback_lead_seconds=event.data.get("playback_lead_seconds"),
-                        generation_realtime_factor=event.data.get("generation_realtime_factor", 0.0),
-                        post_first_generation_realtime_factor=event.data.get(
-                            "post_first_generation_realtime_factor"
-                        ),
-                        first_audio_latency_seconds=event.data.get("first_audio_latency_seconds"),
-                        decode_chunks_submitted=event.data.get("decode_chunks_submitted", 0),
-                        decode_queue_depth=event.data.get("decode_queue_depth", 0),
-                        pending_decode_frames=event.data.get("pending_decode_frames", 0),
-                        chunk_frames=event.data.get("chunk_frames", 0),
-                    )
-                elif event.type == "result":
-                    metadata = dict(event.data["metadata"])
-                    job.result = {
-                        "audio_path": event.data["audio_path"],
-                        "tokens_path": event.data["tokens_path"],
-                        "metadata_path": event.data["metadata_path"],
-                        "metadata": metadata,
-                    }
-                    job.update(
-                        state="finished",
-                        generated_frames=metadata.get("generated_frames", 0),
-                        emitted_audio_seconds=metadata.get("duration_seconds", 0.0),
-                        audio_path=event.data["audio_path"],
-                    )
+                        if job.is_closed:
+                            break
+                    if event.type == "metadata":
+                        job.update(**event.data)
+                    elif event.type == "progress":
+                        job.update(**event.data)
+                    elif event.type == "audio":
+                        waveform = event.data["waveform"]
+                        channels = 1 if waveform.ndim == 1 else int(min(2, waveform.shape[0]))
+                        with job.status_lock:
+                            if job.status.get("first_audio_at") is None:
+                                job.status["first_audio_at"] = time.time()
+                        if streaming_generation:
+                            _put_stream_audio(job, _pcm16le_bytes(waveform))
+                        job.update(
+                            generated_frames=event.data.get("generated_frames", job.snapshot().get("generated_frames", 0)),
+                            emitted_audio_seconds=event.data.get("emitted_audio_seconds", 0.0),
+                            generated_audio_seconds=event.data.get("generated_audio_seconds", 0.0),
+                            sample_rate=event.data.get("sample_rate", runtime.sample_rate),
+                            channels=channels,
+                            lead_seconds=event.data.get("lead_seconds", 0.0),
+                            generation_lead_seconds=event.data.get("generation_lead_seconds", 0.0),
+                            playback_lead_seconds=event.data.get("playback_lead_seconds"),
+                            generation_realtime_factor=event.data.get("generation_realtime_factor", 0.0),
+                            post_first_generation_realtime_factor=event.data.get(
+                                "post_first_generation_realtime_factor"
+                            ),
+                            first_audio_latency_seconds=event.data.get("first_audio_latency_seconds"),
+                            decode_chunks_submitted=event.data.get("decode_chunks_submitted", 0),
+                            decode_queue_depth=event.data.get("decode_queue_depth", 0),
+                            pending_decode_frames=event.data.get("pending_decode_frames", 0),
+                            chunk_frames=event.data.get("chunk_frames", 0),
+                        )
+                    elif event.type == "result":
+                        metadata = dict(event.data["metadata"])
+                        job.result = {
+                            "audio_path": event.data["audio_path"],
+                            "tokens_path": event.data["tokens_path"],
+                            "metadata_path": event.data["metadata_path"],
+                            "metadata": metadata,
+                        }
+                        job.update(
+                            state="finished",
+                            generated_frames=metadata.get("generated_frames", 0),
+                            emitted_audio_seconds=metadata.get("duration_seconds", 0.0),
+                            audio_path=event.data["audio_path"],
+                        )
             try:
                 job.audio_queue.put_nowait(None)
             except queue.Full:
@@ -524,7 +627,7 @@ def create_app(
         text: str = Form(...),
         prompt_text: str = Form(""),
         max_new_tokens: int = Form(DEFAULT_MAX_NEW_TOKENS),
-        codec_chunk_frames: int = Form(8),
+        codec_chunk_frames: int = Form(16),
         seed: int = Form(1234),
         tokens_control: int = Form(0),
         tokens: int = Form(0),
@@ -540,14 +643,9 @@ def create_app(
         if not text:
             raise HTTPException(status_code=400, detail="text must not be empty")
 
-        mode = (mode or "").strip().lower()
-        if mode not in {"voice_clone", "continuation", "continuation_clone"}:
-            mode = "voice_clone"
-        mode_name = {
-            "voice_clone": MODE_CLONE,
-            "continuation": MODE_CONTINUE,
-            "continuation_clone": MODE_CONTINUE_CLONE,
-        }[mode]
+        mode = "voice_clone"
+        language = "Chinese"
+        mode_name = MODE_CLONE
 
         prompt_audio_path = ""
         if prompt_audio is not None and prompt_audio.filename:
@@ -560,17 +658,10 @@ def create_app(
             if candidate.exists() and REFERENCE_AUDIO_DIR in candidate.resolve().parents:
                 prompt_audio_path = str(candidate)
 
+        if not prompt_audio_path and DEFAULT_CLONE_AUDIO_PATH:
+            prompt_audio_path = DEFAULT_CLONE_AUDIO_PATH
         if not prompt_audio_path:
-            mode_name = "Direct Generation"
-
-        if mode in {"continuation", "continuation_clone"} and prompt_audio_path:
-            if not text:
-                raise HTTPException(status_code=400, detail="continuation mode requires text")
-            if not (prompt_text or "").strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail="continuation mode requires reference audio transcript",
-                )
+            raise HTTPException(status_code=500, detail="no clone reference audio is available")
 
         max_new_tokens = _safe_int(
             max_new_tokens,
@@ -578,14 +669,14 @@ def create_app(
             minimum=1,
             maximum=DEFAULT_MAX_NEW_TOKENS,
         )
-        codec_chunk_frames = _safe_int(codec_chunk_frames, default=8, minimum=0, maximum=32)
+        codec_chunk_frames = _safe_int(codec_chunk_frames, default=16, minimum=0, maximum=32)
         streaming_generation_enabled = bool(_safe_int(streaming_generation, default=1, minimum=0, maximum=1))
         request = StreamingRequest(
             text=text,
-            mode="continuation" if not prompt_audio_path or mode in {"continuation", "continuation_clone"} else "voice_clone",
-            prompt_text=prompt_text or "",
-            prompt_audio_path=prompt_audio_path or None,
-            language=_normalize_language(language),
+            mode="voice_clone",
+            prompt_text="",
+            prompt_audio_path=prompt_audio_path,
+            language="Chinese",
             tokens_control=bool(int(tokens_control)),
             tokens=_safe_int(tokens, default=0, minimum=0),
             max_new_frames=max_new_tokens,
@@ -688,22 +779,150 @@ def create_app(
                 "codec_weight_dtype": codec_weight_dtype,
                 "codec_compute_dtype": codec_compute_dtype,
                 "runtime": runtime_manager.status(),
+                "generation_scheduler": generation_scheduler.status(),
             }
         )
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
-        return JSONResponse(runtime_manager.status())
+        return JSONResponse({**runtime_manager.status(), "generation_scheduler": generation_scheduler.status()})
+
+    def document_settings(raw: str) -> dict[str, Any]:
+        try:
+            incoming = json.loads(raw or "{}")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="invalid document settings") from exc
+        reference_audio_path = str(incoming.get("reference_audio_path") or DEFAULT_CLONE_AUDIO_PATH)
+        try:
+            reference_candidate = Path(_decode_reference_path(reference_audio_path)).resolve(strict=True)
+            reference_root = REFERENCE_AUDIO_DIR.resolve(strict=True)
+            if reference_root not in reference_candidate.parents or not reference_candidate.is_file():
+                raise ValueError
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="invalid clone reference audio") from exc
+        return {
+            "reference_audio_path": str(reference_candidate),
+            "voice_name": str(incoming.get("voice_name") or "本地克隆音色")[:120],
+            "language": "Chinese",
+            "temperature": _safe_float(incoming.get("temperature"), default=1.7, minimum=0.1, maximum=3.0),
+            "top_p": _safe_float(incoming.get("top_p"), default=0.8, minimum=0.1, maximum=1.0),
+            "top_k": _safe_int(incoming.get("top_k"), default=25, minimum=1, maximum=200),
+            "repetition_penalty": _safe_float(
+                incoming.get("repetition_penalty"), default=1.0, minimum=0.8, maximum=2.0
+            ),
+            "max_new_tokens": _safe_int(
+                incoming.get("max_new_tokens"), default=DEFAULT_MAX_NEW_TOKENS, minimum=80, maximum=DEFAULT_MAX_NEW_TOKENS
+            ),
+            "codec_chunk_frames": _safe_int(incoming.get("codec_chunk_frames"), default=16, minimum=1, maximum=32),
+            "seed": _safe_int(incoming.get("seed"), default=1234, minimum=-1, maximum=999999),
+            "aac_bitrate": "192k",
+            "sample_rate": 48000,
+            "channels": 2,
+        }
+
+    @app.get("/api/document-projects")
+    async def list_document_projects() -> JSONResponse:
+        return JSONResponse({"projects": document_projects.list_projects()})
+
+    @app.get("/api/document-projects/{project_id}")
+    async def get_document_project(project_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(document_projects.get_project(project_id))
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+
+    @app.post("/api/document-projects")
+    async def create_document_project(
+        document: UploadFile = File(...),
+        name: str = Form(""),
+        settings_json: str = Form("{}"),
+        max_chars: int = Form(200),
+    ) -> JSONResponse:
+        try:
+            project = document_projects.create_project(
+                name=name,
+                filename=document.filename or "document.txt",
+                data=await document.read(),
+                settings=document_settings(settings_json),
+                max_chars=_safe_int(max_chars, default=200, minimum=40, maximum=500),
+            )
+            return JSONResponse(project)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/document-projects/{project_id}/append")
+    async def append_document_project(project_id: str, document: UploadFile = File(...)) -> JSONResponse:
+        try:
+            return JSONResponse(
+                document_projects.append_document(
+                    project_id, filename=document.filename or "document.txt", data=await document.read()
+                )
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/document-projects/{project_id}/start")
+    async def start_document_project(project_id: str, settings_json: str = Form("{}")) -> JSONResponse:
+        try:
+            return JSONResponse(document_projects.start(project_id, settings=document_settings(settings_json)))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/document-projects/{project_id}/stop")
+    async def stop_document_project(project_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(document_projects.stop(project_id))
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+
+    @app.delete("/api/document-projects/{project_id}")
+    async def delete_document_project(project_id: str) -> JSONResponse:
+        try:
+            document_projects.delete(project_id)
+            return JSONResponse({"ok": True})
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/document-projects/{project_id}/playback")
+    async def save_document_playback(
+        project_id: str,
+        segment_index: int = Form(0),
+        offset_seconds: float = Form(0.0),
+    ) -> JSONResponse:
+        try:
+            return JSONResponse(
+                document_projects.update_playback(
+                    project_id, segment_index=segment_index, offset_seconds=offset_seconds
+                )
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+
+    @app.get("/api/document-projects/{project_id}/media")
+    async def document_project_media(project_id: str, path: str) -> FileResponse:
+        try:
+            media_path = document_projects.media_path(project_id, _decode_reference_path(path))
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="media not found") from exc
+        media_type = "audio/mp4" if media_path.suffix.lower() == ".m4a" else "application/octet-stream"
+        return FileResponse(str(media_path), media_type=media_type, filename=media_path.name)
 
     return app
 
 
-def _html(*, defaults: dict[str, Any], examples: list[dict[str, str]], languages: list[str], runtime: dict[str, Any]) -> str:
+def _html(*, defaults: dict[str, Any], examples: list[dict[str, str]], voices: list[dict[str, str]], languages: list[str], runtime: dict[str, Any]) -> str:
     replacements = {
         "__DEFAULT_TEXT__": json.dumps(defaults["text"], ensure_ascii=False),
         "__DEFAULT_MAX_NEW_TOKENS__": str(defaults["max_new_tokens"]),
         "__DEFAULT_SEED__": str(defaults["seed"]),
         "__EXAMPLES_JSON__": json.dumps(examples, ensure_ascii=False),
+        "__VOICES_JSON__": json.dumps(voices, ensure_ascii=False),
         "__LANGUAGES_JSON__": json.dumps(languages, ensure_ascii=False),
         "__RUNTIME_JSON__": json.dumps(runtime, ensure_ascii=False),
     }
@@ -864,7 +1083,52 @@ INDEX_HTML = r"""
     .summary { color: var(--muted); margin-bottom: 8px; }
     .meter { height: 7px; background: #e5e7eb; border-radius: 999px; overflow: hidden; margin-bottom: 8px; }
     .meter > div { height: 100%; width: 0%; background: var(--orange); transition: width 0.2s ease; }
-    .examples-wrap { overflow: auto; max-height: 500px; border: 1px solid var(--line); border-radius: 4px; }
+    .clone-voice-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+    .clone-voice-tab { flex: 1; padding: 8px 12px; background: #f3f4f6; color: var(--muted); }
+    .clone-voice-tab.active { background: var(--accent); color: #fff; }
+    .clone-voices-wrap { height: 360px; overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+    .clone-voice-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #eef0f3; cursor: pointer; }
+    .clone-voice-item:last-child { border-bottom: 0; }
+    .clone-voice-item:hover { background: #f8fafc; }
+    .clone-voice-item.active { background: #ecfdf5; box-shadow: inset 3px 0 0 var(--accent); }
+    .clone-voice-info { min-width: 0; flex: 1; }
+    .clone-voice-name { color: var(--ink); font-weight: 700; }
+    .clone-voice-description { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .clone-voice-controls { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    .clone-voice-action { padding: 7px 10px; background: #fff; color: var(--muted); border: 1px solid var(--line); font-size: 12px; }
+    .clone-voice-action:hover { background: #f3f4f6; color: var(--ink); }
+    .clone-voice-preview { flex: 0 0 auto; padding: 7px 12px; background: #e5e7eb; color: var(--ink); font-size: 12px; }
+    .clone-voice-preview:hover { background: #d1d5db; }
+    .clone-voices-empty { display: grid; place-items: center; height: 100%; color: var(--muted); }
+    .workspace-tabs { display: flex; gap: 8px; margin: 16px 0; padding: 5px; border: 1px solid var(--line); border-radius: 7px; background: #f3f4f6; }
+    .workspace-tab { flex: 1; padding: 11px 16px; background: transparent; color: var(--muted); }
+    .workspace-tab:hover { background: #e5e7eb; color: var(--ink); }
+    .workspace-tab.active { background: var(--accent); color: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
+    .workspace-tab.active:hover { background: var(--accent); color: #fff; }
+    .document-workspace { margin-top: 0; }
+    .document-toolbar { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(260px, 1fr); gap: 12px; }
+    .document-drop-zone { position: relative; min-height: 96px; border: 1px dashed #9ca3af; border-radius: 6px; display: grid; place-items: center; text-align: center; color: var(--muted); background: #fafafa; padding: 14px; }
+    .document-drop-zone input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+    .document-project-controls { display: grid; gap: 9px; align-content: start; }
+    .document-inline { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }
+    .document-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .document-progress { height: 12px; background: #e5e7eb; border-radius: 999px; overflow: hidden; margin: 12px 0 8px; }
+    .document-progress > div { height: 100%; width: 0%; background: var(--accent); transition: width 0.3s ease; }
+    .document-stats { color: var(--muted); font-size: 12px; min-height: 20px; }
+    .document-body { display: grid; grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr); gap: 12px; margin-top: 12px; }
+    .document-segments { height: 340px; overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; }
+    .document-segment { display: grid; grid-template-columns: 64px 1fr 90px 74px; gap: 10px; align-items: center; padding: 9px 10px; border-bottom: 1px solid #eef0f3; }
+    .document-segment:last-child { border-bottom: 0; }
+    .document-segment.playable { cursor: pointer; }
+    .document-segment.playable:hover { background: #f8fafc; }
+    .document-segment.playable:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .document-segment.playing { background: #ecfdf5; }
+    .document-segment.playing:hover { background: #ecfdf5; }
+    .document-segment-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .document-segment-status { color: var(--muted); font-size: 12px; }
+    .document-segment-play { color: var(--accent); font-size: 12px; font-weight: 700; text-align: right; }
+    .document-project-status { min-height: 90px; max-height: 180px; overflow: auto; white-space: pre-wrap; border: 1px solid var(--line); border-radius: 4px; padding: 10px; background: #fff; font-size: 12px; }
+    .document-player-wrap { display: grid; gap: 10px; align-content: start; }
     table { width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; }
     th, td { border-bottom: 1px solid #eef0f3; padding: 10px; text-align: left; vertical-align: top; }
     th { position: sticky; top: 0; background: #fff; z-index: 1; font-weight: 700; }
@@ -877,6 +1141,8 @@ INDEX_HTML = r"""
       .page { padding: 16px; }
       .layout { grid-template-columns: 1fr; }
       .button-row { grid-template-columns: 1fr; }
+      .document-toolbar, .document-body { grid-template-columns: 1fr; }
+      .document-inline { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -884,10 +1150,16 @@ INDEX_HTML = r"""
   <div class="page">
     <div class="app-card">
       <div class="app-title">MOSS-TTS Local v1.5 Realtime Streaming</div>
-      <div class="app-subtitle">Realtime streaming decode with Direct Generation, Clone, Continuation, Continuation + Clone, and language tags</div>
+      <div class="app-subtitle">固定使用中文语音克隆模式，支持本地音色选择、参考音频上传与实时流式播放</div>
     </div>
 
-    <div class="layout">
+    <div class="workspace-tabs" role="tablist" aria-label="工作模式">
+      <button id="workspace-tab-text" class="workspace-tab active" type="button" role="tab" aria-controls="workspace-text" aria-selected="true">本地文本测试</button>
+      <button id="workspace-tab-document" class="workspace-tab" type="button" role="tab" aria-controls="workspace-document" aria-selected="false">文件生成</button>
+    </div>
+
+    <div id="workspace-text" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-text">
+      <div class="layout">
       <div class="stack">
         <div class="panel">
           <label for="text">Text</label>
@@ -896,6 +1168,9 @@ INDEX_HTML = r"""
 
         <div class="panel">
           <label>Reference Audio (Optional)</label>
+          <label for="clone-voice" style="color: var(--ink); font-weight: 700;">本地克隆音色</label>
+          <select id="clone-voice" style="margin-bottom: 10px;"></select>
+          <div class="hint" style="margin-bottom: 10px;">选择后可先试听，生成时将作为 Clone 参考音频。</div>
           <div id="reference-drop-zone" class="drop-zone">
             <input id="prompt-audio" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.ogg,.opus,.aac">
             <div class="drop-copy">Drop audio here<br>or<br>click to upload</div>
@@ -924,28 +1199,13 @@ INDEX_HTML = r"""
           <div id="selected-reference" class="selected-reference">No reference selected.</div>
         </div>
 
-        <div class="panel">
-          <label>Mode with Reference Audio</label>
-          <div class="hint">If no reference audio is uploaded, Direct Generation will be used automatically.</div>
-          <div class="radio-row" style="margin-top: 10px;">
-            <label class="radio-pill"><input type="radio" name="mode" value="voice_clone" checked> Clone</label>
-            <label class="radio-pill"><input type="radio" name="mode" value="continuation"> Continuation</label>
-            <label class="radio-pill"><input type="radio" name="mode" value="continuation_clone"> Continuation + Clone</label>
-          </div>
-        </div>
-        <div id="mode-hint" class="mode-hint"></div>
-
-        <div id="reference-transcript-panel" class="panel hidden">
-          <label for="prompt-text">Reference Audio Transcript</label>
-          <div class="hint">Required for Continuation modes. Enter the transcript corresponding to the reference audio.</div>
-          <textarea id="prompt-text" class="small-textarea" placeholder="Transcript of the reference audio."></textarea>
-        </div>
+        <input class="hidden" type="radio" name="mode" value="voice_clone" checked>
+        <select id="language" class="hidden"><option value="Chinese" selected>Chinese</option></select>
+        <div id="mode-hint" class="hidden"></div>
+        <div id="reference-transcript-panel" class="hidden"><textarea id="prompt-text"></textarea></div>
 
         <div class="panel">
-          <label for="language">Language Tag</label>
-          <div class="hint">Optional for v1.5. Set this when the input language is known, especially outside Chinese and English.</div>
-          <select id="language"></select>
-          <label style="margin-top: 14px;"><input id="tokens-control" type="checkbox"> Enable Duration Control (Expected Audio Tokens)</label>
+          <label><input id="tokens-control" type="checkbox"> Enable Duration Control (Expected Audio Tokens)</label>
           <div id="tokens-wrap" class="hidden" style="margin-top: 10px;">
             <label for="tokens">expected_tokens</label>
             <input id="tokens" type="number" min="1" step="1" value="1">
@@ -999,14 +1259,14 @@ INDEX_HTML = r"""
             <div class="control-row" data-pair="codec-chunk-frames">
               <div>
                 <div class="range-label">Codec Chunk Frames (0=auto)</div>
-                <input id="codec-chunk-frames-range" type="range" min="0" max="32" step="1" value="8">
+                <input id="codec-chunk-frames-range" type="range" min="0" max="32" step="1" value="16">
                 <div class="range-minmax"><span>0</span><span>32</span></div>
               </div>
-              <input id="codec-chunk-frames" type="number" min="0" max="32" step="1" value="8">
+              <input id="codec-chunk-frames" type="number" min="0" max="32" step="1" value="16">
             </div>
             <div class="control-row">
-              <label for="initial-playback-delay">Initial Playback Delay (s)</label>
-              <input id="initial-playback-delay" type="number" min="0" max="2" step="0.01" value="0.08">
+              <label for="initial-playback-delay">流式播放最小预缓冲（秒，自动调整）</label>
+              <input id="initial-playback-delay" type="number" min="0.3" max="12" step="0.1" value="1.5">
             </div>
             <div class="control-row" data-pair="seed">
               <div>
@@ -1023,15 +1283,18 @@ INDEX_HTML = r"""
         <div class="button-row">
           <button id="start" class="primary" type="button">Generate Speech</button>
           <button id="pause" class="secondary" type="button" disabled>Pause Playback</button>
-          <button id="stop" class="secondary" type="button">Close Job</button>
+          <button id="stop" class="secondary" type="button" disabled>停止当前生成</button>
         </div>
       </div>
 
       <div class="stack">
-        <div class="panel audio-panel">
-          <label>Output Audio</label>
-          <audio id="audio-output" controls disabled></audio>
-          <a id="download" class="download" href="#">Download final wav</a>
+        <div class="panel">
+          <label style="color: var(--ink); font-weight: 700;">本地克隆音色</label>
+          <div class="clone-voice-tabs" role="tablist" aria-label="本地克隆音色分类">
+            <button id="clone-tab-favorites" class="clone-voice-tab active" type="button" role="tab" aria-selected="true">收藏</button>
+            <button id="clone-tab-hidden" class="clone-voice-tab" type="button" role="tab" aria-selected="false">隐藏</button>
+          </div>
+          <div id="clone-voices-list" class="clone-voices-wrap"></div>
         </div>
         <div class="panel">
           <label>Status</label>
@@ -1040,25 +1303,89 @@ INDEX_HTML = r"""
           <div class="meter"><div id="bar"></div></div>
           <div id="status" class="status-box">idle</div>
         </div>
-        <div class="panel">
-          <label>Examples (click a row to fill inputs)</label>
-          <div class="examples-wrap">
-            <table>
-              <thead><tr><th>Reference Speech</th><th>Example Text</th></tr></thead>
-              <tbody id="examples-body"></tbody>
-            </table>
+        <div class="panel audio-panel">
+          <label>Output Audio</label>
+          <audio id="audio-output" controls disabled></audio>
+          <a id="download" class="download" href="#">Download final wav</a>
+        </div>
+      </div>
+    </div>
+    </div>
+
+    <div id="workspace-document" class="workspace-panel hidden" role="tabpanel" aria-labelledby="workspace-tab-document">
+    <div class="panel document-workspace">
+      <label style="color: var(--ink); font-size: 16px; font-weight: 700;">文档转音频项目</label>
+      <div class="hint" style="margin-bottom: 12px;">拖入 TXT、Markdown 或 DOCX 创建项目；项目会固定当前音色与生成参数，支持追加文档、暂停和断点继续。</div>
+      <div class="document-toolbar">
+        <div>
+          <input id="document-project-name" type="text" placeholder="项目名称（留空则使用文档名）" style="margin-bottom: 8px;">
+          <div id="document-create-drop" class="document-drop-zone">
+            <input id="document-create-file" type="file" accept=".txt,.md,.markdown,.docx,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+            <div><b>拖入文档创建项目</b><br><span class="hint">单文件最大 30 MB，自动按自然句分段</span></div>
+          </div>
+        </div>
+        <div class="document-project-controls">
+          <div class="document-inline">
+            <select id="document-project-select"><option value="">暂无项目</option></select>
+            <button id="document-refresh" class="secondary small-button" type="button">刷新</button>
+            <label class="secondary small-button" style="margin:0; cursor:pointer; position:relative; overflow:hidden;">追加文档<input id="document-append-file" type="file" accept=".txt,.md,.markdown,.docx" style="position:absolute; inset:0; opacity:0; cursor:pointer;"></label>
+          </div>
+          <div class="document-inline">
+            <label for="document-max-chars" style="margin:0;">每段最大字符</label>
+            <input id="document-max-chars" type="number" min="40" max="500" step="10" value="200" style="width:100px;">
+            <span></span>
+          </div>
+          <div class="document-actions">
+            <button id="document-start" class="primary small-button" type="button" disabled>开始 / 继续</button>
+            <button id="document-stop" class="secondary small-button" type="button" disabled>停止</button>
+            <button id="document-delete" class="secondary small-button" type="button" disabled>删除项目</button>
+            <a id="document-final-download" class="secondary small-button hidden" href="#" download="complete.m4a" style="text-decoration:none;">下载完整 M4A</a>
           </div>
         </div>
       </div>
+      <div class="document-progress"><div id="document-progress-fill"></div></div>
+      <div id="document-stats" class="document-stats">尚未选择项目。</div>
+      <div class="document-body">
+        <div id="document-segments" class="document-segments"><div class="clone-voices-empty">项目段落将在这里显示</div></div>
+        <div class="document-player-wrap">
+          <audio id="document-audio" controls></audio>
+          <div class="document-actions">
+            <button id="document-play-continue" class="secondary small-button" type="button" disabled>从记录位置连续播放</button>
+          </div>
+          <div id="document-project-status" class="document-project-status">idle</div>
+        </div>
+      </div>
+    </div>
     </div>
   </div>
 
 <script>
 const EXAMPLES = __EXAMPLES_JSON__;
+const CLONE_VOICES = __VOICES_JSON__;
 const LANGUAGES = __LANGUAGES_JSON__;
 const INITIAL_RUNTIME = __RUNTIME_JSON__;
 const DEFAULT_TEXT = __DEFAULT_TEXT__;
 const CONTINUATION_NOTICE = "Continuation mode is active. Fill Reference Audio Transcript with the transcript of the reference audio.";
+const HIDDEN_CLONE_VOICES_STORAGE_KEY = "moss-tts-hidden-clone-voices-v1";
+const UI_STATE_STORAGE_KEY = "moss-tts-ui-state-v1";
+const UI_OPTIMIZATION_DEFAULTS_VERSION = 3;
+const PERSISTED_VALUE_FIELDS = [
+  "temperature", "top-p", "top-k", "repetition-penalty", "max-new-tokens",
+  "codec-chunk-frames", "seed", "initial-playback-delay", "tokens",
+  "document-max-chars", "document-project-name"
+];
+
+let activeWorkspaceTab = "text";
+let activeCloneVoiceTab = "favorites";
+let hiddenCloneVoicePaths = new Set();
+let uiStateReady = false;
+try {
+  const savedHiddenVoices = JSON.parse(localStorage.getItem(HIDDEN_CLONE_VOICES_STORAGE_KEY) || "[]");
+  const availablePaths = new Set(CLONE_VOICES.map((voice) => voice.audio_path));
+  hiddenCloneVoicePaths = new Set(savedHiddenVoices.filter((path) => availablePaths.has(path)));
+} catch (err) {
+  hiddenCloneVoicePaths = new Set();
+}
 
 let currentJob = null;
 let audioContext = null;
@@ -1070,8 +1397,12 @@ let currentStreamAbortController = null;
 let currentStreamingGenerationEnabled = true;
 let playbackPaused = false;
 let playbackCompletionTimer = null;
-let currentInitialPlaybackDelaySeconds = 0.08;
-const MIN_INITIAL_PLAYBACK_BUFFER_SECONDS = 0.32;
+let currentInitialPlaybackDelaySeconds = 1.5;
+let adaptiveRealtimeBufferTargetSeconds = 1.5;
+let estimatedRealtimeAudioSeconds = 0;
+let latestRealtimeGenerationRate = 0;
+const MAX_ADAPTIVE_PLAYBACK_BUFFER_SECONDS = 12;
+const ADAPTIVE_PLAYBACK_BUFFER_SAFETY_SECONDS = 0.75;
 let pendingRealtimePcmChunks = [];
 let pendingRealtimePcmSeconds = 0;
 let realtimePlaybackStarted = false;
@@ -1087,6 +1418,12 @@ let referenceRecordingChunks = [];
 let referenceRecordingSampleRate = 48000;
 let referenceRecordingStartedAt = 0;
 let referenceRecordingTimer = null;
+let currentDocumentProject = null;
+let documentProjectPollTimer = null;
+let documentPlaybackIndex = null;
+let documentPlaybackActive = false;
+let lastPlaybackSaveAt = 0;
+const DOCUMENT_PROJECT_SELECTION_KEY = "moss-tts-current-document-project-v1";
 
 function field(id) { return document.getElementById(id); }
 function apiUrl(path) {
@@ -1130,8 +1467,9 @@ function renderRuntime(status) {
   runtimeReady = status && status.state === "ready";
   const elapsed = status && status.load_elapsed_seconds != null ? ` | load=${Number(status.load_elapsed_seconds).toFixed(1)}s` : "";
   const extra = runtimeReady ? ` | n_vq=${status.n_vq} | sr=${status.sample_rate}` : "";
+  const parallel = status && status.generation_scheduler ? ` | GPU并行=${status.generation_scheduler.max_parallel}` : "";
   const error = status && status.error ? ` | error=${status.error}` : "";
-  field("runtime-summary").textContent = `Runtime: ${(status && status.state) || "unknown"}${elapsed}${extra}${error}`;
+  field("runtime-summary").textContent = `Runtime: ${(status && status.state) || "unknown"}${elapsed}${extra}${parallel}${error}`;
 }
 async function pollRuntime() {
   try {
@@ -1220,6 +1558,8 @@ function setReferenceSourceMode(mode) {
   } else {
     field("prompt-audio").value = "";
     field("example-audio-path").value = "";
+    field("clone-voice").value = "";
+    syncCloneVoiceListSelection();
   }
   updateReferencePreview();
   updateReferenceLabel();
@@ -1308,6 +1648,8 @@ async function startReferenceRecording() {
   }
   field("prompt-audio").value = "";
   field("example-audio-path").value = "";
+  field("clone-voice").value = "";
+  syncCloneVoiceListSelection();
   recordedReferenceFile = null;
   clearReferencePreview();
   referenceRecordingChunks = [];
@@ -1374,8 +1716,251 @@ function clearReferenceAudio() {
   recordedReferenceFile = null;
   field("prompt-audio").value = "";
   field("example-audio-path").value = "";
+  field("clone-voice").value = "";
+  syncCloneVoiceListSelection();
   clearReferencePreview();
   updateReferenceLabel();
+  const visibleVoices = favoriteCloneVoices();
+  const fallbackVoice = visibleVoices.find((voice) => voice.name === "龙嫱") || visibleVoices[0];
+  if (fallbackVoice) selectCloneVoice(fallbackVoice.audio_path, false);
+}
+
+function favoriteCloneVoices() {
+  return CLONE_VOICES.filter((voice) => !hiddenCloneVoicePaths.has(voice.audio_path));
+}
+
+function hiddenCloneVoices() {
+  return CLONE_VOICES.filter((voice) => hiddenCloneVoicePaths.has(voice.audio_path));
+}
+
+function persistHiddenCloneVoices() {
+  try {
+    localStorage.setItem(HIDDEN_CLONE_VOICES_STORAGE_KEY, JSON.stringify([...hiddenCloneVoicePaths]));
+  } catch (err) {}
+}
+
+function setWorkspaceTab(tabName, persist = true) {
+  activeWorkspaceTab = tabName === "document" ? "document" : "text";
+  const textActive = activeWorkspaceTab === "text";
+  field("workspace-text").classList.toggle("hidden", !textActive);
+  field("workspace-document").classList.toggle("hidden", textActive);
+  field("workspace-tab-text").classList.toggle("active", textActive);
+  field("workspace-tab-document").classList.toggle("active", !textActive);
+  field("workspace-tab-text").setAttribute("aria-selected", String(textActive));
+  field("workspace-tab-document").setAttribute("aria-selected", String(!textActive));
+  if (persist) saveUiState();
+}
+
+function saveUiState() {
+  if (!uiStateReady) return;
+  const values = {};
+  for (const id of PERSISTED_VALUE_FIELDS) values[id] = field(id).value;
+  const state = {
+    text: field("text").value,
+    selectedVoicePath: field("clone-voice").value,
+    activeWorkspaceTab,
+    activeCloneVoiceTab,
+    tokensControl: field("tokens-control").checked,
+    streamingGeneration: field("streaming-generation").checked,
+    samplingOpen: document.querySelector(".accordion").open,
+    optimizationDefaultsVersion: UI_OPTIMIZATION_DEFAULTS_VERSION,
+    values,
+  };
+  try {
+    localStorage.setItem(UI_STATE_STORAGE_KEY, JSON.stringify(state));
+  } catch (err) {}
+}
+
+function restoreUiState() {
+  let state = {};
+  try {
+    state = JSON.parse(localStorage.getItem(UI_STATE_STORAGE_KEY) || "{}");
+  } catch (err) {
+    state = {};
+  }
+  if (typeof state.text === "string") field("text").value = state.text;
+  if (state.values && typeof state.values === "object") {
+    for (const id of PERSISTED_VALUE_FIELDS) {
+      if (state.values[id] == null) continue;
+      field(id).value = String(state.values[id]);
+      const range = field(`${id}-range`);
+      if (range) range.value = String(state.values[id]);
+    }
+  }
+  if (Number(state.optimizationDefaultsVersion || 0) < 2) {
+    field("codec-chunk-frames").value = "16";
+    field("codec-chunk-frames-range").value = "16";
+  }
+  if (Number(state.optimizationDefaultsVersion || 0) < 3) {
+    field("initial-playback-delay").value = "1.5";
+  }
+  if (typeof state.tokensControl === "boolean") field("tokens-control").checked = state.tokensControl;
+  if (typeof state.streamingGeneration === "boolean") field("streaming-generation").checked = state.streamingGeneration;
+  if (typeof state.samplingOpen === "boolean") document.querySelector(".accordion").open = state.samplingOpen;
+  setWorkspaceTab(state.activeWorkspaceTab, false);
+  activeCloneVoiceTab = state.activeCloneVoiceTab === "hidden" ? "hidden" : "favorites";
+  setupCloneVoices();
+  renderCloneVoiceList();
+  const visibleVoices = favoriteCloneVoices();
+  const savedVoice = visibleVoices.find((voice) => voice.audio_path === state.selectedVoicePath);
+  const fallbackVoice = visibleVoices.find((voice) => voice.name === "龙嫱") || visibleVoices[0];
+  if (savedVoice || fallbackVoice) selectCloneVoice((savedVoice || fallbackVoice).audio_path, false);
+  uiStateReady = true;
+  updateDurationControls();
+  syncCloneVoiceListSelection();
+  saveUiState();
+}
+
+function setupUiStatePersistence() {
+  field("text").addEventListener("input", saveUiState);
+  field("clone-voice").addEventListener("change", saveUiState);
+  field("tokens-control").addEventListener("change", saveUiState);
+  field("streaming-generation").addEventListener("change", saveUiState);
+  for (const id of PERSISTED_VALUE_FIELDS) {
+    field(id).addEventListener("input", saveUiState);
+    const range = field(`${id}-range`);
+    if (range) range.addEventListener("input", saveUiState);
+  }
+  document.querySelector(".accordion").addEventListener("toggle", saveUiState);
+}
+
+function setCloneVoiceTab(tabName) {
+  activeCloneVoiceTab = tabName === "hidden" ? "hidden" : "favorites";
+  renderCloneVoiceList();
+  saveUiState();
+}
+
+function hideCloneVoice(voice) {
+  hiddenCloneVoicePaths.add(voice.audio_path);
+  persistHiddenCloneVoices();
+  const wasSelected = field("clone-voice").value === voice.audio_path;
+  setupCloneVoices();
+  if (wasSelected) {
+    const visibleVoices = favoriteCloneVoices();
+    const fallbackVoice = visibleVoices.find((item) => item.name === "龙嫱") || visibleVoices[0];
+    if (fallbackVoice) selectCloneVoice(fallbackVoice.audio_path, false);
+  }
+  renderCloneVoiceList();
+  saveUiState();
+}
+
+function favoriteCloneVoice(voice) {
+  hiddenCloneVoicePaths.delete(voice.audio_path);
+  persistHiddenCloneVoices();
+  setupCloneVoices();
+  renderCloneVoiceList();
+  saveUiState();
+}
+
+function syncCloneVoiceListSelection() {
+  const selectedPath = field("clone-voice").value;
+  for (const item of document.querySelectorAll(".clone-voice-item")) {
+    item.classList.toggle("active", item.dataset.audioPath === selectedPath);
+  }
+}
+
+function selectCloneVoice(audioPath, autoplay = false) {
+  const select = field("clone-voice");
+  if (!audioPath) {
+    clearReferenceAudio();
+    return;
+  }
+  if (referenceRecordingActive) stopReferenceRecording(true);
+  recordedReferenceFile = null;
+  referenceSourceMode = "upload";
+  field("prompt-audio").value = "";
+  field("example-audio-path").value = audioPath;
+  select.value = audioPath;
+  document.querySelector("input[name='mode'][value='voice_clone']").checked = true;
+  syncReferenceSourceControls();
+  updateReferencePreview();
+  updateReferenceLabel();
+  syncCloneVoiceListSelection();
+  const selectedVoice = CLONE_VOICES.find((voice) => voice.audio_path === audioPath);
+  setStatus(`已选择克隆音色：${selectedVoice ? `${selectedVoice.name} — ${selectedVoice.description}` : audioPath}`);
+  if (autoplay) {
+    const preview = field("reference-audio-preview");
+    preview.play().catch((err) => setStatus(`试听失败：${err}`));
+  }
+  saveUiState();
+}
+
+function renderCloneVoiceList() {
+  const list = field("clone-voices-list");
+  list.innerHTML = "";
+  const favoriteVoices = favoriteCloneVoices();
+  const hiddenVoices = hiddenCloneVoices();
+  const voices = activeCloneVoiceTab === "hidden" ? hiddenVoices : favoriteVoices;
+  const favoritesTab = field("clone-tab-favorites");
+  const hiddenTab = field("clone-tab-hidden");
+  favoritesTab.textContent = `收藏 (${favoriteVoices.length})`;
+  hiddenTab.textContent = `隐藏 (${hiddenVoices.length})`;
+  favoritesTab.classList.toggle("active", activeCloneVoiceTab === "favorites");
+  hiddenTab.classList.toggle("active", activeCloneVoiceTab === "hidden");
+  favoritesTab.setAttribute("aria-selected", activeCloneVoiceTab === "favorites" ? "true" : "false");
+  hiddenTab.setAttribute("aria-selected", activeCloneVoiceTab === "hidden" ? "true" : "false");
+  if (!voices.length) {
+    const empty = document.createElement("div");
+    empty.className = "clone-voices-empty";
+    empty.textContent = activeCloneVoiceTab === "hidden" ? "暂无隐藏音色" : "暂无收藏音色";
+    list.appendChild(empty);
+    return;
+  }
+  for (const voice of voices) {
+    const item = document.createElement("div");
+    item.className = "clone-voice-item";
+    item.dataset.audioPath = voice.audio_path;
+    const info = document.createElement("div");
+    info.className = "clone-voice-info";
+    const name = document.createElement("div");
+    name.className = "clone-voice-name";
+    name.textContent = voice.name;
+    const description = document.createElement("div");
+    description.className = "clone-voice-description";
+    description.textContent = voice.description;
+    info.append(name, description);
+    const controls = document.createElement("div");
+    controls.className = "clone-voice-controls";
+    const actionButton = document.createElement("button");
+    actionButton.type = "button";
+    actionButton.className = "clone-voice-action";
+    actionButton.textContent = activeCloneVoiceTab === "hidden" ? "收藏" : "隐藏";
+    actionButton.onclick = (event) => {
+      event.stopPropagation();
+      if (activeCloneVoiceTab === "hidden") favoriteCloneVoice(voice);
+      else hideCloneVoice(voice);
+    };
+    controls.appendChild(actionButton);
+    if (activeCloneVoiceTab === "favorites") {
+      const previewButton = document.createElement("button");
+      previewButton.type = "button";
+      previewButton.className = "clone-voice-preview";
+      previewButton.textContent = "▶ 试听";
+      previewButton.onclick = (event) => {
+        event.stopPropagation();
+        selectCloneVoice(voice.audio_path, true);
+      };
+      controls.appendChild(previewButton);
+      item.onclick = () => selectCloneVoice(voice.audio_path, false);
+    }
+    item.append(info, controls);
+    list.appendChild(item);
+  }
+  syncCloneVoiceListSelection();
+}
+
+function setupCloneVoices() {
+  const select = field("clone-voice");
+  const selectedPath = select.value;
+  select.innerHTML = "";
+  for (const voice of favoriteCloneVoices()) {
+    const option = document.createElement("option");
+    option.value = voice.audio_path;
+    option.textContent = `${voice.name} — ${voice.description}`;
+    select.appendChild(option);
+  }
+  if (favoriteCloneVoices().some((voice) => voice.audio_path === selectedPath)) select.value = selectedPath;
+  select.onchange = () => selectCloneVoice(select.value, false);
 }
 function updateModeHint() {
   const continuationMode = selectedMode() === "continuation" || selectedMode() === "continuation_clone";
@@ -1464,6 +2049,7 @@ function setupLanguages() {
     option.textContent = language;
     select.appendChild(option);
   }
+  select.value = "Chinese";
 }
 function setupRangePair(id, integer = false) {
   const range = field(`${id}-range`);
@@ -1486,6 +2072,271 @@ function mergeUint8Arrays(a, b) {
   merged.set(b, a.length);
   return merged;
 }
+
+function documentSettingsSnapshot() {
+  const voiceSelect = field("clone-voice");
+  return {
+    reference_audio_path: field("example-audio-path").value || voiceSelect.value,
+    voice_name: voiceSelect.selectedOptions[0] ? voiceSelect.selectedOptions[0].textContent : "本地克隆音色",
+    temperature: field("temperature").value,
+    top_p: field("top-p").value,
+    top_k: field("top-k").value,
+    repetition_penalty: field("repetition-penalty").value,
+    max_new_tokens: field("max-new-tokens").value,
+    codec_chunk_frames: field("codec-chunk-frames").value,
+    seed: field("seed").value,
+  };
+}
+
+function documentProjectUrl(projectId, suffix = "") {
+  return apiUrl(`api/document-projects/${encodeURIComponent(projectId)}${suffix}`);
+}
+
+function documentMediaUrl(projectId, path) {
+  const url = new URL(documentProjectUrl(projectId, "/media"));
+  url.searchParams.set("path", path);
+  return url.toString();
+}
+
+function formatDocumentDuration(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return "--:--";
+  const value = Math.max(0, Math.round(Number(seconds)));
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  const rest = value % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`
+    : `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+async function loadDocumentProjects(preferredProjectId = "") {
+  const response = await fetch(apiUrl("api/document-projects"));
+  if (!response.ok) throw new Error(await response.text());
+  const data = await response.json();
+  const select = field("document-project-select");
+  const remembered = preferredProjectId || select.value || localStorage.getItem(DOCUMENT_PROJECT_SELECTION_KEY) || "";
+  select.innerHTML = "";
+  if (!data.projects.length) {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "暂无项目";
+    select.appendChild(empty);
+    currentDocumentProject = null;
+    renderDocumentProject(null);
+    return;
+  }
+  for (const project of data.projects) {
+    const option = document.createElement("option");
+    option.value = project.id;
+    option.textContent = `${project.name} · ${project.state} · ${project.stats.completed_segments}/${project.stats.total_segments}`;
+    select.appendChild(option);
+  }
+  if (data.projects.some((project) => project.id === remembered)) select.value = remembered;
+  localStorage.setItem(DOCUMENT_PROJECT_SELECTION_KEY, select.value);
+  await loadDocumentProject(select.value);
+}
+
+async function loadDocumentProject(projectId) {
+  if (!projectId) {
+    currentDocumentProject = null;
+    renderDocumentProject(null);
+    return;
+  }
+  const response = await fetch(documentProjectUrl(projectId));
+  if (!response.ok) throw new Error(await response.text());
+  currentDocumentProject = await response.json();
+  renderDocumentProject(currentDocumentProject);
+}
+
+function renderDocumentProject(project) {
+  const startButton = field("document-start");
+  const stopButton = field("document-stop");
+  const playButton = field("document-play-continue");
+  const deleteButton = field("document-delete");
+  const finalDownload = field("document-final-download");
+  const segmentsContainer = field("document-segments");
+  if (!project) {
+    startButton.disabled = true;
+    stopButton.disabled = true;
+    playButton.disabled = true;
+    deleteButton.disabled = true;
+    field("document-progress-fill").style.width = "0%";
+    field("document-stats").textContent = "尚未选择项目。";
+    field("document-project-status").textContent = "idle";
+    finalDownload.classList.add("hidden");
+    segmentsContainer.innerHTML = '<div class="clone-voices-empty">项目段落将在这里显示</div>';
+    return;
+  }
+  const stats = project.stats || {};
+  const progress = Math.max(0, Math.min(1, Number(stats.progress || 0)));
+  field("document-progress-fill").style.width = `${(progress * 100).toFixed(1)}%`;
+  const eta = stats.eta_seconds == null ? "计算中" : formatDocumentDuration(stats.eta_seconds);
+  const speed = Number(stats.speed_realtime || 0);
+  field("document-stats").textContent =
+    `${project.state} · ${stats.completed_segments || 0}/${stats.total_segments || 0} 段 · ` +
+    `${stats.completed_chars || 0}/${stats.total_chars || 0} 字 · 已生成 ${formatDocumentDuration(stats.completed_audio_seconds || 0)} · ` +
+    `速度 ${speed > 0 ? speed.toFixed(2) + "×实时" : "计算中"} · 预计剩余 ${eta}`;
+  field("document-project-status").textContent =
+    `${project.name}\n${project.message || project.state}\n音色：${project.settings.voice_name || ""}\n` +
+    `参数指纹：${String(project.settings_fingerprint || "").slice(0, 12)}`;
+  startButton.disabled = project.state === "running" || project.state === "stopping";
+  stopButton.disabled = project.state !== "running";
+  deleteButton.disabled = project.state === "running" || project.state === "stopping";
+  const completed = project.segments.filter((segment) => segment.status === "completed" && segment.audio_file);
+  playButton.disabled = completed.length === 0;
+  if (project.final_audio) {
+    finalDownload.href = documentMediaUrl(project.id, project.final_audio);
+    finalDownload.classList.remove("hidden");
+  } else {
+    finalDownload.classList.add("hidden");
+  }
+  segmentsContainer.innerHTML = "";
+  for (const segment of project.segments) {
+    const row = document.createElement("div");
+    row.className = "document-segment";
+    if (documentPlaybackIndex === segment.index) row.classList.add("playing");
+    const number = document.createElement("div");
+    number.textContent = `#${segment.index + 1}`;
+    const text = document.createElement("div");
+    text.className = "document-segment-text";
+    text.textContent = segment.text;
+    text.title = segment.text;
+    const status = document.createElement("div");
+    status.className = "document-segment-status";
+    status.textContent = segment.status === "completed"
+      ? formatDocumentDuration(segment.duration_seconds)
+      : segment.status === "failed" ? "失败" : segment.status === "generating" ? "生成中" : segment.status === "encoding" ? "转码中" : "等待";
+    const action = document.createElement("div");
+    if (segment.status === "completed" && segment.audio_file) {
+      row.classList.add("playable");
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-label", `播放第 ${segment.index + 1} 段`);
+      action.className = "document-segment-play";
+      action.textContent = documentPlaybackIndex === segment.index ? "正在播放" : "▶ 播放";
+      row.onclick = () => playDocumentSegment(segment.index, true, 0);
+      row.onkeydown = (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        playDocumentSegment(segment.index, true, 0);
+      };
+    }
+    row.append(number, text, status, action);
+    segmentsContainer.appendChild(row);
+  }
+}
+
+async function createDocumentProject(file) {
+  if (!file) return;
+  const form = new FormData();
+  form.append("document", file);
+  form.append("name", field("document-project-name").value);
+  form.append("max_chars", field("document-max-chars").value);
+  form.append("settings_json", JSON.stringify(documentSettingsSnapshot()));
+  field("document-project-status").textContent = "正在创建项目并解析文档...";
+  const response = await fetch(apiUrl("api/document-projects"), {method: "POST", body: form});
+  if (!response.ok) throw new Error(await response.text());
+  const project = await response.json();
+  localStorage.setItem(DOCUMENT_PROJECT_SELECTION_KEY, project.id);
+  field("document-create-file").value = "";
+  await loadDocumentProjects(project.id);
+}
+
+async function appendDocumentToProject(file) {
+  if (!file || !currentDocumentProject) return;
+  const form = new FormData();
+  form.append("document", file);
+  field("document-project-status").textContent = "正在追加文档...";
+  const response = await fetch(documentProjectUrl(currentDocumentProject.id, "/append"), {method: "POST", body: form});
+  field("document-append-file").value = "";
+  if (!response.ok) throw new Error(await response.text());
+  currentDocumentProject = await response.json();
+  renderDocumentProject(currentDocumentProject);
+  await loadDocumentProjects(currentDocumentProject.id);
+}
+
+async function startDocumentProject() {
+  if (!currentDocumentProject) return;
+  const form = new FormData();
+  form.append("settings_json", JSON.stringify(documentSettingsSnapshot()));
+  const response = await fetch(documentProjectUrl(currentDocumentProject.id, "/start"), {method: "POST", body: form});
+  if (!response.ok) throw new Error(await response.text());
+  currentDocumentProject = await response.json();
+  renderDocumentProject(currentDocumentProject);
+}
+
+async function stopDocumentProject() {
+  if (!currentDocumentProject) return;
+  const response = await fetch(documentProjectUrl(currentDocumentProject.id, "/stop"), {method: "POST"});
+  if (!response.ok) throw new Error(await response.text());
+  currentDocumentProject = await response.json();
+  renderDocumentProject(currentDocumentProject);
+}
+
+async function deleteDocumentProject() {
+  if (!currentDocumentProject) return;
+  if (!window.confirm(`确定删除项目“${currentDocumentProject.name}”及其全部音频吗？`)) return;
+  const response = await fetch(documentProjectUrl(currentDocumentProject.id), {method: "DELETE"});
+  if (!response.ok) throw new Error(await response.text());
+  currentDocumentProject = null;
+  localStorage.removeItem(DOCUMENT_PROJECT_SELECTION_KEY);
+  await loadDocumentProjects();
+}
+
+async function playDocumentSegment(segmentIndex, continuous = true, offsetSeconds = 0) {
+  if (!currentDocumentProject) return;
+  const segment = currentDocumentProject.segments.find(
+    (item) => item.index === segmentIndex && item.status === "completed" && item.audio_file
+  );
+  if (!segment) return;
+  documentPlaybackIndex = segmentIndex;
+  documentPlaybackActive = continuous;
+  renderDocumentProject(currentDocumentProject);
+  const audio = field("document-audio");
+  audio.src = documentMediaUrl(currentDocumentProject.id, segment.audio_file);
+  audio.onloadedmetadata = () => {
+    if (offsetSeconds > 0 && offsetSeconds < audio.duration) audio.currentTime = offsetSeconds;
+  };
+  await audio.play();
+}
+
+async function playDocumentFromSavedPosition() {
+  if (!currentDocumentProject) return;
+  const saved = currentDocumentProject.playback || {segment_index: 0, offset_seconds: 0};
+  const completed = currentDocumentProject.segments.filter(
+    (segment) => segment.status === "completed" && segment.audio_file
+  );
+  const target = completed.find((segment) => segment.index >= Number(saved.segment_index || 0)) || completed[0];
+  if (target) await playDocumentSegment(target.index, true, target.index === saved.segment_index ? saved.offset_seconds : 0);
+}
+
+async function saveDocumentPlaybackPosition() {
+  if (!currentDocumentProject || documentPlaybackIndex == null) return;
+  const audio = field("document-audio");
+  const form = new FormData();
+  form.append("segment_index", String(documentPlaybackIndex));
+  form.append("offset_seconds", String(Number(audio.currentTime || 0).toFixed(3)));
+  await fetch(documentProjectUrl(currentDocumentProject.id, "/playback"), {method: "POST", body: form});
+}
+
+async function advanceDocumentPlayback() {
+  if (!documentPlaybackActive || !currentDocumentProject || documentPlaybackIndex == null) return;
+  await loadDocumentProject(currentDocumentProject.id);
+  const next = currentDocumentProject.segments.find(
+    (segment) => segment.index > documentPlaybackIndex && segment.status === "completed" && segment.audio_file
+  );
+  if (next) await playDocumentSegment(next.index, true, 0);
+  else documentPlaybackActive = false;
+}
+
+async function pollCurrentDocumentProject() {
+  if (!currentDocumentProject) return;
+  try {
+    await loadDocumentProject(currentDocumentProject.id);
+  } catch (err) {
+    field("document-project-status").textContent = String(err);
+  }
+}
 function clearPlaybackCompletionTimer() {
   if (playbackCompletionTimer) {
     window.clearTimeout(playbackCompletionTimer);
@@ -1503,17 +2354,57 @@ function updatePauseButtonState() {
   pauseBtn.textContent = "Pause Playback";
 }
 function resolveInitialPlaybackDelaySeconds() {
-  const raw = Number(field("initial-playback-delay").value || 0.08);
-  return Number.isFinite(raw) ? Math.max(0.0, raw) : 0.08;
+  const raw = Number(field("initial-playback-delay").value || 1.5);
+  return Number.isFinite(raw) ? Math.max(0.3, Math.min(12, raw)) : 1.5;
+}
+function estimateRealtimeAudioDurationSeconds() {
+  if (field("tokens-control").checked) {
+    return Math.max(0.1, Number(field("tokens").value || 1) / 12.5);
+  }
+  const text = field("text").value || "";
+  const factor = detectTextLanguage(text) === "zh" ? 3.098411951313033 : 0.8673376262755219;
+  const estimated = Math.max(0.1, text.length * factor / 12.5);
+  const configuredMaximum = Math.max(1, Number(field("max-new-tokens").value || 7500)) / 12.5;
+  return Math.min(estimated, configuredMaximum);
+}
+function calculateAdaptiveRealtimeBufferTarget(minimumSeconds, expectedAudioSeconds, generationRate) {
+  const rate = Number(generationRate || 0);
+  const deficitBuffer = rate > 0 && rate < 1
+    ? Number(expectedAudioSeconds || 0) * (1 - rate) + ADAPTIVE_PLAYBACK_BUFFER_SAFETY_SECONDS
+    : 0;
+  return Math.min(
+    MAX_ADAPTIVE_PLAYBACK_BUFFER_SECONDS,
+    Math.max(Number(minimumSeconds || 1.5), deficitBuffer)
+  );
+}
+function updateAdaptiveRealtimeBufferTarget(status = null) {
+  if (realtimePlaybackStarted) return;
+  const measuredRate = Number(
+    (status && status.post_first_generation_realtime_factor) ||
+    (status && status.generation_realtime_factor) ||
+    latestRealtimeGenerationRate || 0
+  );
+  if (Number.isFinite(measuredRate) && measuredRate > 0) latestRealtimeGenerationRate = measuredRate;
+  adaptiveRealtimeBufferTargetSeconds = calculateAdaptiveRealtimeBufferTarget(
+    currentInitialPlaybackDelaySeconds,
+    estimatedRealtimeAudioSeconds,
+    latestRealtimeGenerationRate
+  );
+  if (pendingRealtimePcmSeconds >= adaptiveRealtimeBufferTargetSeconds && pendingRealtimePcmChunks.length > 0) {
+    flushPendingRealtimePcmChunks();
+  }
 }
 function setGenerationActive(active) {
   generationActive = Boolean(active);
   field("start").disabled = generationActive;
+  field("stop").disabled = !generationActive;
 }
 function resetRealtimePlaybackBuffer() {
   pendingRealtimePcmChunks = [];
   pendingRealtimePcmSeconds = 0;
   realtimePlaybackStarted = false;
+  latestRealtimeGenerationRate = 0;
+  adaptiveRealtimeBufferTargetSeconds = currentInitialPlaybackDelaySeconds;
 }
 function pcmChunkDurationSeconds(bytes, sampleRate, channels) {
   const bytesPerFrame = Math.max(1, Number(channels || 2) * 2);
@@ -1538,7 +2429,7 @@ function enqueueRealtimePcmChunk(bytes, sampleRate, channels) {
   }
   pendingRealtimePcmChunks.push({ bytes, sampleRate, channels });
   pendingRealtimePcmSeconds += pcmChunkDurationSeconds(bytes, sampleRate, channels);
-  if (pendingRealtimePcmSeconds >= MIN_INITIAL_PLAYBACK_BUFFER_SECONDS) {
+  if (pendingRealtimePcmSeconds >= adaptiveRealtimeBufferTargetSeconds) {
     flushPendingRealtimePcmChunks();
   }
 }
@@ -1570,7 +2461,7 @@ function schedulePcmChunk(bytes, sampleRate, channels) {
   const source = audioContext.createBufferSource();
   source.buffer = buffer;
   source.connect(audioContext.destination);
-  const startAt = Math.max(nextPlaybackTime || (audioContext.currentTime + currentInitialPlaybackDelaySeconds), audioContext.currentTime + 0.02);
+  const startAt = Math.max(nextPlaybackTime || (audioContext.currentTime + 0.04), audioContext.currentTime + 0.02);
   source.start(startAt);
   nextPlaybackTime = startAt + buffer.duration;
 }
@@ -1580,6 +2471,9 @@ async function prepareRealtimePlayback(sampleRate) {
   audioContext = new AudioContextCtor({ sampleRate });
   await audioContext.resume();
   currentInitialPlaybackDelaySeconds = resolveInitialPlaybackDelaySeconds();
+  estimatedRealtimeAudioSeconds = estimateRealtimeAudioDurationSeconds();
+  adaptiveRealtimeBufferTargetSeconds = currentInitialPlaybackDelaySeconds;
+  latestRealtimeGenerationRate = 0;
   nextPlaybackTime = 0;
   resetRealtimePlaybackBuffer();
   playbackPaused = false;
@@ -1656,8 +2550,12 @@ async function streamAudio(jobId, sampleRate, channels) {
 }
 async function pollStatus(jobId) {
   const status = await fetchJson(apiUrl(`api/generate-stream/${jobId}/status`));
+  updateAdaptiveRealtimeBufferTarget(status);
   setStatus(status);
-  field("summary").textContent = `${status.state} | mode=${status.mode || selectedModeName()} | frames=${status.generated_frames || 0} | emitted=${Number(status.emitted_audio_seconds || 0).toFixed(2)}s | lead=${Number(status.lead_seconds || 0).toFixed(2)}s | playback_delay=${currentInitialPlaybackDelaySeconds.toFixed(2)}s`;
+  const bufferedSeconds = realtimePlaybackStarted && audioContext
+    ? Math.max(0, nextPlaybackTime - audioContext.currentTime)
+    : pendingRealtimePcmSeconds;
+  field("summary").textContent = `${status.state} | mode=${status.mode || selectedModeName()} | frames=${status.generated_frames || 0} | emitted=${Number(status.emitted_audio_seconds || 0).toFixed(2)}s | generation=${Number(latestRealtimeGenerationRate || 0).toFixed(2)}× | buffer=${bufferedSeconds.toFixed(2)}/${adaptiveRealtimeBufferTargetSeconds.toFixed(2)}s`;
   if (status.state === "finished") {
     clearInterval(statusTimer);
     statusTimer = null;
@@ -1693,8 +2591,8 @@ field("start").onclick = async () => {
   field("audio-output").removeAttribute("src");
   field("audio-output").load();
   const form = new FormData();
-  form.append("mode", selectedMode());
-  form.append("language", field("language").value);
+  form.append("mode", "voice_clone");
+  form.append("language", "Chinese");
   form.append("text", field("text").value);
   form.append("prompt_text", field("prompt-text").value);
   form.append("max_new_tokens", field("max-new-tokens").value);
@@ -1740,7 +2638,12 @@ field("start").onclick = async () => {
     setStatus(String(err));
   }
 };
-field("stop").onclick = () => closeRealtimeStream();
+field("stop").onclick = async () => {
+  if (!generationActive) return;
+  await closeRealtimeStream();
+  field("summary").textContent = "已停止当前生成";
+  setStatus("当前生成已停止，未播放的流式音频缓冲已清空。已完成的文档项目内容不受影响。");
+};
 field("pause").onclick = async () => {
   if (!audioContext) return;
   if (playbackPaused) {
@@ -1755,7 +2658,15 @@ field("pause").onclick = async () => {
 
 field("text").value = DEFAULT_TEXT;
 setupLanguages();
-renderExamples();
+setupCloneVoices();
+renderCloneVoiceList();
+field("workspace-tab-text").onclick = () => setWorkspaceTab("text");
+field("workspace-tab-document").onclick = () => setWorkspaceTab("document");
+field("clone-tab-favorites").onclick = () => setCloneVoiceTab("favorites");
+field("clone-tab-hidden").onclick = () => setCloneVoiceTab("hidden");
+const initialVisibleVoices = favoriteCloneVoices();
+const initialCloneVoice = initialVisibleVoices.find((voice) => voice.name === "龙嫱") || initialVisibleVoices[0];
+if (initialCloneVoice) selectCloneVoice(initialCloneVoice.audio_path, false);
 renderRuntime(INITIAL_RUNTIME);
 for (const id of ["temperature", "top-p", "top-k", "repetition-penalty", "max-new-tokens", "codec-chunk-frames", "seed"]) {
   setupRangePair(id, ["top-k", "max-new-tokens", "codec-chunk-frames", "seed"].includes(id));
@@ -1768,6 +2679,8 @@ field("prompt-audio").onchange = () => {
     recordedReferenceFile = null;
     referenceSourceMode = "upload";
     field("example-audio-path").value = "";
+    field("clone-voice").value = "";
+    syncCloneVoiceListSelection();
     syncReferenceSourceControls();
   }
   updateReferencePreview();
@@ -1777,12 +2690,57 @@ field("reference-source-upload").onclick = () => setReferenceSourceMode("upload"
 field("reference-source-record").onclick = () => setReferenceSourceMode("record");
 field("reference-record-button").onclick = () => toggleReferenceRecording();
 field("clear-reference").onclick = clearReferenceAudio;
+field("document-create-file").onchange = async () => {
+  try { await createDocumentProject(field("document-create-file").files[0]); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-append-file").onchange = async () => {
+  try { await appendDocumentToProject(field("document-append-file").files[0]); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-project-select").onchange = async () => {
+  try {
+    localStorage.setItem(DOCUMENT_PROJECT_SELECTION_KEY, field("document-project-select").value);
+    await loadDocumentProject(field("document-project-select").value);
+  } catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-refresh").onclick = async () => {
+  try { await loadDocumentProjects(); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-start").onclick = async () => {
+  try { await startDocumentProject(); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-stop").onclick = async () => {
+  try { await stopDocumentProject(); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-delete").onclick = async () => {
+  try { await deleteDocumentProject(); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-play-continue").onclick = async () => {
+  try { await playDocumentFromSavedPosition(); }
+  catch (err) { field("document-project-status").textContent = String(err); }
+};
+field("document-audio").onended = () => advanceDocumentPlayback();
+field("document-audio").ontimeupdate = () => {
+  const now = Date.now();
+  if (now - lastPlaybackSaveAt < 2000) return;
+  lastPlaybackSaveAt = now;
+  saveDocumentPlaybackPosition().catch(() => {});
+};
 for (const radio of document.querySelectorAll("input[name='mode']")) {
   radio.onchange = updateModeHint;
 }
 syncReferenceSourceControls();
 updateRecordButtonState();
+setupUiStatePersistence();
+restoreUiState();
 updateReferenceLabel();
+loadDocumentProjects().catch((err) => { field("document-project-status").textContent = String(err); });
+documentProjectPollTimer = setInterval(pollCurrentDocumentProject, 1000);
 setInterval(pollRuntime, 1500);
 pollRuntime();
 </script>
@@ -1818,6 +2776,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-preload", action="store_true")
+    parser.add_argument(
+        "--max-parallel-generations",
+        type=int,
+        default=int(os.environ.get("MOSS_TTS_MAX_PARALLEL_GENERATIONS", "2")),
+    )
     return parser.parse_args()
 
 
@@ -1837,6 +2800,7 @@ def main() -> None:
         codec_compute_dtype=args.codec_compute_dtype,
         warmup=not args.no_warmup,
         preload=not args.no_preload,
+        max_parallel_generations=max(1, int(args.max_parallel_generations)),
     )
     uvicorn.run(app, host=args.host, port=int(args.port))
 
