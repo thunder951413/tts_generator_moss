@@ -213,6 +213,9 @@ dev/*
 # Weights
 weights
 models/
+*.gguf
+*.safetensors
+*.bin
 
 # Local Windows runtimes and service state
 .ffmpeg-runtime/
@@ -222,3 +225,8 @@ moss-tts.pid
 
 outputs/*
 assets/audio/bailian/transcripts.auto.json
+
+# Apple Silicon native runtime, secrets and service state
+.runtime/
+.env.macos
+qwen-tts.pid

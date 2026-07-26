@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Realtime Web Audio app for MOSS-TTS Local Transformer v1.5."""
+"""Persistent Qwen3-TTS web service for Apple Silicon."""
 
 from __future__ import annotations
 
@@ -33,47 +33,30 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-STREAMING_MODULE_DIR = REPO_ROOT / "moss_tts_local_v1.5"
+STREAMING_MODULE_DIR = REPO_ROOT / "qwen_tts_service"
 if str(STREAMING_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(STREAMING_MODULE_DIR))
 
-from streaming import (
-    DEFAULT_CODEC_DIR,
-    DEFAULT_MODEL_DIR,
-    DEFAULT_OUTPUT_DIR,
-    StreamingRequest,
-    StreamingRuntime,
-    LegacyRuntime,
-    load_legacy_runtime,
-    load_runtime,
-    synthesize_for_runtime,
-)
 from document_projects import DocumentProjectManager
+from qwen_protocol import StreamingRequest
 from qwen_runtime import QwenWorkerRuntime
 
-
-torch.backends.cuda.enable_cudnn_sdp(False)
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(True)
-
-DEFAULT_UPLOAD_DIR = Path("outputs/moss_tts_local_v1_5_uploads")
-DEFAULT_DOCUMENT_PROJECT_DIR = REPO_ROOT / "outputs" / "moss_tts_document_projects"
-DEFAULT_SERVICE_JOB_DIR = REPO_ROOT / "outputs" / "moss_tts_service_jobs"
-SERVICE_AUTH_COOKIE = "moss_tts_service_session"
-DEFAULT_LITE_MODEL_DIR = REPO_ROOT / "models" / "MOSS-TTS-Local-Transformer"
-DEFAULT_LITE_CODEC_DIR = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer"
-DEFAULT_QWEN_ROOT = REPO_ROOT.parent / "faster-qwen3-tts"
-DEFAULT_QWEN_PYTHON = DEFAULT_QWEN_ROOT / ".venv" / "Scripts" / "python.exe"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "qwen_tts_streaming"
+DEFAULT_UPLOAD_DIR = REPO_ROOT / "outputs" / "qwen_tts_uploads"
+DEFAULT_DOCUMENT_PROJECT_DIR = REPO_ROOT / "outputs" / "qwen_tts_document_projects"
+DEFAULT_SERVICE_JOB_DIR = REPO_ROOT / "outputs" / "qwen_tts_service_jobs"
+SERVICE_AUTH_COOKIE = "qwen_tts_service_session"
+DEFAULT_QWEN_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_QWEN_WORKER_SCRIPT = STREAMING_MODULE_DIR / "qwen_worker.py"
-DEFAULT_QWEN_0_6B_MODEL_DIR = DEFAULT_QWEN_ROOT / "models" / "Qwen3-TTS-12Hz-0.6B-Base"
-DEFAULT_QWEN_1_7B_MODEL_DIR = DEFAULT_QWEN_ROOT / "models" / "Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_QWEN_0_6B_MODEL_DIR = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_QWEN_1_7B_MODEL_DIR = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_QWEN_BACKEND = "ggml"
+DEFAULT_QWEN_QUANT = "Q4_K_M"
+DEFAULT_QWENTTS_LIBRARY = REPO_ROOT / ".runtime" / "qwentts.cpp" / "build-metal" / "libqwen.dylib"
 DEFAULT_MODEL_PROFILE = "qwen_0_6b"
 MODEL_PROFILE_LABELS = {
-    "quality_4b": "高质量 4B（v1.5）",
-    "light_1_7b": "轻量 1.7B（v1.0）",
-    "qwen_0_6b": "Qwen3-TTS 0.6B（极速克隆）",
-    "qwen_1_7b": "Qwen3-TTS 1.7B（高质量克隆）",
+    "qwen_0_6b": "Qwen3-TTS 0.6B（Metal 极速克隆）",
+    "qwen_1_7b": "Qwen3-TTS 1.7B（Metal 高质量克隆）",
 }
 DEFAULT_MAX_NEW_TOKENS = 7500
 MODE_CLONE = "Clone"
@@ -85,7 +68,7 @@ CONTINUATION_NOTICE = (
 ZH_TOKENS_PER_CHAR = 3.098411951313033
 EN_TOKENS_PER_CHAR = 0.8673376262755219
 REFERENCE_AUDIO_DIR = REPO_ROOT / "assets" / "audio"
-EXAMPLE_TEXTS_JSONL_PATH = REPO_ROOT / "assets" / "text" / "moss_tts_example_texts.jsonl"
+EXAMPLE_TEXTS_JSONL_PATH = REPO_ROOT / "assets" / "text" / "qwen_tts_example_texts.jsonl"
 BAILIAN_VOICES_TSV_PATH = REFERENCE_AUDIO_DIR / "bailian" / "voices.tsv"
 LANGUAGE_TAG_AUTO = "Auto (omit)"
 LANGUAGE_TAG_CHOICES = [
@@ -259,46 +242,17 @@ class RuntimeManager:
     def __init__(
         self,
         *,
-        model_dir: str,
-        codec_dir: str,
-        lite_model_dir: str,
-        lite_codec_dir: str,
         qwen_python: str,
         qwen_worker_script: str,
         qwen_0_6b_model_dir: str,
         qwen_1_7b_model_dir: str,
         qwen_0_6b_lanes: int,
         qwen_1_7b_lanes: int,
-        device: str,
-        tts_device: str,
-        codec_device: str,
-        dtype: str,
-        attn_implementation: str,
-        codec_weight_dtype: str,
-        codec_compute_dtype: str,
-        warmup: bool,
+        qwen_backend: str,
+        qwen_quant: str,
+        qwentts_library: str,
     ) -> None:
         self.profiles = {
-            "quality_4b": {
-                "label": MODEL_PROFILE_LABELS["quality_4b"],
-                "model_dir": str(model_dir),
-                "codec_dir": str(codec_dir),
-                "sample_rate": 48000,
-                "channels": 2,
-                "streaming": True,
-                "backend": "moss",
-                "family": "moss",
-            },
-            "light_1_7b": {
-                "label": MODEL_PROFILE_LABELS["light_1_7b"],
-                "model_dir": str(lite_model_dir),
-                "codec_dir": str(lite_codec_dir),
-                "sample_rate": 24000,
-                "channels": 1,
-                "streaming": True,
-                "backend": "moss",
-                "family": "moss",
-            },
             "qwen_0_6b": {
                 "label": MODEL_PROFILE_LABELS["qwen_0_6b"],
                 "model_dir": str(qwen_0_6b_model_dir),
@@ -310,6 +264,8 @@ class RuntimeManager:
                 "family": "qwen",
                 "lanes": max(1, int(qwen_0_6b_lanes)),
                 "base_port": 7870,
+                "runtime_backend": qwen_backend,
+                "quant": qwen_quant,
             },
             "qwen_1_7b": {
                 "label": MODEL_PROFILE_LABELS["qwen_1_7b"],
@@ -322,25 +278,29 @@ class RuntimeManager:
                 "family": "qwen",
                 "lanes": max(1, int(qwen_1_7b_lanes)),
                 "base_port": 7880,
+                "runtime_backend": qwen_backend,
+                "quant": qwen_quant,
             },
         }
         self.qwen_python = str(qwen_python)
         self.qwen_worker_script = str(qwen_worker_script)
-        self.device = device
-        self.tts_device = tts_device
-        self.codec_device = codec_device
-        self.dtype = dtype
-        self.attn_implementation = attn_implementation
-        self.codec_weight_dtype = codec_weight_dtype
-        self.codec_compute_dtype = codec_compute_dtype
-        self.warmup = bool(warmup)
+        self.qwen_backend = str(qwen_backend)
+        self.qwen_quant = str(qwen_quant)
+        self.qwentts_library = str(qwentts_library)
+        self.device = "metal"
+        self.tts_device = "metal"
+        self.codec_device = "metal"
+        self.dtype = "gguf"
+        self.attn_implementation = "ggml_metal"
+        self.codec_weight_dtype = "gguf"
+        self.codec_compute_dtype = "ggml"
         self._lock = threading.Lock()
         self._session_condition = threading.Condition()
         self._session_count = 0
         self._switching = False
         self._active_profile: str | None = None
         self._status_lock = threading.Lock()
-        self._runtime: StreamingRuntime | LegacyRuntime | QwenWorkerRuntime | None = None
+        self._runtime: QwenWorkerRuntime | None = None
         self._loader_thread: threading.Thread | None = None
         self._state = "not_loaded"
         self._error: str | None = None
@@ -402,14 +362,11 @@ class RuntimeManager:
                     "id": profile_id,
                     **profile,
                     "available": (
-                        Path(profile["model_dir"]).exists()
-                        and Path(profile["codec_dir"]).exists()
+                        Path(self.qwen_python).is_file()
+                        and Path(self.qwen_worker_script).is_file()
                         and (
-                            profile.get("backend") != "qwen"
-                            or (
-                                Path(self.qwen_python).is_file()
-                                and Path(self.qwen_worker_script).is_file()
-                            )
+                            not self.qwentts_library
+                            or Path(self.qwentts_library).expanduser().is_file()
                         )
                     ),
                     "loaded": profile_id == self._active_profile and self._runtime is not None,
@@ -430,9 +387,9 @@ class RuntimeManager:
                 with self.session(DEFAULT_MODEL_PROFILE):
                     pass
             except Exception:
-                logging.exception("failed to preload MOSS-TTS Local v1.5 streaming runtime")
+                logging.exception("failed to preload Qwen3-TTS Metal runtime")
 
-        self._loader_thread = threading.Thread(target=_load, name="moss-tts-local-v1.5-runtime-loader", daemon=True)
+        self._loader_thread = threading.Thread(target=_load, name="qwen3-tts-metal-runtime-loader", daemon=True)
         self._loader_thread.start()
 
     def _release_runtime(self) -> None:
@@ -453,43 +410,31 @@ class RuntimeManager:
             self._active_profile = None
             self._set_status(state="not_loaded")
 
-    def _load(self, profile_id: str) -> StreamingRuntime | LegacyRuntime | QwenWorkerRuntime:
+    def _load(self, profile_id: str) -> QwenWorkerRuntime:
         if profile_id not in self.profiles:
             raise ValueError(f"unknown model profile: {profile_id}")
         profile = self.profiles[profile_id]
-        if not Path(profile["model_dir"]).exists() or not Path(profile["codec_dir"]).exists():
-            raise RuntimeError(f"模型档位尚未下载完整：{profile['label']}")
         with self._lock:
             if self._runtime is None or self._active_profile != profile_id:
                 self._set_status(state="loading")
                 try:
                     self._release_runtime()
-                    if profile.get("backend") == "qwen":
-                        if not Path(self.qwen_python).is_file():
-                            raise RuntimeError(f"Qwen Python环境不存在：{self.qwen_python}")
-                        self._runtime = QwenWorkerRuntime(
-                            profile_id=profile_id,
-                            model_dir=profile["model_dir"],
-                            python_executable=self.qwen_python,
-                            worker_script=self.qwen_worker_script,
-                            lanes=int(profile.get("lanes") or 1),
-                            base_port=int(profile["base_port"]),
-                            log_dir=REPO_ROOT / "logs" / "qwen-workers",
-                        )
-                    elif profile_id == "light_1_7b":
-                        self._runtime = load_legacy_runtime(
-                            model_dir=profile["model_dir"], codec_dir=profile["codec_dir"],
-                            device=self.device, tts_device=self.tts_device, codec_device=self.codec_device,
-                            dtype=self.dtype, attn_implementation=self.attn_implementation,
-                        )
-                    else:
-                        self._runtime = load_runtime(
-                            model_dir=profile["model_dir"], codec_dir=profile["codec_dir"],
-                            device=self.device, tts_device=self.tts_device, codec_device=self.codec_device,
-                            dtype=self.dtype, attn_implementation=self.attn_implementation,
-                            codec_weight_dtype=self.codec_weight_dtype,
-                            codec_compute_dtype=self.codec_compute_dtype, warmup=self.warmup,
-                        )
+                    if not Path(self.qwen_python).is_file():
+                        raise RuntimeError(f"Qwen Python环境不存在：{self.qwen_python}")
+                    if self.qwentts_library and not Path(self.qwentts_library).expanduser().is_file():
+                        raise RuntimeError(f"qwentts.cpp Metal动态库不存在：{self.qwentts_library}")
+                    self._runtime = QwenWorkerRuntime(
+                        profile_id=profile_id,
+                        model_dir=profile["model_dir"],
+                        backend=str(profile["runtime_backend"]),
+                        quant=str(profile["quant"]),
+                        library_path=self.qwentts_library or None,
+                        python_executable=self.qwen_python,
+                        worker_script=self.qwen_worker_script,
+                        lanes=int(profile.get("lanes") or 1),
+                        base_port=int(profile["base_port"]),
+                        log_dir=REPO_ROOT / "logs" / "qwen-workers",
+                    )
                     self._active_profile = profile_id
                 except Exception as exc:
                     self._set_status(state="error", error=str(exc))
@@ -746,49 +691,31 @@ class StreamingJobManager:
 
 def create_app(
     *,
-    model_dir: str,
-    codec_dir: str,
-    lite_model_dir: str | Path = DEFAULT_LITE_MODEL_DIR,
-    lite_codec_dir: str | Path = DEFAULT_LITE_CODEC_DIR,
     qwen_python: str | Path = DEFAULT_QWEN_PYTHON,
     qwen_worker_script: str | Path = DEFAULT_QWEN_WORKER_SCRIPT,
     qwen_0_6b_model_dir: str | Path = DEFAULT_QWEN_0_6B_MODEL_DIR,
     qwen_1_7b_model_dir: str | Path = DEFAULT_QWEN_1_7B_MODEL_DIR,
     qwen_0_6b_lanes: int = 1,
     qwen_1_7b_lanes: int = 1,
+    qwen_backend: str = DEFAULT_QWEN_BACKEND,
+    qwen_quant: str = DEFAULT_QWEN_QUANT,
+    qwentts_library: str | Path = DEFAULT_QWENTTS_LIBRARY,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     upload_dir: str | Path = DEFAULT_UPLOAD_DIR,
-    device: str = "cuda",
-    tts_device: str = "cuda:0",
-    codec_device: str = "cuda:0",
-    dtype: str = "bfloat16",
-    attn_implementation: str = "flash_attention_2",
-    codec_weight_dtype: str = "fp32",
-    codec_compute_dtype: str = "bf16",
-    warmup: bool = True,
     preload: bool = True,
-    max_parallel_generations: int = 2,
+    max_parallel_generations: int = 1,
     access_password: str = "",
 ) -> FastAPI:
     runtime_manager = RuntimeManager(
-        model_dir=str(model_dir),
-        codec_dir=str(codec_dir),
-        lite_model_dir=str(lite_model_dir),
-        lite_codec_dir=str(lite_codec_dir),
         qwen_python=str(qwen_python),
         qwen_worker_script=str(qwen_worker_script),
         qwen_0_6b_model_dir=str(qwen_0_6b_model_dir),
         qwen_1_7b_model_dir=str(qwen_1_7b_model_dir),
         qwen_0_6b_lanes=max(1, int(qwen_0_6b_lanes)),
         qwen_1_7b_lanes=max(1, int(qwen_1_7b_lanes)),
-        device=device,
-        tts_device=tts_device,
-        codec_device=codec_device,
-        dtype=dtype,
-        attn_implementation=attn_implementation,
-        codec_weight_dtype=codec_weight_dtype,
-        codec_compute_dtype=codec_compute_dtype,
-        warmup=warmup,
+        qwen_backend=str(qwen_backend),
+        qwen_quant=str(qwen_quant),
+        qwentts_library=str(qwentts_library),
     )
     jobs = StreamingJobManager(DEFAULT_SERVICE_JOB_DIR)
     output_dir = Path(output_dir)
@@ -796,12 +723,9 @@ def create_app(
     output_dir.mkdir(parents=True, exist_ok=True)
     upload_dir.mkdir(parents=True, exist_ok=True)
     generation_scheduler = GpuGenerationScheduler(max_parallel=max_parallel_generations)
-    ffmpeg_path = shutil.which("ffmpeg") or str(REPO_ROOT / ".ffmpeg-runtime" / "Library" / "bin" / "ffmpeg.exe")
+    ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
     def synthesize_for_profile_runtime(runtime: Any, request: StreamingRequest, *, output_dir: str | Path):
-        if isinstance(runtime, QwenWorkerRuntime):
-            yield from runtime.synthesize(request, output_dir=output_dir)
-            return
-        yield from synthesize_for_runtime(runtime, request, output_dir=output_dir)
+        yield from runtime.synthesize(request, output_dir=output_dir)
 
     document_projects = DocumentProjectManager(
         root_dir=DEFAULT_DOCUMENT_PROJECT_DIR,
@@ -822,10 +746,10 @@ def create_app(
         finally:
             runtime_manager.close()
 
-    app = FastAPI(title="MOSS + Qwen Local TTS Service", lifespan=lifespan)
+    app = FastAPI(title="Qwen3-TTS Apple Silicon Service", lifespan=lifespan)
     resolved_access_password = str(access_password or "")
     expected_session = hmac.new(
-        resolved_access_password.encode("utf-8"), b"moss-tts-service-session", hashlib.sha256
+        resolved_access_password.encode("utf-8"), b"qwen-tts-service-session", hashlib.sha256
     ).hexdigest()
 
     @app.middleware("http")
@@ -1090,7 +1014,7 @@ def create_app(
             qwen_append_silence=bool(
                 _safe_int(qwen_append_silence, default=1, minimum=0, maximum=1)
             ),
-            qwen_instruct=str(qwen_instruct or "").strip()[:500],
+            qwen_instruct="",
             qwen_min_new_tokens=_safe_int(
                 qwen_min_new_tokens, default=2, minimum=2, maximum=256
             ),
@@ -1195,17 +1119,14 @@ def create_app(
     async def runtime_info() -> JSONResponse:
         return JSONResponse(
             {
-                "model_dir": str(model_dir),
-                "codec_dir": str(codec_dir),
                 "output_dir": str(output_dir),
                 "upload_dir": str(upload_dir),
-                "device": device,
-                "tts_device": tts_device,
-                "codec_device": codec_device,
-                "dtype": dtype,
-                "attn_implementation": attn_implementation,
-                "codec_weight_dtype": codec_weight_dtype,
-                "codec_compute_dtype": codec_compute_dtype,
+                "backend": runtime_manager.qwen_backend,
+                "quant": runtime_manager.qwen_quant,
+                "qwentts_library": runtime_manager.qwentts_library,
+                "device": runtime_manager.device,
+                "dtype": runtime_manager.dtype,
+                "attn_implementation": runtime_manager.attn_implementation,
                 "runtime": runtime_manager.status(),
                 "generation_scheduler": generation_scheduler.status(),
             }
@@ -1310,6 +1231,8 @@ def create_app(
         return {
             "model_profile": model_profile,
             "model_label": MODEL_PROFILE_LABELS[model_profile],
+            "runtime_backend": str(runtime_manager.profiles[model_profile]["runtime_backend"]),
+            "quant": str(runtime_manager.profiles[model_profile]["quant"]),
             "reference_audio_path": str(reference_candidate),
             "voice_name": str(incoming.get("voice_name") or "本地克隆音色")[:120],
             "language": "Chinese",
@@ -1338,7 +1261,7 @@ def create_app(
             "qwen_reference_text": qwen_reference_text,
             "qwen_non_streaming_mode": bool(incoming.get("qwen_non_streaming_mode", False)),
             "qwen_append_silence": bool(incoming.get("qwen_append_silence", True)),
-            "qwen_instruct": str(incoming.get("qwen_instruct") or "").strip()[:500],
+            "qwen_instruct": "",
             "qwen_min_new_tokens": _safe_int(
                 incoming.get("qwen_min_new_tokens"), default=2, minimum=2, maximum=256
             ),
@@ -1451,7 +1374,7 @@ def _login_html(*, next_path: str, error: str) -> str:
     error_block = f'<div class="error">{safe_error}</div>' if safe_error else ""
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MOSS-TTS 服务登录</title><style>
+<title>Qwen3-TTS 服务登录</title><style>
 body{{margin:0;background:#f3f4f6;font-family:Inter,"Microsoft YaHei",sans-serif;color:#171717;display:grid;place-items:center;min-height:100vh}}
 .card{{width:min(420px,calc(100vw - 40px));background:#fff;border:1px solid #ddd;border-radius:12px;padding:28px;box-shadow:0 12px 35px #00000012}}
 h1{{font-size:22px;margin:0 0 8px}}p{{color:#666;margin:0 0 22px}}label{{display:block;font-weight:700;margin-bottom:8px}}
@@ -1459,7 +1382,7 @@ input{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #bbb;borde
 button{{width:100%;margin-top:16px;padding:11px;border:0;border-radius:7px;background:#166534;color:#fff;font-weight:700;font-size:15px;cursor:pointer}}
 .error{{color:#b91c1c;background:#fef2f2;padding:9px;border-radius:6px;margin-bottom:14px}}
 </style></head><body><form class="card" method="post" action="/login">
-<h1>MOSS-TTS 服务登录</h1><p>输入服务密码后可查看和管理所有生成任务。</p>{error_block}
+<h1>Qwen3-TTS 服务登录</h1><p>输入服务密码后可查看和管理所有生成任务。</p>{error_block}
 <input type="hidden" name="next_path" value="{safe_next}"><label for="password">服务密码</label>
 <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
 <button type="submit">登录</button></form></body></html>"""
@@ -1487,7 +1410,7 @@ INDEX_HTML = r"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MOSS-TTS Local v1.5 Realtime Streaming</title>
+  <title>Qwen3-TTS Apple Silicon</title>
   <style>
     :root {
       --bg: #f6f7f8;
@@ -1769,23 +1692,19 @@ INDEX_HTML = r"""
 <body>
   <div class="page">
     <div class="app-card">
-      <div class="app-header-row"><div><div class="app-title">MOSS + Qwen 本地语音生成</div>
+      <div class="app-header-row"><div><div class="app-title">Qwen3-TTS · Apple Silicon Metal</div>
       <div class="app-subtitle">后台服务持续执行任务；关闭页面后可从其他设备登录并查看进度</div></div>
       <form method="post" action="/logout"><button class="logout-button" type="submit">退出登录</button></form></div>
       <div class="model-profile-row">
         <label for="model-profile" style="margin:0;font-weight:700;">生成模型</label>
         <select id="model-profile">
-          <optgroup label="Qwen3-TTS / Faster CUDA Graph">
-            <option value="qwen_0_6b" selected>Qwen3-TTS 0.6B（极速克隆）</option>
-            <option value="qwen_1_7b">Qwen3-TTS 1.7B（高质量克隆）</option>
-          </optgroup>
-          <optgroup label="MOSS-TTS">
-            <option value="quality_4b">MOSS 高质量 4B（v1.5）</option>
-            <option value="light_1_7b">MOSS 轻量 1.7B（v1.0）</option>
+          <optgroup label="Qwen3-TTS / GGML Metal">
+            <option value="qwen_0_6b" selected>Qwen3-TTS 0.6B（Metal 极速克隆）</option>
+            <option value="qwen_1_7b">Qwen3-TTS 1.7B（Metal 高质量克隆）</option>
           </optgroup>
         </select>
       </div>
-      <div id="model-profile-hint" class="hint" style="margin-top:6px;">Qwen 0.6B：CUDA Graph极速音色克隆。新建文件项目会锁定当前模型和参数。</div>
+      <div id="model-profile-hint" class="hint" style="margin-top:6px;">Qwen 0.6B：GGML Metal 音色克隆。新建文件项目会锁定当前模型和参数。</div>
     </div>
 
     <div class="service-task-center">
@@ -1943,10 +1862,7 @@ INDEX_HTML = r"""
                 <button id="qwen-transcript-reset" class="text-button" type="button">恢复预置台词</button>
               </div>
             </div>
-            <div class="field-block">
-              <label for="qwen-instruct">风格指令（可选）</label>
-              <input id="qwen-instruct" type="text" maxlength="500" placeholder="例如：自然、沉稳地朗读">
-            </div>
+            <input id="qwen-instruct" type="hidden" value="">
             <div class="control-row" data-pair="qwen-temperature">
               <div>
                 <div class="range-label">temperature</div>
@@ -2109,9 +2025,9 @@ const LANGUAGES = __LANGUAGES_JSON__;
 const INITIAL_RUNTIME = __RUNTIME_JSON__;
 const DEFAULT_TEXT = __DEFAULT_TEXT__;
 const CONTINUATION_NOTICE = "Continuation mode is active. Fill Reference Audio Transcript with the transcript of the reference audio.";
-const HIDDEN_CLONE_VOICES_STORAGE_KEY = "moss-tts-hidden-clone-voices-v1";
-const ICL_TRANSCRIPT_OVERRIDES_STORAGE_KEY = "moss-tts-icl-transcript-overrides-v1";
-const UI_STATE_STORAGE_KEY = "moss-tts-ui-state-v1";
+const HIDDEN_CLONE_VOICES_STORAGE_KEY = "qwen-tts-hidden-clone-voices-v1";
+const ICL_TRANSCRIPT_OVERRIDES_STORAGE_KEY = "qwen-tts-icl-transcript-overrides-v1";
+const UI_STATE_STORAGE_KEY = "qwen-tts-ui-state-v1";
 const UI_OPTIMIZATION_DEFAULTS_VERSION = 4;
 const PERSISTED_VALUE_FIELDS = [
   "model-profile",
@@ -2188,7 +2104,7 @@ let serviceTasksPollTimer = null;
 let documentPlaybackIndex = null;
 let documentPlaybackActive = false;
 let lastPlaybackSaveAt = 0;
-const DOCUMENT_PROJECT_SELECTION_KEY = "moss-tts-current-document-project-v1";
+const DOCUMENT_PROJECT_SELECTION_KEY = "qwen-tts-current-document-project-v1";
 
 function field(id) { return document.getElementById(id); }
 function apiUrl(path) {
@@ -2568,7 +2484,7 @@ async function openServiceTask(task) {
 }
 function selectedModelProfile() {
   const value = field("model-profile").value;
-  return ["quality_4b", "light_1_7b", "qwen_0_6b", "qwen_1_7b"].includes(value)
+  return ["qwen_0_6b", "qwen_1_7b"].includes(value)
     ? value
     : "qwen_0_6b";
 }
@@ -2615,10 +2531,8 @@ function applyModelProfileCapabilities(persist = true) {
   field("streaming-generation").disabled = false;
   field("qwen-streaming-generation").disabled = false;
   const hints = {
-    qwen_0_6b: "Qwen 0.6B：Faster CUDA Graph极速克隆，默认X-vector无需参考文字。新项目会锁定模型与Qwen参数。",
-    qwen_1_7b: "Qwen 1.7B：更高克隆质量，支持X-vector与ICL克隆。ICL必须填写准确参考文字。新项目会锁定全部参数。",
-    light_1_7b: "MOSS 1.7B：参考音频缓存、本地KV缓存和分块流式解码；建议块大小4–8。新项目会锁定此模型。",
-    quality_4b: "MOSS 4B：高质量v1.5，支持流式生成。新项目会锁定此模型。",
+    qwen_0_6b: "Qwen 0.6B：GGML Metal 极速克隆，默认X-vector无需参考文字。新项目会锁定模型、量化和参数。",
+    qwen_1_7b: "Qwen 1.7B：GGML Metal 高质量克隆，支持X-vector与ICL。ICL必须填写准确参考文字。",
   };
   field("model-profile-hint").textContent = hints[profile] || hints.qwen_0_6b;
   updateIclTranscriptStatus();
@@ -3211,7 +3125,7 @@ function renderDocumentProject(project) {
     `${stats.completed_chars || 0}/${stats.total_chars || 0} 字 · 已生成 ${formatDocumentDuration(stats.completed_audio_seconds || 0)} · ` +
     `速度 ${speed > 0 ? speed.toFixed(2) + "×实时" : "计算中"} · 预计剩余 ${eta}`;
   field("document-project-status").textContent =
-    `${project.name}\n${project.message || project.state}\n模型：${project.settings.model_label || (project.settings.model_profile === "light_1_7b" ? "轻量 1.7B（v1.0）" : "高质量 4B（v1.5）")}（项目已锁定）\n音色：${project.settings.voice_name || ""}\n` +
+    `${project.name}\n${project.message || project.state}\n模型：${project.settings.model_label || "Qwen3-TTS"}（项目已锁定）\n音色：${project.settings.voice_name || ""}\n` +
     `Seed：${formatSeed(project.settings.seed, project.settings.seed_mode)}\n参数指纹：${String(project.settings_fingerprint || "").slice(0, 12)}`;
   startButton.disabled = project.state === "running" || project.state === "stopping";
   stopButton.disabled = project.state !== "running";
@@ -3820,13 +3734,9 @@ pollRuntime();
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the MOSS-TTS Local v1.5 realtime streaming app.")
+    parser = argparse.ArgumentParser(description="Run the Qwen3-TTS Apple Silicon service.")
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "7861")))
-    parser.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", str(DEFAULT_MODEL_DIR)))
-    parser.add_argument("--codec-dir", default=os.environ.get("CODEC_DIR", str(DEFAULT_CODEC_DIR)))
-    parser.add_argument("--lite-model-dir", default=os.environ.get("LITE_MODEL_DIR", str(DEFAULT_LITE_MODEL_DIR)))
-    parser.add_argument("--lite-codec-dir", default=os.environ.get("LITE_CODEC_DIR", str(DEFAULT_LITE_CODEC_DIR)))
     parser.add_argument("--qwen-python", default=os.environ.get("QWEN_TTS_PYTHON", str(DEFAULT_QWEN_PYTHON)))
     parser.add_argument(
         "--qwen-worker-script",
@@ -3850,31 +3760,27 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("QWEN_TTS_1_7B_LANES", "1")),
     )
+    parser.add_argument(
+        "--qwen-backend",
+        choices=["ggml", "torch"],
+        default=os.environ.get("QWEN_TTS_BACKEND", DEFAULT_QWEN_BACKEND),
+    )
+    parser.add_argument(
+        "--qwen-quant",
+        choices=["BF16", "Q8_0", "Q4_K_M"],
+        default=os.environ.get("QWEN_TTS_QUANT", DEFAULT_QWEN_QUANT),
+    )
+    parser.add_argument(
+        "--qwentts-library",
+        default=os.environ.get("QWENTTS_CPP_LIBRARY", str(DEFAULT_QWENTTS_LIBRARY)),
+    )
     parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
     parser.add_argument("--upload-dir", default=os.environ.get("UPLOAD_DIR", str(DEFAULT_UPLOAD_DIR)))
-    parser.add_argument("--device", default=os.environ.get("DEVICE", "cuda"))
-    parser.add_argument("--tts-device", default=os.environ.get("TTS_DEVICE", "cuda:0"))
-    parser.add_argument("--codec-device", default=os.environ.get("CODEC_DEVICE", os.environ.get("TTS_DEVICE", "cuda:0")))
-    parser.add_argument("--dtype", default=os.environ.get("TTS_DTYPE", "bfloat16"))
-    parser.add_argument("--attn-implementation", default=os.environ.get("ATTN_IMPLEMENTATION", "flash_attention_2"))
-    parser.add_argument(
-        "--codec-weight-dtype",
-        default=os.environ.get("CODEC_WEIGHT_DTYPE", "fp32"),
-        choices=["bf16", "bfloat16", "fp32", "float32"],
-        help="Codec encoder/decoder parameter dtype. Defaults to fp32; pass bf16 to reduce memory. The quantizer stays fp32.",
-    )
-    parser.add_argument(
-        "--codec-compute-dtype",
-        default=os.environ.get("CODEC_COMPUTE_DTYPE", "bf16"),
-        choices=["bf16", "fp32"],
-        help="Codec non-quantizer autocast compute dtype.",
-    )
-    parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-preload", action="store_true")
     parser.add_argument(
         "--max-parallel-generations",
         type=int,
-        default=int(os.environ.get("MOSS_TTS_MAX_PARALLEL_GENERATIONS", "2")),
+        default=int(os.environ.get("QWEN_TTS_MAX_PARALLEL_GENERATIONS", "1")),
     )
     return parser.parse_args()
 
@@ -3882,29 +3788,20 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     app = create_app(
-        model_dir=args.model_dir,
-        codec_dir=args.codec_dir,
-        lite_model_dir=args.lite_model_dir,
-        lite_codec_dir=args.lite_codec_dir,
         qwen_python=args.qwen_python,
         qwen_worker_script=args.qwen_worker_script,
         qwen_0_6b_model_dir=args.qwen_0_6b_model_dir,
         qwen_1_7b_model_dir=args.qwen_1_7b_model_dir,
         qwen_0_6b_lanes=max(1, int(args.qwen_0_6b_lanes)),
         qwen_1_7b_lanes=max(1, int(args.qwen_1_7b_lanes)),
+        qwen_backend=args.qwen_backend,
+        qwen_quant=args.qwen_quant,
+        qwentts_library=args.qwentts_library,
         output_dir=args.output_dir,
         upload_dir=args.upload_dir,
-        device=args.device,
-        tts_device=args.tts_device or args.device,
-        codec_device=args.codec_device or args.tts_device or args.device,
-        dtype=args.dtype,
-        attn_implementation=args.attn_implementation,
-        codec_weight_dtype=args.codec_weight_dtype,
-        codec_compute_dtype=args.codec_compute_dtype,
-        warmup=not args.no_warmup,
         preload=not args.no_preload,
         max_parallel_generations=max(1, int(args.max_parallel_generations)),
-        access_password=os.environ.get("MOSS_TTS_ACCESS_PASSWORD", ""),
+        access_password=os.environ.get("QWEN_TTS_ACCESS_PASSWORD", ""),
     )
     uvicorn.run(app, host=args.host, port=int(args.port))
 

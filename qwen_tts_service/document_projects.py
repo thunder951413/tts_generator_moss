@@ -160,11 +160,11 @@ class DocumentProjectManager:
 
     @staticmethod
     def _migrate_model_profile(manifest: dict[str, Any]) -> bool:
-        """Bind projects created before multi-model support to the original 4B model."""
+        """Bind old projects to the Qwen 0.6B profile on the macOS branch."""
         changed = False
         settings = manifest.setdefault("settings", {})
         if not settings.get("model_profile"):
-            settings["model_profile"] = "quality_4b"
+            settings["model_profile"] = "qwen_0_6b"
             changed = True
         if settings.get("seed_mode") not in {"fixed", "random"}:
             try:
@@ -418,7 +418,7 @@ class DocumentProjectManager:
     def _run_project(self, project_id: str, stop_event: threading.Event) -> None:
         pending_encode: tuple[int, Future[dict[str, Any]]] | None = None
         try:
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="moss-tts-aac") as encoder:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-tts-aac") as encoder:
                 while True:
                     if stop_event.is_set():
                         if pending_encode is not None:
@@ -581,7 +581,7 @@ class DocumentProjectManager:
         result_event: dict[str, Any] | None = None
         with self.generation_lock:
             started_at = time.perf_counter()
-            model_profile = str(settings.get("model_profile") or "quality_4b")
+            model_profile = str(settings.get("model_profile") or "qwen_0_6b")
             with self.runtime_session(model_profile) as runtime:
                 for event in self.synthesize_fn(runtime, request, output_dir=working_dir):
                     if event.type == "result":
@@ -594,7 +594,7 @@ class DocumentProjectManager:
             "source_wav": str(source_wav),
             "duration_seconds": float(result_event.get("metadata", {}).get("duration_seconds", 0.0)),
             "generation_seconds": generation_seconds,
-            "model_profile": str(settings.get("model_profile") or "quality_4b"),
+            "model_profile": str(settings.get("model_profile") or "qwen_0_6b"),
             "seed": int(settings.get("seed", 1234)),
             "seed_mode": str(settings.get("seed_mode") or "fixed"),
         }

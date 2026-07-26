@@ -7,8 +7,10 @@ import base64
 import http.client
 import json
 import logging
+import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -19,7 +21,7 @@ from typing import Any, Generator
 import numpy as np
 import torch
 
-from streaming import StreamingEvent, StreamingRequest
+from qwen_protocol import StreamingEvent, StreamingRequest
 
 
 LOG = logging.getLogger("qwen-runtime")
@@ -32,6 +34,9 @@ class QwenWorkerClient:
         python_executable: str | Path,
         worker_script: str | Path,
         model_dir: str | Path,
+        backend: str,
+        quant: str,
+        library_path: str | Path | None,
         profile_id: str,
         lane_index: int,
         port: int,
@@ -54,9 +59,13 @@ class QwenWorkerClient:
                 str(Path(python_executable).resolve()),
                 str(Path(worker_script).resolve()),
                 "--model",
-                str(Path(model_dir).resolve()),
+                str(model_dir),
                 "--profile-id",
                 profile_id,
+                "--backend",
+                backend,
+                "--quant",
+                quant,
                 "--port",
                 str(self.port),
             ],
@@ -65,6 +74,14 @@ class QwenWorkerClient:
             stdout=self._stdout,
             stderr=self._stderr,
             creationflags=creationflags,
+            env={
+                **dict(os.environ),
+                **(
+                    {"QWENTTS_CPP_LIBRARY": str(Path(library_path).expanduser().resolve())}
+                    if library_path
+                    else {}
+                ),
+            },
         )
         self._wait_until_ready(float(startup_timeout))
 
@@ -144,21 +161,24 @@ class QwenWorkerClient:
 
 
 class QwenWorkerRuntime:
-    """A lane pool that presents the same surface used by the MOSS app."""
+    """A lane pool that presents the streaming surface used by the web app."""
 
     runtime_family = "faster_qwen3_tts"
     sample_rate = 24000
     frame_rate = 12.0
     n_vq = 16
-    attn_implementation = "cuda_graph_sdpa"
-    codec_weight_dtype = "bf16"
-    codec_compute_dtype = "bf16"
+    attn_implementation = "ggml_metal" if sys.platform == "darwin" else "ggml"
+    codec_weight_dtype = "gguf"
+    codec_compute_dtype = "ggml"
 
     def __init__(
         self,
         *,
         profile_id: str,
         model_dir: str | Path,
+        backend: str = "ggml",
+        quant: str = "Q4_K_M",
+        library_path: str | Path | None = None,
         python_executable: str | Path,
         worker_script: str | Path,
         lanes: int,
@@ -166,12 +186,16 @@ class QwenWorkerRuntime:
         log_dir: str | Path,
     ) -> None:
         self.profile_id = profile_id
-        self.model_dir = str(Path(model_dir).resolve())
+        self.model_dir = str(model_dir)
+        self.backend = str(backend)
+        self.quant = str(quant)
+        self.library_path = str(library_path or "")
         self.codec_dir = self.model_dir
-        self.device = torch.device("cuda:0")
-        self.tts_device = torch.device("cuda:0")
-        self.codec_device = torch.device("cuda:0")
-        self.dtype = torch.bfloat16
+        runtime_device = "mps" if sys.platform == "darwin" else "cpu"
+        self.device = torch.device(runtime_device)
+        self.tts_device = torch.device(runtime_device)
+        self.codec_device = torch.device(runtime_device)
+        self.dtype = torch.float32
         self.reference_audio_cache: OrderedDict[str, bool] = OrderedDict()
         self.reference_audio_cache_hits = 0
         self.reference_audio_cache_misses = 0
@@ -185,6 +209,9 @@ class QwenWorkerRuntime:
                     python_executable=python_executable,
                     worker_script=worker_script,
                     model_dir=self.model_dir,
+                    backend=self.backend,
+                    quant=self.quant,
+                    library_path=self.library_path or None,
                     profile_id=profile_id,
                     lane_index=index,
                     port=int(base_port) + index,

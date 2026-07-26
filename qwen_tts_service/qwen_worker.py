@@ -2,7 +2,7 @@
 """Isolated HTTP worker for Faster Qwen3-TTS.
 
 This file is executed with the Faster Qwen3-TTS virtual environment so its
-Transformers dependency does not conflict with the MOSS service environment.
+native GGML/Metal dependencies stay isolated from the web service environment.
 Only loopback HTTP is exposed and audio is returned as NDJSON PCM chunks.
 """
 
@@ -30,21 +30,39 @@ LOG = logging.getLogger("qwen-worker")
 
 
 class WorkerState:
-    def __init__(self, *, model_path: str, profile_id: str, max_seq_len: int) -> None:
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        profile_id: str,
+        max_seq_len: int,
+        backend: str,
+        quant: str,
+    ) -> None:
         self.profile_id = profile_id
         self.model_path = str(model_path)
+        self.backend = str(backend)
+        self.quant = str(quant)
         self.started_at = time.time()
         self.generation_lock = threading.Lock()
         self.requests = 0
         self.reference_keys: set[tuple[str, str, bool]] = set()
         LOG.info("loading Faster Qwen3-TTS model %s", self.model_path)
-        self.model = FasterQwen3TTS.from_pretrained(
-            self.model_path,
-            device="cuda:0",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            max_seq_len=max_seq_len,
-        )
+        load_kwargs: dict[str, Any] = {
+            "backend": self.backend,
+            "quant": self.quant,
+            "max_seq_len": max_seq_len,
+        }
+        if self.backend == "torch":
+            load_kwargs.update(
+                device="cuda:0",
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+        library_path = os.environ.get("QWENTTS_CPP_LIBRARY", "").strip()
+        if library_path:
+            load_kwargs["qwentts_library_path"] = library_path
+        self.model = FasterQwen3TTS.from_pretrained(self.model_path, **load_kwargs)
         self.model.warmup(prefill_len=100)
         self.sample_rate = int(getattr(self.model, "sample_rate", 24000))
         LOG.info("worker ready: profile=%s sample_rate=%s", self.profile_id, self.sample_rate)
@@ -54,6 +72,8 @@ class WorkerState:
             "ok": True,
             "profile_id": self.profile_id,
             "model_path": self.model_path,
+            "backend": self.backend,
+            "quant": self.quant,
             "sample_rate": self.sample_rate,
             "requests": self.requests,
             "reference_cache_entries": len(self.reference_keys),
@@ -78,7 +98,8 @@ class WorkerState:
         seed = payload.get("seed")
         if seed is not None and int(seed) >= 0:
             torch.manual_seed(int(seed))
-            torch.cuda.manual_seed_all(int(seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed))
 
         ref_text = str(payload.get("ref_text") or "").strip()
         xvec_only = bool(payload.get("xvec_only", True))
@@ -107,32 +128,68 @@ class WorkerState:
                 "channels": 1,
                 "n_vq": 16,
                 "frame_rate": 12.0,
-                "attn_implementation": "cuda_graph_sdpa",
-                "codec_weight_dtype": "bf16",
-                "codec_compute_dtype": "bf16",
+                "backend": self.backend,
+                "quant": self.quant,
+                "attn_implementation": "ggml_metal" if self.backend == "ggml" else "cuda_graph_sdpa",
+                "codec_weight_dtype": "gguf" if self.backend == "ggml" else "bf16",
+                "codec_compute_dtype": "ggml" if self.backend == "ggml" else "bf16",
                 "processor_mode": "voice_clone",
                 "reference_cache_hit": cache_hit,
+                "seed": int(seed) if seed is not None else None,
             },
         }
 
-        generator = self.model.generate_voice_clone_streaming(
-            text=text,
-            language="Chinese",
-            ref_audio=str(ref_audio),
-            ref_text=ref_text,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=max(2, min(int(payload.get("min_new_tokens") or 2), max_new_tokens)),
-            temperature=float(payload.get("temperature") or 0.9),
-            top_k=max(1, min(200, int(payload.get("top_k") or 50))),
-            top_p=max(0.01, min(1.0, float(payload.get("top_p") or 1.0))),
-            do_sample=bool(payload.get("do_sample", True)),
-            repetition_penalty=max(0.8, min(2.0, float(payload.get("repetition_penalty") or 1.05))),
-            chunk_size=chunk_size,
-            xvec_only=xvec_only,
-            non_streaming_mode=bool(payload.get("non_streaming_mode", False)),
-            append_silence=bool(payload.get("append_silence", True)),
-            instruct=str(payload.get("instruct") or "").strip() or None,
-        )
+        generation_kwargs = {
+            "text": text,
+            "language": "Chinese",
+            "ref_audio": str(ref_audio),
+            "ref_text": ref_text,
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": max(2, min(int(payload.get("min_new_tokens") or 2), max_new_tokens)),
+            "temperature": float(payload.get("temperature") or 0.9),
+            "top_k": max(1, min(200, int(payload.get("top_k") or 50))),
+            "top_p": max(0.01, min(1.0, float(payload.get("top_p") or 1.0))),
+            "do_sample": bool(payload.get("do_sample", True)),
+            "repetition_penalty": max(0.8, min(2.0, float(payload.get("repetition_penalty") or 1.05))),
+            "chunk_size": chunk_size,
+            "xvec_only": xvec_only,
+            "non_streaming_mode": bool(payload.get("non_streaming_mode", False)),
+            "append_silence": bool(payload.get("append_silence", True)),
+            "instruct": str(payload.get("instruct") or "").strip() or None,
+        }
+        if self.backend == "ggml" and generation_kwargs["instruct"]:
+            raise ValueError("GGML Base voice-clone backend does not support instruct")
+        if self.backend == "ggml" and seed is not None:
+            # FasterQwen3TTS does not yet expose qwentts.cpp's seed argument.
+            # Use its adapter preparation and native streaming helpers so the
+            # effective seed saved by the service is also the seed actually used.
+            ref_kwargs, adapter_prepare_ms, adapter_profile = self.model._resolve_clone_reference(
+                ref_audio=generation_kwargs["ref_audio"],
+                ref_text=ref_text,
+                xvec_only=xvec_only,
+                append_silence=generation_kwargs["append_silence"],
+                ref_spk=None,
+                ref_rvq=None,
+                ref_spk_emb=None,
+                ref_codes=None,
+            )
+            generator = self.model._stream_runtime(
+                text=text,
+                lang="Chinese",
+                **ref_kwargs,
+                max_new_tokens=max_new_tokens,
+                do_sample=generation_kwargs["do_sample"],
+                temperature=generation_kwargs["temperature"],
+                top_k=generation_kwargs["top_k"],
+                top_p=generation_kwargs["top_p"],
+                repetition_penalty=generation_kwargs["repetition_penalty"],
+                seed=int(seed),
+                chunk_size=chunk_size,
+                adapter_prepare_ms=adapter_prepare_ms,
+                adapter_profile=adapter_profile,
+            )
+        else:
+            generator = self.model.generate_voice_clone_streaming(**generation_kwargs)
 
         for audio, sample_rate, timing in generator:
             chunk = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -197,6 +254,9 @@ class WorkerState:
             "reference_cache_entries": len(self.reference_keys),
             "xvec_only": xvec_only,
             "non_streaming_mode": bool(payload.get("non_streaming_mode", False)),
+            "seed": int(seed) if seed is not None else None,
+            "backend": self.backend,
+            "quant": self.quant,
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         yield {
@@ -273,13 +333,21 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--backend", choices=["ggml", "torch"], default="ggml")
+    parser.add_argument("--quant", choices=["BF16", "Q8_0", "Q4_K_M"], default="Q4_K_M")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    state = WorkerState(model_path=args.model, profile_id=args.profile_id, max_seq_len=args.max_seq_len)
+    state = WorkerState(
+        model_path=args.model,
+        profile_id=args.profile_id,
+        max_seq_len=args.max_seq_len,
+        backend=args.backend,
+        quant=args.quant,
+    )
     server = ThreadingHTTPServer((args.host, args.port), WorkerHandler)
     server.worker_state = state  # type: ignore[attr-defined]
     LOG.info("listening on http://%s:%s", args.host, args.port)
