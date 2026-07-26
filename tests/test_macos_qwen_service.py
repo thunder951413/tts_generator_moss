@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import time
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -34,10 +37,34 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
     )
 
     with TestClient(app) as client:
-        page = client.get("/")
-        assert page.status_code == 200
-        assert "Qwen3-TTS · Apple Silicon Metal" in page.text
-        assert "MOSS 高质量 4B" not in page.text
+        page = client.get("/", follow_redirects=False)
+        assert page.status_code == 307
+        assert page.headers["location"] == "/reader"
+
+        reader = client.get("/reader")
+        assert reader.status_code == 200
+        assert "Qwen 声阅" in reader.text
+        assert 'id="reader-settings-dialog"' in reader.text
+        assert 'id="listening-settings-card"' in reader.text
+        assert 'id="preset-select"' not in reader.text
+        assert 'id="voice-select"' not in reader.text
+        assert 'id="stop-generation"' in reader.text
+        assert 'id="generate-whole-book"' in reader.text
+        assert 'id="download-whole-book"' in reader.text
+        assert 'id="book-aac-bitrate"' in reader.text
+        assert 'id="book-progress-detail-button"' in reader.text
+        reader_script = client.get("/reader-assets/reader.js")
+        assert reader_script.status_code == 200
+        assert '"/api/service-settings"' in reader_script.text
+        assert '"/api/presets"' not in reader_script.text
+        assert 'form.set("qwen_non_streaming_mode", "1")' in reader_script.text
+        assert 'ephemeral-audio' in reader_script.text
+        assert "renderWholeBookProgress" in reader_script.text
+        assert 'stopCurrentGeneration' in reader_script.text
+
+        service_settings = client.get("/api/service-settings")
+        assert service_settings.status_code == 200
+        assert service_settings.json()["settings"]["reference_audio_path"]
 
         runtime = client.get("/api/runtime").json()
         assert runtime["backend"] == "ggml"
@@ -46,11 +73,340 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
             "qwen_0_6b",
             "qwen_1_7b",
         ]
+        voices = client.get("/api/voices").json()
+        assert voices["voices"]
+        assert voices["default_reference_audio_path"]
 
 
 def test_random_seed_is_resolved_before_task_creation() -> None:
     module = load_app_module()
     assert module._safe_int(-1, default=1234, minimum=-1, maximum=999999) == -1
+
+
+def test_voice_presets_are_persistent_and_can_import_reference_audio(tmp_path: Path) -> None:
+    module = load_app_module()
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        access_password="",
+    )
+    with TestClient(app) as client:
+        imported = client.post(
+            "/api/presets/reference-audio",
+            files={"audio": ("my-voice.wav", b"RIFFfake-wave-data", "audio/wav")},
+        )
+        assert imported.status_code == 200
+        reference_path = imported.json()["reference_audio_path"]
+        assert Path(reference_path).is_file()
+        assert client.get("/api/reference-audio", params={"path": reference_path}).status_code == 200
+
+        created = client.post(
+            "/api/presets",
+            json={
+                "name": "旁白测试",
+                "settings": {
+                    "model_profile": "qwen_0_6b",
+                    "reference_audio_path": reference_path,
+                    "qwen_seed": "1234",
+                    "qwen_temperature": "0.9",
+                    "qwen_top_p": 0.95,
+                    "qwen_top_k": 40,
+                    "qwen_repetition_penalty": 1.08,
+                    "qwen_max_new_tokens": 2048,
+                    "qwen_chunk_size": 8,
+                    "qwen_min_new_tokens": 2,
+                    "qwen_append_silence": True,
+                    "qwen_aac_bitrate": "80k",
+                },
+            },
+        )
+        assert created.status_code == 201
+        preset = created.json()
+        assert preset["name"] == "旁白测试"
+        assert preset["settings"]["reference_audio_path"] == reference_path
+        assert preset["settings"]["qwen_top_k"] == 40
+        assert preset["settings"]["qwen_aac_bitrate"] == "80k"
+
+        activated = client.put(
+            "/api/service-settings/active-preset",
+            json={"preset_id": preset["id"]},
+        )
+        assert activated.status_code == 200
+        assert activated.json()["active_preset_id"] == preset["id"]
+        assert client.get("/api/service-settings").json()["name"] == "旁白测试"
+
+        listed = client.get("/api/presets")
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()["presets"]] == [preset["id"]]
+        assert listed.json()["active_preset_id"] == preset["id"]
+
+        updated = client.put(
+            f"/api/presets/{preset['id']}",
+            content=json.dumps(
+                {
+                    "name": "旁白测试（更新）",
+                    "settings": {
+                        "model_profile": "qwen_1_7b",
+                        "reference_audio_path": reference_path,
+                        "qwen_seed": "5678",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["settings"]["model_profile"] == "qwen_1_7b"
+        assert client.get("/api/service-settings").json()["settings"]["model_profile"] == "qwen_1_7b"
+
+        applied = client.put(
+            "/api/service-settings",
+            json={
+                "name": "工作台应用",
+                "settings": {
+                    "model_profile": "qwen_0_6b",
+                    "voice_name": "工作台音色",
+                    "reference_audio_path": reference_path,
+                    "qwen_seed": -1,
+                    "qwen_temperature": 0.85,
+                },
+            },
+        )
+        assert applied.status_code == 200
+        assert applied.json()["source"] == "studio"
+        assert client.get("/api/service-settings").json()["settings"]["qwen_seed"] == -1
+
+        deleted = client.delete(f"/api/presets/{preset['id']}")
+        assert deleted.status_code == 200
+        assert client.get("/api/presets").json()["presets"] == []
+
+
+def test_service_accepts_bearer_api_clients_and_stt_uploads(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    module = load_app_module()
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preload=False,
+        stt_preload=False,
+        access_password="1234",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_transcribe(**kwargs):
+        captured.update(kwargs)
+        return (
+            json.dumps({"text": "这是流式服务的转写测试。"}, ensure_ascii=False).encode(),
+            "application/json",
+        )
+
+    monkeypatch.setattr(app.state.stt_runtime, "transcribe", fake_transcribe)
+    headers = {"Authorization": "Bearer 1234"}
+    with TestClient(app) as client:
+        assert client.get("/api/voices").status_code == 401
+        assert client.get("/api/voices", headers=headers).status_code == 200
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers=headers,
+            files={"file": ("sample.wav", b"RIFF-test-audio", "audio/wav")},
+            data={"language": "zh", "response_format": "json"},
+        )
+        assert response.status_code == 200
+        assert response.json()["text"] == "这是流式服务的转写测试。"
+        assert captured["filename"] == "sample.wav"
+        assert captured["language"] == "zh"
+
+
+def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: Path) -> None:
+    module = load_app_module()
+    module.DEFAULT_SERVICE_JOB_DIR = tmp_path / "jobs"
+    chunks = [
+        module.torch.tensor([[0.10, -0.10, 0.20, -0.20]], dtype=module.torch.float32),
+        module.torch.tensor([[0.30, -0.30, 0.40, -0.40]], dtype=module.torch.float32),
+    ]
+
+    class FakeRuntime:
+        sample_rate = 24000
+        n_vq = 16
+
+        def synthesize(self, _request, *, output_dir):
+            output = Path(output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            yield types.SimpleNamespace(
+                type="metadata",
+                data={"sample_rate": 24000, "channels": 1},
+            )
+            elapsed = 0.0
+            for index, waveform in enumerate(chunks, start=1):
+                elapsed += waveform.shape[-1] / 24000
+                yield types.SimpleNamespace(
+                    type="audio",
+                    data={
+                        "waveform": waveform,
+                        "generated_frames": index,
+                        "emitted_audio_seconds": elapsed,
+                        "generated_audio_seconds": elapsed,
+                        "sample_rate": 24000,
+                    },
+                )
+            audio_path = output / "fake.wav"
+            tokens_path = output / "fake.npy"
+            metadata_path = output / "fake.json"
+            audio_path.write_bytes(b"RIFF-result")
+            tokens_path.write_bytes(b"tokens")
+            metadata_path.write_text("{}", encoding="utf-8")
+            yield types.SimpleNamespace(
+                type="result",
+                data={
+                    "audio_path": str(audio_path),
+                    "tokens_path": str(tokens_path),
+                    "metadata_path": str(metadata_path),
+                    "metadata": {
+                        "generated_frames": len(chunks),
+                        "duration_seconds": elapsed,
+                    },
+                },
+            )
+
+    class FakeRuntimeManager:
+        def __init__(self, **_kwargs):
+            self.qwen_backend = "ggml"
+            self.qwen_quant = "Q4_K_M"
+            self.qwentts_library = ""
+            self.device = "metal"
+            self.dtype = "gguf"
+            self.attn_implementation = "ggml_metal"
+            self.profiles = {
+                "qwen_0_6b": {
+                    "label": "test",
+                    "sample_rate": 24000,
+                    "channels": 1,
+                    "streaming": True,
+                    "backend": "qwen",
+                },
+                "qwen_1_7b": {
+                    "label": "test",
+                    "sample_rate": 24000,
+                    "channels": 1,
+                    "streaming": True,
+                    "backend": "qwen",
+                },
+            }
+
+        @contextmanager
+        def session(self, _profile):
+            yield FakeRuntime()
+
+        def status(self):
+            return {"state": "ready", "device": "metal", "profiles": []}
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(module, "RuntimeManager", FakeRuntimeManager)
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        stt_preload=False,
+        access_password="",
+    )
+    with TestClient(app) as client:
+        voice = client.get("/api/voices").json()["voices"][0]
+        applied = client.put(
+            "/api/service-settings",
+            json={
+                "name": "API 默认音色",
+                "settings": {
+                    "model_profile": "qwen_1_7b",
+                    "voice_name": voice["name"],
+                    "reference_audio_path": voice["audio_path"],
+                    "qwen_clone_mode": "xvec",
+                    "qwen_seed": 4321,
+                },
+            },
+        )
+        assert applied.status_code == 200
+        started = client.post(
+            "/api/generate-stream/start",
+            data={
+                "text": "测试真正的 PCM 流式输出。",
+                "streaming_generation": "1",
+                "model_profile": "qwen_0_6b",
+            },
+        )
+        assert started.status_code == 200
+        assert started.json()["model_profile"] == "qwen_1_7b"
+        assert started.json()["seed"] == 4321
+        job_id = started.json()["job_id"]
+        with client.stream("GET", f"/api/generate-stream/{job_id}/audio") as streamed:
+            payload = b"".join(streamed.iter_raw())
+            assert streamed.headers["x-audio-codec"] == "pcm_s16le"
+            assert streamed.headers["x-audio-sample-rate"] == "24000"
+        expected = b"".join(module._pcm16le_bytes(chunk, 1) for chunk in chunks)
+        assert payload == expected
+        status = client.get(f"/api/generate-stream/{job_id}/status").json()
+        assert status["state"] == "finished"
+        assert status["generated_frames"] == 2
+
+        def fake_ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"fake-aac")
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr(module.subprocess, "run", fake_ffmpeg)
+        nonstream = client.post(
+            "/api/generate-stream/start",
+            data={
+                "text": "逐段非流式高质量听书。",
+                "streaming_generation": "0",
+                "qwen_non_streaming_mode": "1",
+                "ephemeral_audio": "1",
+            },
+        )
+        assert nonstream.status_code == 200
+        assert nonstream.json()["streaming_generation"] is False
+        ephemeral_job_id = nonstream.json()["job_id"]
+        for _ in range(50):
+            ephemeral_status = client.get(
+                f"/api/generate-stream/{ephemeral_job_id}/status"
+            ).json()
+            if ephemeral_status["state"] == "finished":
+                break
+            time.sleep(0.01)
+        assert ephemeral_status["state"] == "finished"
+        result = client.get(f"/api/generate-stream/{ephemeral_job_id}/result").json()
+        source_paths = [
+            Path(result[key])
+            for key in ("audio_path", "tokens_path", "metadata_path")
+        ]
+        encoded = client.get(
+            f"/api/generate-stream/{ephemeral_job_id}/result-audio-aac",
+            params={"bitrate": "64k"},
+        )
+        assert encoded.status_code == 200
+        assert encoded.headers["content-type"].startswith("audio/mp4")
+        assert encoded.content == b"fake-aac"
+        cleaned = client.delete(
+            f"/api/generate-stream/{ephemeral_job_id}/ephemeral-audio"
+        )
+        assert cleaned.status_code == 200
+        assert not any(path.exists() for path in source_paths)
+        cleaned_status = client.get(
+            f"/api/generate-stream/{ephemeral_job_id}/status"
+        ).json()
+        assert cleaned_status["ephemeral_cleaned"] is True
+        assert cleaned_status["result_ready"] is False
 
 
 def test_ggml_worker_passes_effective_seed_to_native_stream(tmp_path: Path) -> None:
@@ -106,3 +462,48 @@ def test_ggml_worker_passes_effective_seed_to_native_stream(tmp_path: Path) -> N
     assert state.model.stream_kwargs["seed"] == 424242
     assert events[0]["data"]["seed"] == 424242
     assert events[-1]["data"]["metadata"]["seed"] == 424242
+
+
+def test_worker_preserves_virtualenv_python_symlink(monkeypatch, tmp_path: Path) -> None:
+    service_dir = ROOT / "qwen_tts_service"
+    sys.path.insert(0, str(service_dir))
+    try:
+        import qwen_runtime
+    finally:
+        sys.path.remove(str(service_dir))
+
+    real_python = tmp_path / "real-python"
+    real_python.write_bytes(b"")
+    venv_python = tmp_path / "venv-python"
+    venv_python.symlink_to(real_python)
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def __init__(self, command, **_kwargs):
+            captured["command"] = command
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(qwen_runtime.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(qwen_runtime.QwenWorkerClient, "_wait_until_ready", lambda *_args: None)
+    client = qwen_runtime.QwenWorkerClient(
+        python_executable=venv_python,
+        worker_script=ROOT / "qwen_tts_service" / "qwen_worker.py",
+        model_dir="model",
+        backend="ggml",
+        quant="Q4_K_M",
+        library_path=None,
+        profile_id="qwen_0_6b",
+        lane_index=0,
+        port=7900,
+        log_dir=tmp_path / "logs",
+    )
+    try:
+        command = captured["command"]
+        assert isinstance(command, list)
+        assert command[0] == os.path.abspath(venv_python)
+        assert command[0] != str(venv_python.resolve())
+    finally:
+        client._stdout.close()
+        client._stderr.close()

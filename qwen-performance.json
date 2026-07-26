@@ -1,24 +1,32 @@
 {
-  "qwen_0_6b_lanes": 1,
-  "qwen_1_7b_lanes": 1,
+  "qwen_0_6b_lanes": 2,
+  "qwen_1_7b_lanes": 2,
+  "max_parallel_generations": 2,
+  "document_parallel_generations": 2,
   "benchmarked": true,
-  "benchmarked_at": "2026-07-26T01:39:15+08:00",
-  "hardware": "NVIDIA GeForce RTX 4090 Laptop GPU (16 GB)",
-  "method": "96 codec frames per job after model, CUDA graph, and reference-cache warmup",
+  "benchmarked_at": "2026-07-26T10:43:00+08:00",
+  "hardware": "Apple M4 Max (40-core GPU, 128 GB unified memory, Metal 4)",
+  "backend": "qwentts.cpp 9dbe7ea, GGML Metal, Q4_K_M",
+  "method": "96 codec frames (7.68 seconds audio) per concurrent job after model, Metal graph, and reference-cache warmup",
+  "recommendation": {
+    "interactive_and_mixed_workloads": 2,
+    "maximum_batch_throughput": 4,
+    "reason": "Two lanes keep each request faster than realtime and give most of the available aggregate speedup. Four lanes maximize total throughput but individual jobs fall below realtime."
+  },
   "qwen_0_6b_results": [
-    {"lanes": 1, "successes": 1, "aggregate_realtime_factor": 3.0184, "mean_first_audio_seconds": 0.2605},
-    {"lanes": 2, "successes": 2, "aggregate_realtime_factor": 2.6702, "mean_first_audio_seconds": 0.6440},
-    {"lanes": 3, "successes": 3, "aggregate_realtime_factor": 2.7115, "mean_first_audio_seconds": 0.9707},
-    {"lanes": 4, "successes": 4, "aggregate_realtime_factor": 2.6521, "mean_first_audio_seconds": 1.2924}
+    {"lanes": 1, "successes": 1, "aggregate_realtime_factor": 1.9307, "mean_first_audio_seconds": 0.2788, "mean_job_wall_seconds": 3.9778},
+    {"lanes": 2, "successes": 2, "aggregate_realtime_factor": 3.1132, "mean_first_audio_seconds": 0.2633, "mean_job_wall_seconds": 4.8990},
+    {"lanes": 3, "successes": 3, "aggregate_realtime_factor": 3.3883, "mean_first_audio_seconds": 0.3092, "mean_job_wall_seconds": 6.4182},
+    {"lanes": 4, "successes": 4, "aggregate_realtime_factor": 3.6113, "mean_first_audio_seconds": 0.3824, "mean_job_wall_seconds": 8.2837}
   ],
   "qwen_1_7b_results": [
-    {"lanes": 1, "successes": 1, "aggregate_realtime_factor": 2.6859, "mean_first_audio_seconds": 0.2941},
-    {"lanes": 2, "successes": 2, "aggregate_realtime_factor": 2.3655, "mean_first_audio_seconds": 0.6889},
-    {"lanes": 3, "successes": 3, "aggregate_realtime_factor": 2.2775, "mean_first_audio_seconds": 1.1052},
-    {"lanes": 4, "successes": 0, "aggregate_realtime_factor": 0.0, "mean_first_audio_seconds": 0.0, "unstable": true, "aborted_after_seconds": 125.5}
+    {"lanes": 1, "successes": 1, "aggregate_realtime_factor": 1.8873, "mean_first_audio_seconds": 0.2435, "mean_job_wall_seconds": 4.0692},
+    {"lanes": 2, "successes": 2, "aggregate_realtime_factor": 2.8692, "mean_first_audio_seconds": 0.2954, "mean_job_wall_seconds": 5.3534},
+    {"lanes": 3, "successes": 3, "aggregate_realtime_factor": 3.2154, "mean_first_audio_seconds": 0.3875, "mean_job_wall_seconds": 6.9772},
+    {"lanes": 4, "successes": 4, "aggregate_realtime_factor": 3.3816, "mean_first_audio_seconds": 0.4983, "mean_job_wall_seconds": 8.7301}
   ],
   "raw_results": {
-    "qwen_0_6b": "outputs/qwen_benchmark_06_full.json",
-    "qwen_1_7b": "outputs/qwen_benchmark_17_full.json"
+    "qwen_0_6b": "outputs/qwen_benchmark_m4max_06.json",
+    "qwen_1_7b": "outputs/qwen_benchmark_m4max_17.json"
   }
 }

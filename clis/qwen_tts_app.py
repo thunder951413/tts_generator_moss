@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import gc
 import hashlib
@@ -17,6 +18,7 @@ import queue
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -24,13 +26,15 @@ import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import orjson
 import torch
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STREAMING_MODULE_DIR = REPO_ROOT / "qwen_tts_service"
@@ -38,13 +42,17 @@ if str(STREAMING_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(STREAMING_MODULE_DIR))
 
 from document_projects import DocumentProjectManager
+from presets import VoicePresetStore
 from qwen_protocol import StreamingRequest
 from qwen_runtime import QwenWorkerRuntime
+from stt_runtime import STTUnavailableError, WhisperCppRuntime
 
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "qwen_tts_streaming"
 DEFAULT_UPLOAD_DIR = REPO_ROOT / "outputs" / "qwen_tts_uploads"
 DEFAULT_DOCUMENT_PROJECT_DIR = REPO_ROOT / "outputs" / "qwen_tts_document_projects"
 DEFAULT_SERVICE_JOB_DIR = REPO_ROOT / "outputs" / "qwen_tts_service_jobs"
+DEFAULT_PRESET_DIR = REPO_ROOT / "outputs" / "qwen_tts_presets"
+NOVEL_READER_WEB_DIR = REPO_ROOT / "web" / "novel_reader"
 SERVICE_AUTH_COOKIE = "qwen_tts_service_session"
 DEFAULT_QWEN_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_QWEN_WORKER_SCRIPT = STREAMING_MODULE_DIR / "qwen_worker.py"
@@ -53,6 +61,9 @@ DEFAULT_QWEN_1_7B_MODEL_DIR = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 DEFAULT_QWEN_BACKEND = "ggml"
 DEFAULT_QWEN_QUANT = "Q4_K_M"
 DEFAULT_QWENTTS_LIBRARY = REPO_ROOT / ".runtime" / "qwentts.cpp" / "build-metal" / "libqwen.dylib"
+DEFAULT_WHISPER_SERVER = Path("/opt/homebrew/bin/whisper-server")
+DEFAULT_WHISPER_MODEL = REPO_ROOT / ".runtime" / "whisper.cpp" / "models" / "ggml-small.bin"
+DEFAULT_WHISPER_PORT = 7890
 DEFAULT_MODEL_PROFILE = "qwen_0_6b"
 MODEL_PROFILE_LABELS = {
     "qwen_0_6b": "Qwen3-TTS 0.6B（Metal 极速克隆）",
@@ -202,6 +213,11 @@ def _safe_int(value: Any, *, default: int, minimum: int, maximum: int | None = N
     return parsed
 
 
+def _safe_aac_bitrate(value: Any, *, default: str = "80k") -> str:
+    bitrate = str(value or default).strip().lower()
+    return bitrate if bitrate in {"48k", "64k", "80k", "96k", "128k", "192k"} else default
+
+
 def _safe_float(value: Any, *, default: float, minimum: float, maximum: float | None = None) -> float:
     try:
         parsed = float(value)
@@ -221,6 +237,22 @@ def _decode_reference_path(path: str) -> str:
             break
         decoded = next_decoded
     return decoded
+
+
+def _resolve_allowed_reference_audio_path(path: str, *roots: Path) -> Path:
+    """Resolve a reference file without allowing an arbitrary local-file read."""
+    try:
+        candidate = Path(_decode_reference_path(path)).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise FileNotFoundError(path) from exc
+    for root in roots:
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if candidate.is_file() and (candidate == resolved_root or resolved_root in candidate.parents):
+            return candidate
+    raise PermissionError("reference audio path is not allowed")
 
 
 def _pcm16le_bytes(waveform: torch.Tensor, channels: int = 2) -> bytes:
@@ -702,9 +734,17 @@ def create_app(
     qwentts_library: str | Path = DEFAULT_QWENTTS_LIBRARY,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     upload_dir: str | Path = DEFAULT_UPLOAD_DIR,
+    preset_dir: str | Path = DEFAULT_PRESET_DIR,
     preload: bool = True,
     max_parallel_generations: int = 1,
+    document_parallel_generations: int = 2,
     access_password: str = "",
+    stt_enabled: bool = True,
+    stt_preload: bool | None = None,
+    whisper_server: str | Path = DEFAULT_WHISPER_SERVER,
+    whisper_model: str | Path = DEFAULT_WHISPER_MODEL,
+    whisper_port: int = DEFAULT_WHISPER_PORT,
+    whisper_threads: int = 8,
 ) -> FastAPI:
     runtime_manager = RuntimeManager(
         qwen_python=str(qwen_python),
@@ -720,10 +760,21 @@ def create_app(
     jobs = StreamingJobManager(DEFAULT_SERVICE_JOB_DIR)
     output_dir = Path(output_dir)
     upload_dir = Path(upload_dir)
+    reader_temp_dir = output_dir / "reader-temporary-audio"
     output_dir.mkdir(parents=True, exist_ok=True)
     upload_dir.mkdir(parents=True, exist_ok=True)
+    reader_temp_dir.mkdir(parents=True, exist_ok=True)
+    preset_store = VoicePresetStore(preset_dir)
     generation_scheduler = GpuGenerationScheduler(max_parallel=max_parallel_generations)
     ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+    stt_runtime = WhisperCppRuntime(
+        binary=whisper_server,
+        model=whisper_model,
+        port=int(whisper_port),
+        threads=max(1, int(whisper_threads)),
+        log_path=REPO_ROOT / "logs" / "whisper-server.log",
+    )
+    should_preload_stt = bool(preload if stt_preload is None else stt_preload)
     def synthesize_for_profile_runtime(runtime: Any, request: StreamingRequest, *, output_dir: str | Path):
         yield from runtime.synthesize(request, output_dir=output_dir)
 
@@ -734,6 +785,10 @@ def create_app(
         request_cls=StreamingRequest,
         generation_lock=generation_scheduler,
         ffmpeg_path=ffmpeg_path,
+        synthesis_workers=min(
+            max(1, int(document_parallel_generations)),
+            max(1, int(max_parallel_generations)),
+        ),
     )
 
     @asynccontextmanager
@@ -741,12 +796,37 @@ def create_app(
         if preload:
             with runtime_manager.session(DEFAULT_MODEL_PROFILE):
                 pass
+        if stt_enabled and should_preload_stt:
+            try:
+                stt_runtime.start()
+            except STTUnavailableError:
+                logging.exception("STT preload failed; TTS service will remain available")
         try:
             yield
         finally:
+            stt_runtime.close()
             runtime_manager.close()
 
     app = FastAPI(title="Qwen3-TTS Apple Silicon Service", lifespan=lifespan)
+    app.state.stt_runtime = stt_runtime
+    app.mount(
+        "/reader-assets",
+        StaticFiles(directory=str(NOVEL_READER_WEB_DIR)),
+        name="novel-reader-assets",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=[
+            "X-Audio-Codec",
+            "X-Audio-Sample-Rate",
+            "X-Audio-Channels",
+            "X-Stream-Id",
+        ],
+    )
     resolved_access_password = str(access_password or "")
     expected_session = hmac.new(
         resolved_access_password.encode("utf-8"), b"qwen-tts-service-session", hashlib.sha256
@@ -754,10 +834,21 @@ def create_app(
 
     @app.middleware("http")
     async def require_service_login(request: Request, call_next):
-        if not resolved_access_password or request.url.path in {"/login", "/api/health"}:
+        if (
+            not resolved_access_password
+            or request.method == "OPTIONS"
+            or request.url.path in {"/login", "/api/health"}
+        ):
             return await call_next(request)
         supplied = request.cookies.get(SERVICE_AUTH_COOKIE, "")
-        if hmac.compare_digest(supplied, expected_session):
+        authorization = request.headers.get("authorization", "")
+        bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        api_key = request.headers.get("x-api-key", "")
+        if (
+            hmac.compare_digest(supplied, expected_session)
+            or hmac.compare_digest(bearer, resolved_access_password)
+            or hmac.compare_digest(api_key, resolved_access_password)
+        ):
             return await call_next(request)
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": "authentication required"}, status_code=401)
@@ -800,21 +891,15 @@ def create_app(
         response.delete_cookie(SERVICE_AUTH_COOKIE)
         return response
 
-    @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
-        defaults = {
-            "text": "欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。",
-            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
-            "seed": 1234,
-        }
-        return HTMLResponse(
-            _html(
-                defaults=defaults,
-                examples=EXAMPLE_ROWS,
-                voices=BAILIAN_VOICE_ROWS,
-                languages=LANGUAGE_TAG_CHOICES,
-                runtime=runtime_manager.status(),
-            )
+    @app.get("/")
+    async def index() -> RedirectResponse:
+        return RedirectResponse(url="/reader", status_code=307)
+
+    @app.get("/reader")
+    async def novel_reader() -> FileResponse:
+        return FileResponse(
+            str(NOVEL_READER_WEB_DIR / "index.html"),
+            media_type="text/html",
         )
 
     def _put_stream_audio(job: StreamingJob, pcm_bytes: bytes) -> None:
@@ -846,6 +931,22 @@ def create_app(
                 except queue.Empty:
                     return
 
+    def _remove_generated_result_files(result: dict[str, Any] | None) -> None:
+        if not result:
+            return
+        resolved_output = output_dir.resolve()
+        for key in ("audio_path", "tokens_path", "metadata_path"):
+            raw_path = result.get(key)
+            if not raw_path:
+                continue
+            try:
+                candidate = Path(str(raw_path)).resolve()
+                candidate.relative_to(resolved_output)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if candidate.is_file():
+                candidate.unlink(missing_ok=True)
+
     def _run_job(
         job: StreamingJob, request: StreamingRequest, mode_name: str,
         streaming_generation: bool, model_profile: str,
@@ -866,6 +967,8 @@ def create_app(
                 for event in synthesize_for_profile_runtime(runtime, request, output_dir=output_dir):
                     with job.status_lock:
                         if job.is_closed:
+                            if event.type == "result" and job.status.get("ephemeral_audio"):
+                                _remove_generated_result_files(event.data)
                             break
                     if event.type == "metadata":
                         job.update(**event.data)
@@ -927,26 +1030,28 @@ def create_app(
         language: str = Form(""),
         text: str = Form(...),
         prompt_text: str = Form(""),
-        max_new_tokens: int = Form(DEFAULT_MAX_NEW_TOKENS),
-        codec_chunk_frames: int = Form(16),
-        seed: int = Form(1234),
+        max_new_tokens: int | None = Form(None),
+        codec_chunk_frames: int | None = Form(None),
+        seed: int | None = Form(None),
         tokens_control: int = Form(0),
         tokens: int = Form(0),
-        temperature: float = Form(1.7),
-        top_p: float = Form(0.8),
-        top_k: int = Form(25),
-        repetition_penalty: float = Form(1.0),
-        model_profile: str = Form(DEFAULT_MODEL_PROFILE),
-        voice_name: str = Form("本地克隆音色"),
-        streaming_generation: int = Form(1),
-        qwen_clone_mode: str = Form("xvec"),
+        temperature: float | None = Form(None),
+        top_p: float | None = Form(None),
+        top_k: int | None = Form(None),
+        repetition_penalty: float | None = Form(None),
+        model_profile: str = Form(""),
+        voice_name: str = Form(""),
+        streaming_generation: int | None = Form(None),
+        qwen_clone_mode: str = Form(""),
         qwen_reference_text: str = Form(""),
-        qwen_non_streaming_mode: int = Form(0),
-        qwen_append_silence: int = Form(1),
+        qwen_non_streaming_mode: int | None = Form(None),
+        qwen_append_silence: int | None = Form(None),
         qwen_instruct: str = Form(""),
-        qwen_min_new_tokens: int = Form(2),
+        qwen_min_new_tokens: int | None = Form(None),
         example_audio_path: str = Form(""),
         prompt_audio: UploadFile | None = File(None),
+        use_service_settings: int = Form(1),
+        ephemeral_audio: int = Form(0),
     ) -> JSONResponse:
         text = (text or "").strip()
         if not text:
@@ -955,6 +1060,56 @@ def create_app(
         mode = "voice_clone"
         language = "Chinese"
         mode_name = MODE_CLONE
+        service_settings = dict(active_service_settings().get("settings") or {})
+        use_applied_service_settings = bool(
+            _safe_int(use_service_settings, default=1, minimum=0, maximum=1)
+        )
+        def service_value(explicit: Any, key: str, fallback: Any) -> Any:
+            if use_applied_service_settings:
+                return service_settings.get(key, fallback)
+            return explicit if explicit is not None and explicit != "" else fallback
+
+        max_new_tokens = service_value(max_new_tokens, "qwen_max_new_tokens", 2048)
+        codec_chunk_frames = service_value(codec_chunk_frames, "qwen_chunk_size", 8)
+        seed = service_value(seed, "qwen_seed", 1234)
+        temperature = service_value(temperature, "qwen_temperature", 0.9)
+        top_p = service_value(top_p, "qwen_top_p", 1.0)
+        top_k = service_value(top_k, "qwen_top_k", 50)
+        repetition_penalty = (
+            service_value(repetition_penalty, "qwen_repetition_penalty", 1.05)
+        )
+        model_profile = str(service_value(model_profile, "model_profile", DEFAULT_MODEL_PROFILE))
+        voice_name = str(service_value(voice_name, "voice_name", "本地克隆音色"))
+        # Delivery mode belongs to the caller. The applied service setting owns
+        # the voice and synthesis parameters, while a reader may still choose
+        # realtime streaming or complete-block playback.
+        streaming_generation = _safe_int(
+            streaming_generation if streaming_generation is not None
+            else service_settings.get("qwen_streaming_generation", 1),
+            default=1,
+            minimum=0,
+            maximum=1,
+        )
+        qwen_clone_mode = str(service_value(qwen_clone_mode, "qwen_clone_mode", "xvec"))
+        qwen_reference_text = str(service_value(
+            qwen_reference_text, "qwen_reference_text", ""
+        ))
+        qwen_non_streaming_mode = _safe_int(
+            qwen_non_streaming_mode if qwen_non_streaming_mode is not None
+            else service_settings.get("qwen_non_streaming_mode", 0),
+            default=0,
+            minimum=0,
+            maximum=1,
+        )
+        qwen_append_silence = int(bool(service_value(
+            qwen_append_silence, "qwen_append_silence", True
+        )))
+        qwen_min_new_tokens = service_value(qwen_min_new_tokens, "qwen_min_new_tokens", 2)
+        example_audio_path = str(service_value(
+            example_audio_path, "reference_audio_path", ""
+        ))
+        if use_applied_service_settings:
+            prompt_audio = None
 
         prompt_audio_path = ""
         if prompt_audio is not None and prompt_audio.filename:
@@ -963,9 +1118,16 @@ def create_app(
             prompt_path.write_bytes(await prompt_audio.read())
             prompt_audio_path = str(prompt_path)
         elif example_audio_path:
-            candidate = Path(_decode_reference_path(example_audio_path))
-            if candidate.exists() and REFERENCE_AUDIO_DIR in candidate.resolve().parents:
-                prompt_audio_path = str(candidate)
+            try:
+                prompt_audio_path = str(
+                    _resolve_allowed_reference_audio_path(
+                        example_audio_path,
+                        REFERENCE_AUDIO_DIR,
+                        preset_store.audio_dir,
+                    )
+                )
+            except (FileNotFoundError, PermissionError):
+                prompt_audio_path = ""
 
         if not prompt_audio_path and DEFAULT_CLONE_AUDIO_PATH:
             prompt_audio_path = DEFAULT_CLONE_AUDIO_PATH
@@ -1030,6 +1192,9 @@ def create_app(
                 "seed": resolved_seed,
                 "configured_seed": configured_seed,
                 "seed_mode": seed_mode,
+                "ephemeral_audio": bool(
+                    _safe_int(ephemeral_audio, default=0, minimum=0, maximum=1)
+                ),
             }
         )
         thread = threading.Thread(
@@ -1058,16 +1223,204 @@ def create_app(
     @app.get("/api/reference-audio")
     async def reference_audio(path: str) -> FileResponse:
         try:
-            reference_root = REFERENCE_AUDIO_DIR.resolve(strict=True)
-            candidate = Path(_decode_reference_path(path)).resolve(strict=True)
+            candidate = _resolve_allowed_reference_audio_path(
+                path,
+                REFERENCE_AUDIO_DIR,
+                preset_store.audio_dir,
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="reference audio not found") from exc
-        if candidate != reference_root and reference_root not in candidate.parents:
-            raise HTTPException(status_code=403, detail="reference audio path is not allowed")
-        if not candidate.is_file():
-            raise HTTPException(status_code=404, detail="reference audio not found")
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail="reference audio path is not allowed") from exc
         media_type = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
         return FileResponse(str(candidate), media_type=media_type, filename=candidate.name)
+
+    def preset_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        name = str(payload.get("name") or "").strip()
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            raise HTTPException(status_code=400, detail="预设设置必须是对象")
+        copied = dict(settings)
+        model_profile = str(copied.get("model_profile") or DEFAULT_MODEL_PROFILE)
+        if model_profile not in runtime_manager.profiles:
+            raise HTTPException(status_code=400, detail="无效的模型预设")
+        copied["model_profile"] = model_profile
+        reference_path = str(copied.get("reference_audio_path") or "").strip()
+        if reference_path:
+            try:
+                copied["reference_audio_path"] = str(
+                    _resolve_allowed_reference_audio_path(
+                        reference_path,
+                        REFERENCE_AUDIO_DIR,
+                        preset_store.audio_dir,
+                    )
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=400, detail="预设参考音频不存在") from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=400, detail="预设参考音频不在允许目录") from exc
+        return name, copied
+
+    @app.get("/api/presets")
+    async def list_presets() -> JSONResponse:
+        active = preset_store.active()
+        return JSONResponse(
+            {
+                "presets": preset_store.list(),
+                "active_preset_id": active["id"] if active else "",
+            }
+        )
+
+    def active_service_settings() -> dict[str, Any]:
+        configuration = preset_store.service_configuration()
+        if configuration is not None:
+            return {
+                "active_preset_id": str(configuration.get("preset_id") or ""),
+                "name": str(configuration.get("name") or "服务设置"),
+                "source": "preset" if configuration.get("preset_id") else "studio",
+                "settings": dict(configuration.get("settings") or {}),
+                "updated_at": configuration.get("updated_at"),
+            }
+        active = preset_store.active()
+        if active is not None:
+            return {
+                "active_preset_id": active["id"],
+                "name": active["name"],
+                "source": "preset",
+                "settings": dict(active.get("settings") or {}),
+            }
+        default_voice = next(
+            (voice for voice in BAILIAN_VOICE_ROWS if voice.get("audio_path") == DEFAULT_CLONE_AUDIO_PATH),
+            BAILIAN_VOICE_ROWS[0] if BAILIAN_VOICE_ROWS else {},
+        )
+        return {
+            "active_preset_id": "",
+            "name": str(default_voice.get("name") or "服务默认音色"),
+            "source": "default",
+            "settings": {
+                "model_profile": DEFAULT_MODEL_PROFILE,
+                "voice_name": str(default_voice.get("name") or "服务默认音色"),
+                "reference_audio_path": str(default_voice.get("audio_path") or DEFAULT_CLONE_AUDIO_PATH),
+                "qwen_clone_mode": "xvec",
+                "qwen_reference_text": "",
+                "qwen_temperature": 0.9,
+                "qwen_top_p": 1.0,
+                "qwen_top_k": 50,
+                "qwen_repetition_penalty": 1.05,
+                "qwen_max_new_tokens": 2048,
+                "qwen_chunk_size": 8,
+                "qwen_min_new_tokens": 2,
+                "qwen_seed": 1234,
+                "qwen_append_silence": True,
+                "qwen_aac_bitrate": "80k",
+            },
+        }
+
+    @app.get("/api/service-settings")
+    async def get_service_settings() -> JSONResponse:
+        return JSONResponse(active_service_settings())
+
+    @app.put("/api/service-settings/active-preset")
+    async def activate_service_preset(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        try:
+            preset = preset_store.activate(str(payload.get("preset_id") or ""))
+            return JSONResponse(
+                {
+                    "active_preset_id": preset["id"],
+                    "name": preset["name"],
+                    "source": "preset",
+                    "settings": dict(preset.get("settings") or {}),
+                }
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="preset not found") from exc
+
+    @app.put("/api/service-settings")
+    async def apply_service_settings(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        try:
+            name, settings = preset_payload(payload)
+            configuration = preset_store.apply_configuration(name=name or "音频工作台设置", settings=settings)
+            return JSONResponse(
+                {
+                    "active_preset_id": "",
+                    "name": configuration["name"],
+                    "source": "studio",
+                    "settings": dict(configuration.get("settings") or {}),
+                    "updated_at": configuration.get("updated_at"),
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/service-settings")
+    async def reset_service_settings() -> JSONResponse:
+        preset_store.clear_configuration()
+        return JSONResponse(active_service_settings())
+
+    @app.get("/api/voices")
+    async def list_native_voices() -> JSONResponse:
+        return JSONResponse(
+            {
+                "voices": BAILIAN_VOICE_ROWS,
+                "default_reference_audio_path": DEFAULT_CLONE_AUDIO_PATH,
+                "models": [
+                    {
+                        "id": profile_id,
+                        "label": MODEL_PROFILE_LABELS[profile_id],
+                    }
+                    for profile_id in ("qwen_0_6b", "qwen_1_7b")
+                ],
+            }
+        )
+
+    @app.post("/api/presets")
+    async def create_preset(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        try:
+            name, settings = preset_payload(payload)
+            return JSONResponse(preset_store.create(name=name, settings=settings), status_code=201)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/presets/{preset_id}")
+    async def update_preset(preset_id: str, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        try:
+            name, settings = preset_payload(payload)
+            return JSONResponse(preset_store.update(preset_id, name=name, settings=settings))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="preset not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/presets/{preset_id}")
+    async def delete_preset(preset_id: str) -> JSONResponse:
+        try:
+            preset_store.delete(preset_id)
+            return JSONResponse({"ok": True})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="preset not found") from exc
+
+    @app.post("/api/presets/reference-audio")
+    async def import_preset_reference_audio(audio: UploadFile = File(...)) -> JSONResponse:
+        filename = audio.filename or "reference.wav"
+        data = await audio.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="参考音频为空")
+        if len(data) > 100 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="参考音频不能超过 100 MB")
+        temporary = upload_dir / f"preset-{uuid.uuid4().hex}{Path(filename).suffix or '.wav'}"
+        try:
+            temporary.write_bytes(data)
+            imported = preset_store.import_reference_audio(filename=filename, temporary_path=temporary)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+        return JSONResponse(
+            {
+                "reference_audio_path": str(imported),
+                "audio_url": f"/api/reference-audio?path={quote(str(imported), safe='')}",
+            }
+        )
 
     @app.get("/api/generate-stream/{job_id}/audio")
     async def generate_stream_audio(job_id: str) -> StreamingResponse:
@@ -1110,6 +1463,77 @@ def create_app(
             raise HTTPException(status_code=404, detail="result is not ready")
         return FileResponse(job.result["audio_path"], media_type="audio/wav", filename="generated.wav")
 
+    @app.get("/api/generate-stream/{job_id}/result-audio-aac")
+    async def generate_stream_result_audio_aac(
+        job_id: str,
+        bitrate: str = "80k",
+    ) -> FileResponse:
+        job = jobs.get(job_id)
+        if job.result is None:
+            raise HTTPException(status_code=404, detail="result is not ready")
+        source = Path(str(job.result.get("audio_path") or ""))
+        if not source.is_file():
+            raise HTTPException(status_code=404, detail="generated audio is missing")
+        selected_bitrate = _safe_aac_bitrate(bitrate)
+        target = reader_temp_dir / f"{job_id}-{selected_bitrate}.m4a"
+        if not target.is_file():
+            completed = subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "48000",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    selected_bitrate,
+                    "-movflags",
+                    "+faststart",
+                    str(target),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0 or not target.is_file():
+                target.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail=(completed.stderr or "AAC encoding failed").strip(),
+                )
+        return FileResponse(
+            str(target),
+            media_type="audio/mp4",
+            filename=f"reader-block-{job_id}.m4a",
+        )
+
+    def _remove_ephemeral_job_audio(job: StreamingJob) -> None:
+        for target in reader_temp_dir.glob(f"{job.job_id}-*.m4a"):
+            target.unlink(missing_ok=True)
+        if not bool(job.snapshot().get("ephemeral_audio")) or job.result is None:
+            return
+        _remove_generated_result_files(job.result)
+        with job.status_lock:
+            job.result = None
+            job.status["audio_path"] = None
+            job.status["ephemeral_cleaned"] = True
+            job.status["updated_at"] = time.time()
+        job.persist()
+
+    @app.delete("/api/generate-stream/{job_id}/ephemeral-audio")
+    async def generate_stream_delete_ephemeral_audio(job_id: str) -> JSONResponse:
+        job = jobs.close(job_id)
+        _remove_ephemeral_job_audio(job)
+        return JSONResponse({"ok": True, "job_id": job_id})
+
     @app.post("/api/generate-stream/{job_id}/close")
     async def generate_stream_close(job_id: str) -> JSONResponse:
         jobs.close(job_id)
@@ -1128,13 +1552,71 @@ def create_app(
                 "dtype": runtime_manager.dtype,
                 "attn_implementation": runtime_manager.attn_implementation,
                 "runtime": runtime_manager.status(),
-                "generation_scheduler": generation_scheduler.status(),
+                "generation_scheduler": {
+                    **generation_scheduler.status(),
+                    "document_parallel": document_projects.synthesis_workers,
+                },
+                "stt": stt_runtime.status() if stt_enabled else {
+                    "state": "disabled",
+                    "ready": False,
+                    "available": False,
+                },
             }
         )
 
+    @app.get("/api/stt/status")
+    async def stt_status() -> JSONResponse:
+        if not stt_enabled:
+            return JSONResponse({"state": "disabled", "ready": False, "available": False})
+        return JSONResponse(stt_runtime.status())
+
+    @app.post("/v1/audio/transcriptions")
+    async def transcribe_audio(
+        file: UploadFile = File(...),
+        model: str = Form("whisper-small"),
+        language: str = Form("auto"),
+        prompt: str = Form(""),
+        response_format: str = Form("json"),
+    ) -> Response:
+        del model  # OpenAI-compatible field; this service has one resident model.
+        if not stt_enabled:
+            raise HTTPException(status_code=503, detail="STT is disabled")
+        if response_format not in {"json", "verbose_json", "text", "srt", "vtt"}:
+            raise HTTPException(status_code=400, detail="unsupported response_format")
+        audio = await file.read()
+        if not audio:
+            raise HTTPException(status_code=400, detail="audio file is empty")
+        if len(audio) > 500 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="audio file exceeds 500 MB")
+        try:
+            payload, media_type = await asyncio.to_thread(
+                stt_runtime.transcribe,
+                audio=audio,
+                filename=file.filename or "audio.wav",
+                language=(language or "auto").strip(),
+                prompt=(prompt or "").strip(),
+                response_format=response_format,
+            )
+        except (STTUnavailableError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return Response(content=payload, media_type=media_type)
+
     @app.get("/api/health")
     async def health() -> JSONResponse:
-        return JSONResponse({**runtime_manager.status(), "generation_scheduler": generation_scheduler.status()})
+        return JSONResponse(
+            {
+                **runtime_manager.status(),
+                "generation_scheduler": {
+                    **generation_scheduler.status(),
+                    "document_parallel": document_projects.synthesis_workers,
+                },
+                "stt": stt_runtime.status() if stt_enabled else {
+                    "state": "disabled",
+                    "ready": False,
+                    "available": False,
+                },
+            }
+        )
 
     @app.get("/api/service/tasks")
     async def service_tasks() -> JSONResponse:
@@ -1209,13 +1691,33 @@ def create_app(
             incoming = json.loads(raw or "{}")
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="invalid document settings") from exc
+        service_settings = dict(active_service_settings().get("settings") or {})
+        inherited = {
+            "model_profile": service_settings.get("model_profile"),
+            "reference_audio_path": service_settings.get("reference_audio_path"),
+            "voice_name": service_settings.get("voice_name"),
+            "qwen_clone_mode": service_settings.get("qwen_clone_mode"),
+            "qwen_reference_text": service_settings.get("qwen_reference_text"),
+            "temperature": service_settings.get("qwen_temperature"),
+            "top_p": service_settings.get("qwen_top_p"),
+            "top_k": service_settings.get("qwen_top_k"),
+            "repetition_penalty": service_settings.get("qwen_repetition_penalty"),
+            "max_new_tokens": service_settings.get("qwen_max_new_tokens"),
+            "codec_chunk_frames": service_settings.get("qwen_chunk_size"),
+            "qwen_min_new_tokens": service_settings.get("qwen_min_new_tokens"),
+            "seed": service_settings.get("qwen_seed"),
+            "qwen_append_silence": service_settings.get("qwen_append_silence"),
+            "aac_bitrate": service_settings.get("qwen_aac_bitrate"),
+        }
+        incoming = {key: value for key, value in inherited.items() if value is not None} | incoming
         reference_audio_path = str(incoming.get("reference_audio_path") or DEFAULT_CLONE_AUDIO_PATH)
         try:
-            reference_candidate = Path(_decode_reference_path(reference_audio_path)).resolve(strict=True)
-            reference_root = REFERENCE_AUDIO_DIR.resolve(strict=True)
-            if reference_root not in reference_candidate.parents or not reference_candidate.is_file():
-                raise ValueError
-        except (FileNotFoundError, ValueError) as exc:
+            reference_candidate = _resolve_allowed_reference_audio_path(
+                reference_audio_path,
+                REFERENCE_AUDIO_DIR,
+                preset_store.audio_dir,
+            )
+        except (FileNotFoundError, PermissionError) as exc:
             raise HTTPException(status_code=400, detail="invalid clone reference audio") from exc
         model_profile = str(incoming.get("model_profile") or DEFAULT_MODEL_PROFILE)
         if model_profile not in runtime_manager.profiles:
@@ -1265,9 +1767,9 @@ def create_app(
             "qwen_min_new_tokens": _safe_int(
                 incoming.get("qwen_min_new_tokens"), default=2, minimum=2, maximum=256
             ),
-            "aac_bitrate": "192k",
+            "aac_bitrate": _safe_aac_bitrate(incoming.get("aac_bitrate"), default="80k"),
             "sample_rate": 48000,
-            "channels": 2,
+            "channels": 1,
         }
 
     @app.get("/api/document-projects")
@@ -1324,6 +1826,35 @@ def create_app(
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/document-projects/{project_id}/start-selection")
+    async def start_document_project_selection(
+        project_id: str,
+        segment_start: int = Form(0),
+        segment_end: int = Form(0),
+        settings_json: str = Form(""),
+    ) -> JSONResponse:
+        try:
+            project = document_projects.get_project(project_id)
+            maximum = max(0, len(project.get("segments", [])) - 1)
+            start_index = _safe_int(segment_start, default=0, minimum=0, maximum=maximum)
+            end_index = _safe_int(
+                segment_end,
+                default=start_index,
+                minimum=start_index,
+                maximum=maximum,
+            )
+            return JSONResponse(
+                document_projects.start(
+                    project_id,
+                    settings=document_settings(settings_json) if settings_json.strip() else None,
+                    segment_indices=list(range(start_index, end_index + 1)),
+                )
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/document-projects/{project_id}/stop")
     async def stop_document_project(project_id: str) -> JSONResponse:
         try:
@@ -1355,6 +1886,25 @@ def create_app(
             )
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
+
+    @app.put("/api/document-projects/{project_id}/segments/{segment_index}")
+    async def update_document_segment(
+        project_id: str,
+        segment_index: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        try:
+            return JSONResponse(
+                document_projects.update_segment_text(
+                    project_id,
+                    segment_index=segment_index,
+                    text=str(payload.get("text") or ""),
+                )
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/document-projects/{project_id}/media")
     async def document_project_media(project_id: str, path: str) -> FileResponse:
@@ -1439,6 +1989,9 @@ INDEX_HTML = r"""
     .app-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; letter-spacing: 0.2px; }
     .app-subtitle { color: var(--muted); font-size: 14px; }
     .app-header-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .app-header-actions { display: flex; align-items: center; gap: 8px; }
+    .reader-link { display: inline-flex; align-items: center; min-height: 31px; padding: 0 12px; border: 1px solid #d8d4f3; border-radius: 7px; background: #f1efff; color: #5143c7; font-size: 12px; font-weight: 700; text-decoration: none; }
+    .reader-link:hover { background: #e8e4ff; }
     .model-profile-row { display: grid; grid-template-columns: 150px minmax(260px, 420px); gap: 10px; align-items: center; margin-top: 12px; }
     .model-profile-row select { min-width: 0; }
     .logout-button { padding: 7px 11px; background: #f3f4f6; color: var(--muted); font-size: 12px; }
@@ -1613,6 +2166,9 @@ INDEX_HTML = r"""
       font-size: 12px;
     }
     .summary { color: var(--muted); margin-bottom: 8px; }
+    .preset-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; }
+    .preset-save-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; margin-top: 8px; }
+    .preset-status { min-height: 18px; margin-top: 8px; color: var(--muted); font-size: 12px; }
     .meter { height: 7px; background: #e5e7eb; border-radius: 999px; overflow: hidden; margin-bottom: 8px; }
     .meter > div { height: 100%; width: 0%; background: var(--orange); transition: width 0.2s ease; }
     .clone-voice-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
@@ -1694,7 +2250,8 @@ INDEX_HTML = r"""
     <div class="app-card">
       <div class="app-header-row"><div><div class="app-title">Qwen3-TTS · Apple Silicon Metal</div>
       <div class="app-subtitle">后台服务持续执行任务；关闭页面后可从其他设备登录并查看进度</div></div>
-      <form method="post" action="/logout"><button class="logout-button" type="submit">退出登录</button></form></div>
+      <div class="app-header-actions"><a class="reader-link" href="/reader">打开小说阅读器</a>
+      <form method="post" action="/logout"><button class="logout-button" type="submit">退出登录</button></form></div></div>
       <div class="model-profile-row">
         <label for="model-profile" style="margin:0;font-weight:700;">生成模型</label>
         <select id="model-profile">
@@ -1724,6 +2281,21 @@ INDEX_HTML = r"""
         <div class="panel">
           <label for="text">Text</label>
           <textarea id="text" placeholder="Enter text to synthesize or continue after the reference audio."></textarea>
+        </div>
+
+        <div class="panel">
+          <label for="preset-select">语音预设</label>
+          <div class="preset-controls">
+            <select id="preset-select"><option value="">选择已保存预设…</option></select>
+            <button id="preset-apply" class="secondary small-button" type="button">应用</button>
+            <button id="preset-delete" class="secondary small-button" type="button" disabled>删除</button>
+          </div>
+          <div class="preset-save-row">
+            <input id="preset-name" type="text" maxlength="120" placeholder="预设名称，例如：旁白·龙嫱·0.6B">
+            <button id="preset-save" class="primary small-button" type="button">保存为新预设</button>
+            <button id="preset-update" class="secondary small-button" type="button" disabled>更新选中预设</button>
+          </div>
+          <div id="preset-status" class="preset-status">预设会保存模型、参考音频、种子和全部 Qwen 生成参数；保存自定义音频时会一并导入本地服务。</div>
         </div>
 
         <div class="panel">
@@ -1974,7 +2546,7 @@ INDEX_HTML = r"""
     <div id="workspace-document" class="workspace-panel hidden" role="tabpanel" aria-labelledby="workspace-tab-document">
     <div class="panel document-workspace">
       <label style="color: var(--ink); font-size: 16px; font-weight: 700;">文档转音频项目</label>
-      <div class="hint" style="margin-bottom: 12px;">拖入 TXT、Markdown 或 DOCX 创建项目；项目会固定当前音色与生成参数，支持追加文档、暂停和断点继续。</div>
+      <div class="hint" style="margin-bottom: 12px;">面向整本书优化：自动分段后使用两个 Metal 通道并行生成，并行转 AAC，最终严格按原文顺序合并；支持追加文档、暂停和断点继续。</div>
       <div class="document-toolbar">
         <div>
           <input id="document-project-name" type="text" placeholder="项目名称（留空则使用文档名）" style="margin-bottom: 8px;">
@@ -2104,6 +2676,8 @@ let serviceTasksPollTimer = null;
 let documentPlaybackIndex = null;
 let documentPlaybackActive = false;
 let lastPlaybackSaveAt = 0;
+let voicePresets = [];
+let activePresetVoiceName = "";
 const DOCUMENT_PROJECT_SELECTION_KEY = "qwen-tts-current-document-project-v1";
 
 function field(id) { return document.getElementById(id); }
@@ -2157,7 +2731,9 @@ function renderRuntime(status) {
   runtimeReady = status && status.state === "ready";
   const elapsed = status && status.load_elapsed_seconds != null ? ` | load=${Number(status.load_elapsed_seconds).toFixed(1)}s` : "";
   const extra = runtimeReady ? ` | n_vq=${status.n_vq} | sr=${status.sample_rate}` : "";
-  const parallel = status && status.generation_scheduler ? ` | GPU并行=${status.generation_scheduler.max_parallel}` : "";
+  const parallel = status && status.generation_scheduler
+    ? ` | GPU并行=${status.generation_scheduler.max_parallel} | 整书并行=${status.generation_scheduler.document_parallel || 1}`
+    : "";
   const error = status && status.error ? ` | error=${status.error}` : "";
   field("runtime-summary").textContent = `Runtime: ${(status && status.state) || "unknown"}${elapsed}${extra}${parallel}${error}`;
 }
@@ -2249,6 +2825,7 @@ function setReferenceSourceMode(mode) {
     field("prompt-audio").value = "";
     field("example-audio-path").value = "";
     field("clone-voice").value = "";
+    activePresetVoiceName = "";
     syncCloneVoiceListSelection();
     clearIclTranscriptForCustomReference();
   }
@@ -2340,6 +2917,7 @@ async function startReferenceRecording() {
   field("prompt-audio").value = "";
   field("example-audio-path").value = "";
   field("clone-voice").value = "";
+  activePresetVoiceName = "";
   syncCloneVoiceListSelection();
   clearIclTranscriptForCustomReference();
   recordedReferenceFile = null;
@@ -2699,6 +3277,10 @@ function selectedCloneVoice() {
   return CLONE_VOICES.find((voice) => voice.audio_path === selectedPath) || null;
 }
 
+function currentVoiceName() {
+  return selectedCloneVoice()?.name || activePresetVoiceName || "本地克隆音色";
+}
+
 function persistIclTranscriptOverrides() {
   try {
     localStorage.setItem(
@@ -2810,6 +3392,7 @@ function selectCloneVoice(audioPath, autoplay = false) {
   updateReferenceLabel();
   syncCloneVoiceListSelection();
   const selectedVoice = CLONE_VOICES.find((voice) => voice.audio_path === audioPath);
+  activePresetVoiceName = selectedVoice?.name || "";
   applySelectedVoiceTranscript(true);
   setStatus(`已选择克隆音色：${selectedVoice ? `${selectedVoice.name} — ${selectedVoice.description}` : audioPath}`);
   if (autoplay) {
@@ -2818,6 +3401,164 @@ function selectCloneVoice(audioPath, autoplay = false) {
   }
   saveUiState();
 }
+
+function setPresetStatus(message) {
+  field("preset-status").textContent = String(message || "");
+}
+
+function setPresetField(id, value) {
+  if (value === undefined || value === null || !field(id)) return;
+  field(id).value = String(value);
+  const range = field(`${id}-range`);
+  if (range) range.value = String(value);
+}
+
+function selectExternalPresetReference(audioPath, voiceName = "") {
+  if (referenceRecordingActive) stopReferenceRecording(true);
+  recordedReferenceFile = null;
+  referenceSourceMode = "upload";
+  field("prompt-audio").value = "";
+  field("example-audio-path").value = audioPath;
+  field("clone-voice").value = "";
+  activePresetVoiceName = String(voiceName || "");
+  syncReferenceSourceControls();
+  updateReferencePreview();
+  updateReferenceLabel();
+  syncCloneVoiceListSelection();
+  clearIclTranscriptForCustomReference();
+}
+
+function currentPresetSettings(referenceAudioPath) {
+  const voice = selectedCloneVoice();
+  const referencePath = referenceAudioPath || field("example-audio-path").value || voice?.audio_path || "";
+  return {
+    model_profile: selectedModelProfile(),
+    voice_name: voice?.name || activePresetVoiceName || field("preset-name").value.trim() || "自定义克隆音色",
+    reference_audio_path: referencePath,
+    qwen_clone_mode: field("qwen-clone-mode").value,
+    qwen_reference_text: field("qwen-reference-text").value,
+    qwen_temperature: field("qwen-temperature").value,
+    qwen_top_p: field("qwen-top-p").value,
+    qwen_top_k: field("qwen-top-k").value,
+    qwen_repetition_penalty: field("qwen-repetition-penalty").value,
+    qwen_max_new_tokens: field("qwen-max-new-tokens").value,
+    qwen_chunk_size: field("qwen-chunk-size").value,
+    qwen_min_new_tokens: field("qwen-min-new-tokens").value,
+    qwen_seed: field("qwen-seed").value,
+    qwen_initial_playback_delay: field("qwen-initial-playback-delay").value,
+    qwen_streaming_generation: field("qwen-streaming-generation").checked,
+    qwen_non_streaming_mode: field("qwen-non-streaming-mode").checked,
+    qwen_append_silence: field("qwen-append-silence").checked,
+  };
+}
+
+function applyVoicePreset(preset) {
+  if (!preset || !preset.settings) throw new Error("预设不存在或数据不完整");
+  const settings = preset.settings;
+  setPresetField("model-profile", settings.model_profile || "qwen_0_6b");
+  for (const [setting, fieldId] of Object.entries({
+    qwen_clone_mode: "qwen-clone-mode",
+    qwen_reference_text: "qwen-reference-text",
+    qwen_temperature: "qwen-temperature",
+    qwen_top_p: "qwen-top-p",
+    qwen_top_k: "qwen-top-k",
+    qwen_repetition_penalty: "qwen-repetition-penalty",
+    qwen_max_new_tokens: "qwen-max-new-tokens",
+    qwen_chunk_size: "qwen-chunk-size",
+    qwen_min_new_tokens: "qwen-min-new-tokens",
+    qwen_seed: "qwen-seed",
+    qwen_initial_playback_delay: "qwen-initial-playback-delay",
+  })) setPresetField(fieldId, settings[setting]);
+  for (const [setting, fieldId] of Object.entries({
+    qwen_streaming_generation: "qwen-streaming-generation",
+    qwen_non_streaming_mode: "qwen-non-streaming-mode",
+    qwen_append_silence: "qwen-append-silence",
+  })) {
+    if (typeof settings[setting] === "boolean") field(fieldId).checked = settings[setting];
+  }
+  applyModelProfileCapabilities(false);
+  const referencePath = String(settings.reference_audio_path || "");
+  if (referencePath) {
+    const builtInVoice = CLONE_VOICES.find((voice) => voice.audio_path === referencePath);
+    if (builtInVoice) selectCloneVoice(referencePath, false);
+    else selectExternalPresetReference(referencePath, settings.voice_name || preset.name);
+  }
+  if (settings.qwen_reference_text != null) field("qwen-reference-text").value = String(settings.qwen_reference_text);
+  updateIclTranscriptStatus();
+  field("preset-select").value = String(preset.id || "");
+  field("preset-name").value = String(preset.name || "");
+  field("preset-update").disabled = !preset.id;
+  field("preset-delete").disabled = !preset.id;
+  setPresetStatus(`已应用预设：${preset.name}`);
+  saveUiState();
+}
+
+function renderVoicePresets(selectedId = field("preset-select").value) {
+  const select = field("preset-select");
+  select.innerHTML = '<option value="">选择已保存预设…</option>';
+  for (const preset of voicePresets) {
+    const option = document.createElement("option");
+    option.value = preset.id;
+    option.textContent = `${preset.name} · ${preset.settings?.model_profile === "qwen_1_7b" ? "1.7B" : "0.6B"}`;
+    select.appendChild(option);
+  }
+  if (voicePresets.some((preset) => preset.id === selectedId)) select.value = selectedId;
+  const selected = voicePresets.find((preset) => preset.id === select.value);
+  field("preset-update").disabled = !selected;
+  field("preset-delete").disabled = !selected;
+}
+
+async function loadVoicePresets(selectedId = "") {
+  const data = await fetchJson(apiUrl("api/presets"));
+  voicePresets = Array.isArray(data.presets) ? data.presets : [];
+  renderVoicePresets(selectedId || field("preset-select").value);
+  return voicePresets;
+}
+
+async function persistPresetReferenceAudio() {
+  const file = field("prompt-audio").files[0] || recordedReferenceFile;
+  if (!file) return field("example-audio-path").value || selectedCloneVoice()?.audio_path || "";
+  setPresetStatus("正在导入自定义参考音频…");
+  const form = new FormData();
+  form.append("audio", file, file.name || "reference.wav");
+  const stored = await fetchJson(apiUrl("api/presets/reference-audio"), { method: "POST", body: form });
+  selectExternalPresetReference(stored.reference_audio_path);
+  return String(stored.reference_audio_path || "");
+}
+
+async function saveVoicePreset(update = false) {
+  const selectedId = field("preset-select").value;
+  const name = field("preset-name").value.trim() || voicePresets.find((item) => item.id === selectedId)?.name || "";
+  if (!name) throw new Error("请填写预设名称");
+  const referenceAudioPath = await persistPresetReferenceAudio();
+  if (!referenceAudioPath) throw new Error("请先选择、上传或录制参考音频");
+  const response = await fetchJson(
+    update && selectedId ? apiUrl(`api/presets/${encodeURIComponent(selectedId)}`) : apiUrl("api/presets"),
+    {
+      method: update && selectedId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, settings: currentPresetSettings(referenceAudioPath) }),
+    }
+  );
+  await loadVoicePresets(response.id);
+  applyVoicePreset(response);
+  setPresetStatus(`预设已保存：${response.name}`);
+}
+
+async function deleteSelectedVoicePreset() {
+  const preset = voicePresets.find((item) => item.id === field("preset-select").value);
+  if (!preset) return;
+  if (!window.confirm(`删除预设“${preset.name}”？参考音频文件会保留，已有文件项目不会受影响。`)) return;
+  await fetchJson(apiUrl(`api/presets/${encodeURIComponent(preset.id)}`), { method: "DELETE" });
+  field("preset-name").value = "";
+  await loadVoicePresets();
+  setPresetStatus(`已删除预设：${preset.name}`);
+}
+
+window.QwenTTSNative = {
+  applyPreset: (preset) => applyVoicePreset(preset),
+  refreshPresets: () => loadVoicePresets(),
+};
 
 function renderCloneVoiceList() {
   const list = field("clone-voices-list");
@@ -3019,7 +3760,7 @@ function documentSettingsSnapshot() {
   return {
     model_profile: selectedModelProfile(),
     reference_audio_path: field("example-audio-path").value || voiceSelect.value,
-    voice_name: voiceSelect.selectedOptions[0] ? voiceSelect.selectedOptions[0].textContent : "本地克隆音色",
+    voice_name: currentVoiceName(),
     temperature: params.temperature,
     top_p: params.topP,
     top_k: params.topK,
@@ -3556,7 +4297,7 @@ field("start").onclick = async () => {
   form.append("top_k", params.topK);
   form.append("repetition_penalty", params.repetitionPenalty);
   form.append("model_profile", selectedModelProfile());
-  form.append("voice_name", field("clone-voice").selectedOptions[0]?.textContent || "本地克隆音色");
+  form.append("voice_name", currentVoiceName());
   form.append("qwen_clone_mode", field("qwen-clone-mode").value);
   form.append("qwen_reference_text", field("qwen-reference-text").value);
   form.append("qwen_non_streaming_mode", field("qwen-non-streaming-mode").checked ? "1" : "0");
@@ -3660,6 +4401,7 @@ field("prompt-audio").onchange = () => {
     referenceSourceMode = "upload";
     field("example-audio-path").value = "";
     field("clone-voice").value = "";
+    activePresetVoiceName = "";
     syncCloneVoiceListSelection();
     clearIclTranscriptForCustomReference();
     syncReferenceSourceControls();
@@ -3672,6 +4414,26 @@ field("reference-source-record").onclick = () => setReferenceSourceMode("record"
 field("reference-record-button").onclick = () => toggleReferenceRecording();
 field("clear-reference").onclick = clearReferenceAudio;
 field("qwen-transcript-reset").onclick = resetCurrentIclTranscript;
+field("preset-select").onchange = () => {
+  const preset = voicePresets.find((item) => item.id === field("preset-select").value);
+  field("preset-update").disabled = !preset;
+  field("preset-delete").disabled = !preset;
+  if (preset) field("preset-name").value = preset.name;
+};
+field("preset-apply").onclick = () => {
+  const preset = voicePresets.find((item) => item.id === field("preset-select").value);
+  if (!preset) return setPresetStatus("请先选择一个预设");
+  try { applyVoicePreset(preset); } catch (err) { setPresetStatus(String(err)); }
+};
+field("preset-save").onclick = () => {
+  saveVoicePreset(false).catch((err) => setPresetStatus(String(err)));
+};
+field("preset-update").onclick = () => {
+  saveVoicePreset(true).catch((err) => setPresetStatus(String(err)));
+};
+field("preset-delete").onclick = () => {
+  deleteSelectedVoicePreset().catch((err) => setPresetStatus(String(err)));
+};
 field("document-create-file").onchange = async () => {
   try { await createDocumentProject(field("document-create-file").files[0]); }
   catch (err) { field("document-project-status").textContent = String(err); }
@@ -3721,6 +4483,7 @@ updateRecordButtonState();
 setupUiStatePersistence();
 restoreUiState();
 updateReferenceLabel();
+loadVoicePresets().catch((err) => setPresetStatus(`预设服务不可用：${err}`));
 loadDocumentProjects().catch((err) => { field("document-project-status").textContent = String(err); });
 documentProjectPollTimer = setInterval(pollCurrentDocumentProject, 1000);
 serviceTasksPollTimer = setInterval(pollServiceTasks, 1000);
@@ -3776,12 +4539,38 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
     parser.add_argument("--upload-dir", default=os.environ.get("UPLOAD_DIR", str(DEFAULT_UPLOAD_DIR)))
+    parser.add_argument("--preset-dir", default=os.environ.get("QWEN_TTS_PRESET_DIR", str(DEFAULT_PRESET_DIR)))
     parser.add_argument("--no-preload", action="store_true")
     parser.add_argument(
         "--max-parallel-generations",
         type=int,
         default=int(os.environ.get("QWEN_TTS_MAX_PARALLEL_GENERATIONS", "1")),
     )
+    parser.add_argument(
+        "--document-parallel-generations",
+        type=int,
+        default=int(os.environ.get("QWEN_TTS_DOCUMENT_PARALLEL_GENERATIONS", "2")),
+    )
+    parser.add_argument(
+        "--whisper-server",
+        default=os.environ.get("QWEN_STT_SERVER", str(DEFAULT_WHISPER_SERVER)),
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default=os.environ.get("QWEN_STT_MODEL", str(DEFAULT_WHISPER_MODEL)),
+    )
+    parser.add_argument(
+        "--whisper-port",
+        type=int,
+        default=int(os.environ.get("QWEN_STT_PORT", str(DEFAULT_WHISPER_PORT))),
+    )
+    parser.add_argument(
+        "--whisper-threads",
+        type=int,
+        default=int(os.environ.get("QWEN_STT_THREADS", "8")),
+    )
+    parser.add_argument("--no-stt", action="store_true")
+    parser.add_argument("--no-stt-preload", action="store_true")
     return parser.parse_args()
 
 
@@ -3799,9 +4588,17 @@ def main() -> None:
         qwentts_library=args.qwentts_library,
         output_dir=args.output_dir,
         upload_dir=args.upload_dir,
+        preset_dir=args.preset_dir,
         preload=not args.no_preload,
         max_parallel_generations=max(1, int(args.max_parallel_generations)),
+        document_parallel_generations=max(1, int(args.document_parallel_generations)),
         access_password=os.environ.get("QWEN_TTS_ACCESS_PASSWORD", ""),
+        stt_enabled=not args.no_stt,
+        stt_preload=not args.no_stt_preload,
+        whisper_server=args.whisper_server,
+        whisper_model=args.whisper_model,
+        whisper_port=args.whisper_port,
+        whisper_threads=max(1, int(args.whisper_threads)),
     )
     uvicorn.run(app, host=args.host, port=int(args.port))
 

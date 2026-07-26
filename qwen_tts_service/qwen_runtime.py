@@ -54,9 +54,13 @@ class QwenWorkerClient:
         self._stdout = open(self.stdout_path, "ab", buffering=0)
         self._stderr = open(self.stderr_path, "ab", buffering=0)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Keep the virtual-environment launcher path intact.  On macOS it is a
+        # symlink to the Homebrew interpreter; Path.resolve() would bypass the
+        # venv and start a worker without any of the project dependencies.
+        python_path = os.path.abspath(os.path.expanduser(os.fspath(python_executable)))
         self.process = subprocess.Popen(
             [
-                str(Path(python_executable).resolve()),
+                python_path,
                 str(Path(worker_script).resolve()),
                 "--model",
                 str(model_dir),

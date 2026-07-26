@@ -1,0 +1,1114 @@
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  books: [],
+  book: null,
+  serviceSettings: null,
+  serviceSettingsName: "正在读取服务设置",
+  serviceSettingsSource: "default",
+  serviceSettingsFingerprint: "",
+  streamRunId: 0,
+  qualityContext: null,
+  stopRequested: false,
+  chapterIndex: 0,
+  selectedBlock: null,
+  playingBlock: null,
+  playbackMode: "",
+  qualityQueue: [],
+  qualityAudio: new Audio(),
+  audioContext: null,
+  streamAbort: null,
+  currentJob: "",
+  stopped: false,
+  paused: false,
+  pendingImport: null,
+  pollTimer: null,
+  editMode: false,
+};
+
+function api(path) {
+  return path.startsWith("/") ? path : `/${path}`;
+}
+
+async function jsonFetch(path, options = {}) {
+  const response = await fetch(api(path), options);
+  if (!response.ok) {
+    let message = await response.text();
+    try { message = JSON.parse(message).detail || message; } catch (_) {}
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+function toast(message, error = false) {
+  const item = document.createElement("div");
+  item.className = `toast${error ? " error" : ""}`;
+  item.textContent = message;
+  $("toast-region").appendChild(item);
+  window.setTimeout(() => item.remove(), 3600);
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds || 0)));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return minutes >= 60
+    ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}:${String(rest).padStart(2, "0")}`
+    : `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+function mediaUrl(bookId, path) {
+  return `/api/document-projects/${encodeURIComponent(bookId)}/media?path=${encodeURIComponent(path)}`;
+}
+
+function currentChapter() {
+  return state.book?.chapters?.[state.chapterIndex] || null;
+}
+
+function chapterSegments(chapter = currentChapter()) {
+  if (!state.book || !chapter) return [];
+  return state.book.segments.filter(
+    (segment) => segment.index >= chapter.segment_start && segment.index <= chapter.segment_end
+  );
+}
+
+async function loadHealth() {
+  try {
+    const health = await jsonFetch("/api/health");
+    const pill = $("service-pill");
+    pill.classList.toggle("ready", health.state === "ready");
+    pill.lastChild.textContent = health.state === "ready"
+      ? `${health.active_profile_label || "TTS Metal"} · STT ${health.stt?.ready ? "就绪" : "未就绪"}`
+      : `服务状态：${health.state}`;
+  } catch (error) {
+    $("service-pill").lastChild.textContent = "本地服务未连接";
+  }
+}
+
+function toBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  return !["0", "false", "no", "off"].includes(String(value).toLowerCase());
+}
+
+function normalizeServiceSettings(shared = {}) {
+  return {
+    model_profile: String(shared.model_profile || "qwen_0_6b"),
+    reference_audio_path: String(shared.reference_audio_path || ""),
+    voice_name: String(shared.voice_name || "服务默认音色"),
+    temperature: Number(shared.qwen_temperature ?? 0.9),
+    top_p: Number(shared.qwen_top_p ?? 1),
+    top_k: Number(shared.qwen_top_k ?? 50),
+    repetition_penalty: Number(shared.qwen_repetition_penalty ?? 1.05),
+    max_new_tokens: Number(shared.qwen_max_new_tokens ?? 2048),
+    codec_chunk_frames: Number(shared.qwen_chunk_size ?? 8),
+    seed: Number(shared.qwen_seed ?? 1234),
+    qwen_clone_mode: String(shared.qwen_clone_mode || "xvec"),
+    qwen_reference_text: String(shared.qwen_reference_text || ""),
+    qwen_non_streaming_mode: false,
+    qwen_append_silence: toBoolean(shared.qwen_append_silence, true),
+    qwen_min_new_tokens: Number(shared.qwen_min_new_tokens ?? 2),
+    aac_bitrate: String(shared.qwen_aac_bitrate || "80k"),
+  };
+}
+
+async function loadServiceSettings() {
+  const payload = await jsonFetch("/api/service-settings");
+  const nextSettings = normalizeServiceSettings(payload.settings || {});
+  const nextFingerprint = JSON.stringify(nextSettings);
+  const changed = Boolean(
+    state.serviceSettingsFingerprint
+    && state.serviceSettingsFingerprint !== nextFingerprint
+  );
+  state.serviceSettings = nextSettings;
+  state.serviceSettingsName = payload.name || nextSettings.voice_name;
+  state.serviceSettingsSource = payload.source || "default";
+  state.serviceSettingsFingerprint = nextFingerprint;
+  updateListeningSummary();
+  updateBitrateLabel();
+  if (changed) {
+    resetRealtimeAfterSettingsChange();
+    toast(`服务音色已更新为“${state.serviceSettingsName}”`);
+  }
+}
+
+async function loadBooks(preferredId = "") {
+  const data = await jsonFetch("/api/document-projects");
+  state.books = data.projects || [];
+  renderBooks();
+  const remembered = preferredId || state.book?.id || localStorage.getItem("qwen-reader-book") || "";
+  const target = state.books.find((book) => book.id === remembered) || state.books[0];
+  if (target) await openBook(target.id, false);
+  else showEmpty();
+}
+
+function renderBooks() {
+  const list = $("book-list");
+  list.innerHTML = "";
+  if (!state.books.length) {
+    list.innerHTML = '<p class="empty-copy">书架还是空的。点击右上角“＋”导入第一本小说。</p>';
+    return;
+  }
+  for (const book of state.books) {
+    const button = document.createElement("button");
+    button.className = `book-card${state.book?.id === book.id ? " active" : ""}`;
+    button.type = "button";
+    const progress = Math.round(100 * Number(book.stats?.progress || 0));
+    const initial = (book.name || "书").trim().slice(0, 1);
+    button.innerHTML = `
+      <span class="book-cover">${escapeHTML(initial)}</span>
+      <span class="book-copy">
+        <strong>${escapeHTML(book.name || "未命名小说")}</strong>
+        <span>${book.chapters?.length || 1} 章 · ${book.stats?.total_chars || 0} 字 · ${progress}% 音频</span>
+        <span class="book-progress"><i style="width:${progress}%"></i></span>
+      </span>`;
+    button.onclick = () => openBook(book.id);
+    list.appendChild(button);
+  }
+}
+
+async function openBook(bookId, remember = true) {
+  await stopPlayback(false);
+  state.book = await jsonFetch(`/api/document-projects/${encodeURIComponent(bookId)}`);
+  syncControlsFromBook();
+  state.chapterIndex = Math.min(
+    Math.max(0, Number(localStorage.getItem(`qwen-reader-chapter-${bookId}`) || 0)),
+    Math.max(0, (state.book.chapters?.length || 1) - 1)
+  );
+  state.selectedBlock = Number(state.book.playback?.segment_index ?? currentChapter()?.segment_start ?? 0);
+  if (remember) localStorage.setItem("qwen-reader-book", bookId);
+  renderBooks();
+  renderBook();
+}
+
+function syncControlsFromBook() {
+  updateListeningSummary();
+  updateBitrateLabel();
+}
+
+function showEmpty() {
+  state.book = null;
+  $("empty-state").classList.remove("hidden");
+  $("reading-view").classList.add("hidden");
+  $("book-title").textContent = "我的书架";
+  $("book-kicker").textContent = "选择一本小说开始阅读";
+  $("chapter-list").innerHTML = '<p class="empty-copy">打开小说后显示章节。</p>';
+  setActionsEnabled(false);
+}
+
+function renderBook() {
+  if (!state.book) return showEmpty();
+  $("empty-state").classList.add("hidden");
+  $("reading-view").classList.remove("hidden");
+  $("book-title").textContent = state.book.name;
+  $("book-kicker").textContent = `${state.serviceSettingsName} · ${state.book.chapters?.length || 1} 章`;
+  const download = $("download-whole-book");
+  if (state.book.final_audio) {
+    download.href = mediaUrl(state.book.id, state.book.final_audio);
+    download.download = `${state.book.name}.m4a`;
+    download.classList.remove("hidden");
+  } else {
+    download.removeAttribute("href");
+    download.classList.add("hidden");
+  }
+  renderChapters();
+  renderCurrentChapter();
+  renderWholeBookProgress();
+  setActionsEnabled(true);
+}
+
+function renderChapters() {
+  const container = $("chapter-list");
+  container.innerHTML = "";
+  for (const chapter of state.book.chapters || []) {
+    const segments = state.book.segments.filter(
+      (segment) => segment.index >= chapter.segment_start && segment.index <= chapter.segment_end
+    );
+    const completed = segments.filter((segment) => segment.status === "completed").length;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `chapter-button${chapter.index === state.chapterIndex ? " active" : ""}`;
+    button.innerHTML = `
+      <span class="chapter-number">${String(chapter.index + 1).padStart(2, "0")}</span>
+      <strong>${escapeHTML(chapter.title)}</strong>
+      <small>${segments.length} 块 · ${completed}/${segments.length} AAC</small>`;
+    button.onclick = () => selectChapter(chapter.index);
+    container.appendChild(button);
+  }
+}
+
+function renderCurrentChapter() {
+  const chapter = currentChapter();
+  if (!chapter) return;
+  const segments = chapterSegments(chapter);
+  $("chapter-position").textContent = `CHAPTER ${String(chapter.index + 1).padStart(2, "0")}`;
+  $("chapter-title").textContent = chapter.title;
+  $("chapter-progress").textContent = `${segments.length} 个文字块`;
+  const duration = segments.reduce((sum, segment) => sum + Number(segment.duration_seconds || 0), 0);
+  $("chapter-duration").textContent = duration ? `已生成 ${formatDuration(duration)} AAC` : "尚未生成音频";
+  $("previous-chapter").disabled = chapter.index <= 0;
+  $("next-chapter").disabled = chapter.index >= state.book.chapters.length - 1;
+  $("selected-range").textContent = chapter.title;
+  $("range-detail").textContent = `第 ${chapter.segment_start + 1}–${chapter.segment_end + 1} 块 · 共 ${segments.length} 块`;
+  const blocks = $("reader-blocks");
+  blocks.innerHTML = "";
+  for (const segment of segments) {
+    const block = document.createElement("p");
+    block.className = "reader-block";
+    block.dataset.segmentIndex = segment.index;
+    block.dataset.originalText = segment.text;
+    block.tabIndex = 0;
+    block.contentEditable = state.editMode ? "true" : "false";
+    block.spellcheck = state.editMode;
+    if (segment.index === state.selectedBlock) block.classList.add("selected");
+    if (segment.index === state.playingBlock) block.classList.add("playing");
+    if (segment.status === "generating" || segment.status === "encoding") block.classList.add("generating");
+    const stateLabel = segment.status === "completed"
+      ? `AAC ${formatDuration(segment.duration_seconds)}`
+      : segment.status === "generating" ? "正在生成"
+      : segment.status === "encoding" ? "正在转 AAC"
+      : segment.status === "failed" ? "生成失败"
+      : "";
+    block.appendChild(document.createTextNode(segment.text));
+    if (stateLabel) {
+      const status = document.createElement("span");
+      status.className = "block-state";
+      status.contentEditable = "false";
+      status.textContent = stateLabel;
+      block.appendChild(status);
+    }
+    block.onclick = () => {
+      state.selectedBlock = segment.index;
+      if (!state.editMode) selectBlock(segment.index);
+      else renderBlockSelection(segment.index);
+    };
+    block.onblur = () => {
+      if (state.editMode) saveSegmentEdit(block, segment.index);
+    };
+    block.onkeydown = (event) => {
+      if (state.editMode) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          block.firstChild.nodeValue = block.dataset.originalText;
+          block.blur();
+        } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault();
+          block.blur();
+        }
+      } else if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectBlock(segment.index);
+      }
+    };
+    blocks.appendChild(block);
+  }
+}
+
+function renderBlockSelection(index) {
+  document.querySelectorAll(".reader-block").forEach((block) => {
+    block.classList.toggle("selected", Number(block.dataset.segmentIndex) === Number(index));
+  });
+}
+
+function editableBlockText(block) {
+  const clone = block.cloneNode(true);
+  clone.querySelectorAll(".block-state").forEach((item) => item.remove());
+  return clone.innerText.replace(/\s+/g, " ").trim();
+}
+
+async function saveSegmentEdit(block, segmentIndex) {
+  const text = editableBlockText(block);
+  const original = block.dataset.originalText || "";
+  if (!text || text === original) {
+    if (!text) block.firstChild.nodeValue = original;
+    return;
+  }
+  block.contentEditable = "false";
+  block.classList.add("generating");
+  try {
+    state.book = await jsonFetch(
+      `/api/document-projects/${encodeURIComponent(state.book.id)}/segments/${segmentIndex}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      }
+    );
+    toast(`第 ${segmentIndex + 1} 块已保存；旧 AAC 已失效`);
+    renderBook();
+  } catch (error) {
+    toast(error.message, true);
+    block.firstChild.nodeValue = original;
+    block.contentEditable = "true";
+    block.classList.remove("generating");
+  }
+}
+
+async function toggleEditMode() {
+  if (!state.book) return;
+  if (!state.editMode) await stopPlayback();
+  state.editMode = !state.editMode;
+  document.body.classList.toggle("edit-mode", state.editMode);
+  const button = $("edit-mode-button");
+  button.classList.toggle("active", state.editMode);
+  button.setAttribute("aria-pressed", String(state.editMode));
+  button.textContent = state.editMode ? "✓ 完成编辑" : "✎ 编辑正文";
+  renderCurrentChapter();
+  toast(state.editMode ? "编辑模式已开启；离开文字块时自动保存" : "已回到浏览模式");
+}
+
+function selectChapter(index) {
+  if (!state.book) return;
+  state.chapterIndex = Math.max(0, Math.min(index, state.book.chapters.length - 1));
+  state.selectedBlock = currentChapter().segment_start;
+  localStorage.setItem(`qwen-reader-chapter-${state.book.id}`, state.chapterIndex);
+  renderChapters();
+  renderCurrentChapter();
+  document.body.classList.remove("toc-open");
+  $("toc-toggle").classList.remove("active");
+  $("toc-toggle").setAttribute("aria-expanded", "false");
+  document.querySelector(".reader-main")?.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function selectBlock(index) {
+  state.selectedBlock = index;
+  renderCurrentChapter();
+  const segment = state.book?.segments?.find((item) => item.index === index);
+  if (segment?.status === "completed" && segment.audio_file) {
+    playQualitySegments([segment]);
+  }
+}
+
+function setActionsEnabled(enabled) {
+  const generating = Boolean(
+    state.currentJob
+    || ["running", "stopping"].includes(state.book?.state)
+    || state.playbackMode === "quality-generating"
+    || state.playbackMode === "quality-online"
+  );
+  $("stream-listen").disabled = !enabled || generating;
+  $("quality-generate").disabled = !enabled || generating;
+  $("generate-whole-book").disabled = !enabled || generating;
+  $("stop-generation").disabled = !generating;
+  $("previous-block").disabled = !enabled;
+  $("next-block").disabled = !enabled;
+}
+
+function escapeHTML(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function openImport(file) {
+  if (!file) return;
+  state.pendingImport = file;
+  $("import-file-name").textContent = file.name;
+  $("import-file-detail").textContent = `${(file.size / 1024).toFixed(1)} KB · 将自动识别章节`;
+  $("import-name").value = file.name.replace(/\.[^.]+$/, "");
+  $("import-dialog").showModal();
+}
+
+function settingsSnapshot() {
+  return {
+    ...(state.serviceSettings || normalizeServiceSettings({})),
+  };
+}
+
+function hexToRGBA(hex, alpha) {
+  const clean = String(hex).replace("#", "");
+  const value = Number.parseInt(clean, 16);
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+}
+
+function applyAppearance() {
+  const theme = $("theme-select").value;
+  const accent = $("accent-color").value;
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.setProperty("--accent", accent);
+  document.documentElement.style.setProperty("--accent-strong", accent);
+  document.documentElement.style.setProperty("--accent-soft", hexToRGBA(accent, .11));
+  $("accent-value").textContent = accent.toUpperCase();
+  localStorage.setItem("qwen-reader-theme", theme);
+  localStorage.setItem("qwen-reader-accent", accent);
+}
+
+function updateBitrateLabel() {
+  const bitrate = $("book-aac-bitrate")?.value || state.serviceSettings?.aac_bitrate || "80k";
+  $("quality-bitrate-label").textContent = `整段非流式 · AAC ${bitrate} 单声道`;
+  updateListeningSummary();
+}
+
+function updateListeningSummary() {
+  const settings = state.serviceSettings || normalizeServiceSettings({});
+  const model = settings.model_profile === "qwen_1_7b" ? "1.7B 高质量" : "0.6B 极速";
+  const seed = Number(settings.seed);
+  if ($("active-preset-name")) {
+    $("active-preset-name").textContent = state.serviceSettingsSource === "studio" ? "音频工作台设置" : state.serviceSettingsName;
+  }
+  if ($("active-voice-name")) $("active-voice-name").textContent = settings.voice_name;
+  if ($("active-generation-summary")) {
+    $("active-generation-summary").textContent = `${model} · ${seed < 0 ? "随机 Seed" : `Seed ${seed}`} · AAC ${settings.aac_bitrate}`;
+  }
+  if ($("service-setting-name")) $("service-setting-name").textContent = state.serviceSettingsName;
+  if ($("service-setting-detail")) {
+    $("service-setting-detail").textContent = `${settings.voice_name} · ${model} · ${settings.qwen_clone_mode === "icl" ? "ICL" : "X-vector"}`;
+  }
+  if ($("import-service-setting")) {
+    $("import-service-setting").textContent = `${settings.voice_name} · ${model}`;
+  }
+}
+
+async function resetRealtimeAfterSettingsChange() {
+  const hadRealtimeAudio = Boolean(
+    state.currentJob
+    || state.playbackMode === "stream"
+    || state.playbackMode === "preview"
+    || (state.playbackMode === "quality" && state.qualityAudio.src)
+  );
+  if (hadRealtimeAudio) {
+    await stopPlayback(true);
+    state.playbackMode = "";
+    state.playingBlock = null;
+    $("play-toggle").textContent = "▶";
+    $("playback-mode").textContent = "参数已更新";
+    $("playback-seed").textContent = "可重新实时试听";
+    renderCurrentChapter();
+  }
+  setActionsEnabled(Boolean(state.book));
+}
+
+function qualitySettingsChanged(settings) {
+  const saved = state.book?.settings;
+  if (!saved) return true;
+  const currentConfiguredSeed = Number(settings.seed);
+  const savedConfiguredSeed = Number(saved.configured_seed ?? saved.seed);
+  return (
+    settings.model_profile !== saved.model_profile
+    || settings.reference_audio_path !== saved.reference_audio_path
+    || settings.qwen_clone_mode !== saved.qwen_clone_mode
+    || settings.qwen_reference_text.trim() !== String(saved.qwen_reference_text || "").trim()
+    || currentConfiguredSeed !== savedConfiguredSeed
+    || settings.aac_bitrate !== (saved.aac_bitrate || "80k")
+    || Number(settings.temperature) !== Number(saved.temperature ?? 0.9)
+    || Number(settings.top_p) !== Number(saved.top_p ?? 1)
+    || Number(settings.top_k) !== Number(saved.top_k ?? 50)
+    || Number(settings.repetition_penalty) !== Number(saved.repetition_penalty ?? 1.05)
+    || Number(settings.max_new_tokens) !== Number(saved.max_new_tokens ?? 2048)
+    || Number(settings.codec_chunk_frames) !== Number(saved.codec_chunk_frames ?? 8)
+    || Number(settings.qwen_min_new_tokens) !== Number(saved.qwen_min_new_tokens ?? 2)
+    || Boolean(settings.qwen_append_silence) !== toBoolean(saved.qwen_append_silence, true)
+  );
+}
+
+async function confirmImport() {
+  const file = state.pendingImport;
+  if (!file) return;
+  const button = $("confirm-import");
+  button.disabled = true;
+  button.textContent = "正在解析章节…";
+  try {
+    const settings = settingsSnapshot();
+    const form = new FormData();
+    form.append("document", file, file.name);
+    form.append("name", $("import-name").value.trim());
+    form.append("max_chars", $("import-block-size").value);
+    form.append("settings_json", JSON.stringify(settings));
+    const book = await jsonFetch("/api/document-projects", { method: "POST", body: form });
+    $("import-dialog").close();
+    state.pendingImport = null;
+    toast(`《${book.name}》已加入书架，识别到 ${book.chapters?.length || 1} 章`);
+    await loadBooks(book.id);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "解析并加入书架";
+  }
+}
+
+async function refreshCurrentBook(render = true) {
+  if (!state.book) return null;
+  state.book = await jsonFetch(`/api/document-projects/${encodeURIComponent(state.book.id)}`);
+  if (render) renderBook();
+  return state.book;
+}
+
+function selectedBookBitrate() {
+  return $("book-aac-bitrate")?.value || "80k";
+}
+
+async function beginQualityGeneration() {
+  if (!state.book || !state.book.segments?.length) return;
+  await stopPlayback(false);
+  $("stream-listen").disabled = true;
+  $("quality-generate").disabled = true;
+  $("generate-whole-book").disabled = true;
+  const segmentStart = 0;
+  const segmentEnd = state.book.segments.length - 1;
+  const form = new FormData();
+  form.append("segment_start", segmentStart);
+  form.append("segment_end", segmentEnd);
+  const settings = settingsSnapshot();
+  settings.qwen_non_streaming_mode = true;
+  settings.aac_bitrate = selectedBookBitrate();
+  if (qualitySettingsChanged(settings)) {
+    form.append("settings_json", JSON.stringify(settings));
+  }
+  state.qualityContext = {
+    scope: "book",
+    title: state.book.name,
+    segmentStart,
+    segmentEnd,
+    autoPlay: false,
+  };
+  state.stopRequested = false;
+  try {
+    state.book = await jsonFetch(
+      `/api/document-projects/${encodeURIComponent(state.book.id)}/start-selection`,
+      { method: "POST", body: form }
+    );
+    state.playbackMode = "quality-generating";
+    renderBook();
+    setActionsEnabled(true);
+    $("generation-label").textContent = "正在生成整本书";
+    pollQualityGeneration();
+  } catch (error) {
+    state.qualityContext = null;
+    state.playbackMode = "";
+    setActionsEnabled(true);
+    toast(error.message, true);
+  }
+}
+
+function generateQualityChapter() {
+  return startQualityChapter();
+}
+
+function generateWholeBook() {
+  return beginQualityGeneration();
+}
+
+function waitForJob(jobId) {
+  return new Promise((resolve, reject) => {
+    const check = async () => {
+      try {
+        const status = await jsonFetch(`/api/generate-stream/${encodeURIComponent(jobId)}/status`);
+        if (state.stopped || jobId !== state.currentJob) {
+          reject(new DOMException("Stopped", "AbortError"));
+        } else if (status.state === "finished" && status.result_ready) {
+          resolve(status);
+        } else if (["error", "closed", "interrupted"].includes(status.state)) {
+          reject(new Error(status.error || "该文字块生成失败"));
+        } else {
+          window.setTimeout(check, 350);
+        }
+      } catch (error) {
+        reject(error);
+      }
+    };
+    check();
+  });
+}
+
+function playTemporaryAAC(jobId) {
+  return new Promise((resolve, reject) => {
+    const audio = state.qualityAudio;
+    audio.src = `/api/generate-stream/${encodeURIComponent(jobId)}/result-audio-aac?bitrate=${encodeURIComponent(selectedBookBitrate())}`;
+    audio.playbackRate = Number($("playback-rate").value || 1);
+    audio.onended = resolve;
+    audio.onerror = () => reject(new Error("临时 AAC 无法播放"));
+    audio.play().then(() => {
+      $("play-toggle").textContent = "Ⅱ";
+    }).catch(reject);
+  });
+}
+
+async function removeTemporaryAudio(jobId) {
+  if (!jobId) return;
+  await fetch(`/api/generate-stream/${encodeURIComponent(jobId)}/ephemeral-audio`, {
+    method: "DELETE",
+  }).catch(() => {});
+}
+
+async function startQualityChapter() {
+  const chapter = currentChapter();
+  if (!state.book || !chapter) return;
+  const segments = chapterSegments(chapter).filter(
+    (segment) => segment.index >= (state.selectedBlock ?? chapter.segment_start)
+  );
+  if (!segments.length) return;
+  await stopPlayback(false);
+  const runId = ++state.streamRunId;
+  state.stopped = false;
+  state.stopRequested = false;
+  state.playbackMode = "quality-online";
+  setActionsEnabled(true);
+  try {
+    for (const segment of segments) {
+      if (state.stopped || runId !== state.streamRunId) break;
+      state.playingBlock = segment.index;
+      state.selectedBlock = segment.index;
+      updatePlayer(segment, "高质量非流式 · 正在生成", null);
+      renderCurrentChapter();
+      scrollPlayingBlock();
+      const form = streamForm(segment);
+      form.set("streaming_generation", "0");
+      form.set("qwen_non_streaming_mode", "1");
+      form.set("ephemeral_audio", "1");
+      const started = await jsonFetch("/api/generate-stream/start", { method: "POST", body: form });
+      state.currentJob = started.job_id;
+      $("playback-seed").textContent = `Seed ${started.seed}${started.seed_mode === "random" ? " · 本次随机" : ""}`;
+      setActionsEnabled(true);
+      try {
+        await waitForJob(started.job_id);
+        if (state.stopped || runId !== state.streamRunId) break;
+        $("playback-mode").textContent = `高质量 AAC ${selectedBookBitrate()}`;
+        await playTemporaryAAC(started.job_id);
+        await savePlayback(segment.index, 0);
+      } finally {
+        await removeTemporaryAudio(started.job_id);
+        if (state.currentJob === started.job_id) state.currentJob = "";
+      }
+    }
+  } catch (error) {
+    if (!state.stopped && error.name !== "AbortError") toast(error.message, true);
+  } finally {
+    if (runId !== state.streamRunId) return;
+    state.currentJob = "";
+    state.playingBlock = null;
+    state.playbackMode = "";
+    $("play-toggle").textContent = "▶";
+    $("playback-mode").textContent = state.stopped ? "生成已停止" : "本章播放完成";
+    renderCurrentChapter();
+    setActionsEnabled(Boolean(state.book));
+  }
+}
+
+function renderWholeBookProgress() {
+  if (!state.book) return;
+  const segments = state.book.segments || [];
+  const counts = { pending: 0, generating: 0, encoding: 0, completed: 0, failed: 0 };
+  for (const segment of segments) counts[segment.status] = (counts[segment.status] || 0) + 1;
+  const total = segments.length;
+  const completed = counts.completed || 0;
+  const progress = Number(state.book.stats?.progress ?? (total ? completed / total : 0));
+  const hasProduction = completed > 0 || ["running", "stopping", "paused", "error"].includes(state.book.state);
+  $("generation-progress").classList.toggle("hidden", !hasProduction);
+  $("generation-bar").value = progress;
+  $("generation-percent").textContent = `${Math.round(progress * 100)}%`;
+  $("generation-label").textContent = state.book.message || (state.book.final_audio ? "整书音频已完成" : "整书制作进度");
+  $("book-progress-detail-button").textContent = `查看详情 · ${completed}/${total} 段`;
+  const eta = state.book.stats?.eta_seconds;
+  $("book-progress-detail").innerHTML = `
+    <span>已完成：${completed} 段</span>
+    <span>总计：${total} 段</span>
+    <span>生成中：${(counts.generating || 0) + (counts.encoding || 0)} 段</span>
+    <span>待处理：${counts.pending || 0} 段</span>
+    <span>失败：${counts.failed || 0} 段</span>
+    <span>AAC：${escapeHTML(state.book.settings?.aac_bitrate || selectedBookBitrate())}</span>
+    <span>已生成：${formatDuration(state.book.stats?.completed_audio_seconds || 0)}</span>
+    <span>剩余：${eta == null ? "计算中" : formatDuration(eta)}</span>`;
+}
+
+async function pollQualityGeneration() {
+  window.clearTimeout(state.pollTimer);
+  const context = state.qualityContext;
+  if (!context || !state.book) return;
+  try {
+    await refreshCurrentBook(true);
+    const segments = state.book.segments.filter(
+      (segment) => segment.index >= context.segmentStart && segment.index <= context.segmentEnd
+    );
+    const completed = segments.filter((segment) => segment.status === "completed").length;
+    renderWholeBookProgress();
+    setActionsEnabled(true);
+    if (state.book.state === "error") throw new Error(state.book.message || "生成失败");
+    const stillRunning = state.book.state === "running" || state.book.state === "stopping";
+    if (stillRunning) {
+      state.pollTimer = window.setTimeout(pollQualityGeneration, 1200);
+      return;
+    }
+    state.playbackMode = "";
+    setActionsEnabled(true);
+    const playable = segments.filter((segment) => segment.status === "completed" && segment.audio_file);
+    if (state.stopRequested || state.book.state === "paused" && completed < segments.length) {
+      toast(`已停止生成；已保存 ${completed}/${segments.length} 个完整 AAC 文字块`);
+    } else {
+      toast(`《${context.title}》整本书已生成：${playable.length} 个 AAC 文字块，整书 M4A 已合并`);
+    }
+    state.qualityContext = null;
+    state.stopRequested = false;
+  } catch (error) {
+    state.qualityContext = null;
+    state.playbackMode = "";
+    setActionsEnabled(Boolean(state.book));
+    toast(error.message, true);
+  }
+}
+
+function playQualitySegments(segments) {
+  if (!state.book || !segments.length) return;
+  stopPlayback(false).then(() => {
+    state.playbackMode = "quality";
+    state.qualityQueue = [...segments];
+    $("playback-mode").textContent = "高质量 AAC";
+    playNextQuality();
+  });
+}
+
+function playNextQuality() {
+  const segment = state.qualityQueue.shift();
+  if (!segment || !state.book) {
+    state.playingBlock = null;
+    $("play-toggle").textContent = "▶";
+    renderCurrentChapter();
+    return;
+  }
+  state.playingBlock = segment.index;
+  state.selectedBlock = segment.index;
+  state.qualityAudio.src = mediaUrl(state.book.id, segment.audio_file);
+  state.qualityAudio.playbackRate = Number($("playback-rate").value || 1);
+  state.qualityAudio.onended = playNextQuality;
+  state.qualityAudio.play().catch((error) => toast(error.message, true));
+  updatePlayer(segment, "高质量 AAC", segment.seed);
+  $("play-toggle").textContent = "Ⅱ";
+  renderCurrentChapter();
+  savePlayback(segment.index, 0);
+  scrollPlayingBlock();
+}
+
+function streamForm(segment, seedOverride = null) {
+  const settings = settingsSnapshot();
+  const form = new FormData();
+  form.append("mode", "voice_clone");
+  form.append("language", "Chinese");
+  form.append("text", segment.text);
+  form.append(
+    "max_new_tokens",
+    String(Math.max(settings.qwen_min_new_tokens, Math.min(settings.max_new_tokens, Math.round(segment.text.length * 3.2))))
+  );
+  form.append("codec_chunk_frames", String(settings.codec_chunk_frames));
+  form.append("seed", String(seedOverride == null ? settings.seed : seedOverride));
+  form.append("temperature", String(settings.temperature));
+  form.append("top_p", String(settings.top_p));
+  form.append("top_k", String(settings.top_k));
+  form.append("repetition_penalty", String(settings.repetition_penalty));
+  form.append("model_profile", settings.model_profile);
+  form.append("voice_name", settings.voice_name);
+  form.append("qwen_clone_mode", settings.qwen_clone_mode);
+  form.append("qwen_reference_text", settings.qwen_reference_text);
+  form.append("qwen_non_streaming_mode", "0");
+  form.append("qwen_append_silence", settings.qwen_append_silence ? "1" : "0");
+  form.append("qwen_min_new_tokens", String(settings.qwen_min_new_tokens));
+  form.append("streaming_generation", "1");
+  form.append("example_audio_path", settings.reference_audio_path);
+  form.append("use_service_settings", "1");
+  return form;
+}
+
+async function startStreamChapter() {
+  const chapter = currentChapter();
+  if (!state.book || !chapter) return;
+  const segments = chapterSegments(chapter).filter((segment) => segment.index >= (state.selectedBlock ?? chapter.segment_start));
+  if (!segments.length) return;
+  await stopPlayback(false);
+  const runId = ++state.streamRunId;
+  state.playbackMode = "stream";
+  state.stopped = false;
+  state.paused = false;
+  $("stream-listen").disabled = true;
+  $("playback-mode").textContent = "实时流式";
+  try {
+    let streamSeed = null;
+    for (const segment of segments) {
+      if (state.stopped || runId !== state.streamRunId) break;
+      streamSeed = await streamOneBlock(segment, streamSeed);
+      await savePlayback(segment.index, 0);
+    }
+  } catch (error) {
+    if (!state.stopped && error.name !== "AbortError") toast(error.message, true);
+  } finally {
+    if (runId !== state.streamRunId) return;
+    $("stream-listen").disabled = false;
+    state.currentJob = "";
+    state.playingBlock = null;
+    $("play-toggle").textContent = "▶";
+    renderCurrentChapter();
+  }
+}
+
+async function streamOneBlock(segment, seedOverride = null) {
+  state.playingBlock = segment.index;
+  state.selectedBlock = segment.index;
+  updatePlayer(segment, "实时流式", null);
+  renderCurrentChapter();
+  scrollPlayingBlock();
+  const start = await jsonFetch(
+    "/api/generate-stream/start",
+    { method: "POST", body: streamForm(segment, seedOverride) }
+  );
+  await playStreamingAudio(start);
+  return start.seed;
+}
+
+async function playStreamingAudio(start) {
+  state.currentJob = start.job_id;
+  setActionsEnabled(Boolean(state.book));
+  $("playback-seed").textContent = `Seed ${start.seed}${start.seed_mode === "random" ? " · 本次随机" : ""}`;
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  if (!state.audioContext || state.audioContext.state === "closed") {
+    state.audioContext = new AudioContextCtor({ sampleRate: start.sample_rate || 24000 });
+  }
+  await state.audioContext.resume();
+  $("play-toggle").textContent = "Ⅱ";
+  state.streamAbort = new AbortController();
+  const response = await fetch(`/api/generate-stream/${start.job_id}/audio`, { signal: state.streamAbort.signal });
+  if (!response.ok || !response.body) throw new Error(await response.text());
+  const channels = Number(response.headers.get("X-Audio-Channels") || start.channels || 1);
+  const sampleRate = Number(response.headers.get("X-Audio-Sample-Rate") || start.sample_rate || 24000);
+  const reader = response.body.getReader();
+  let nextTime = state.audioContext.currentTime + 0.08;
+  let remainder = new Uint8Array(0);
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done || state.stopped) break;
+    let bytes = value;
+    if (remainder.length) {
+      const joined = new Uint8Array(remainder.length + value.length);
+      joined.set(remainder);
+      joined.set(value, remainder.length);
+      bytes = joined;
+      remainder = new Uint8Array(0);
+    }
+    const frameBytes = 2 * channels;
+    const usable = bytes.length - (bytes.length % frameBytes);
+    if (usable < bytes.length) remainder = bytes.slice(usable);
+    if (!usable) continue;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, usable);
+    const frames = usable / frameBytes;
+    const buffer = state.audioContext.createBuffer(channels, frames, sampleRate);
+    for (let channel = 0; channel < channels; channel += 1) {
+      const output = buffer.getChannelData(channel);
+      for (let frame = 0; frame < frames; frame += 1) {
+        output[frame] = view.getInt16((frame * channels + channel) * 2, true) / 32768;
+      }
+    }
+    const source = state.audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(state.audioContext.destination);
+    nextTime = Math.max(nextTime, state.audioContext.currentTime + 0.03);
+    source.start(nextTime);
+    nextTime += buffer.duration;
+  }
+  while (!state.stopped && state.audioContext.currentTime < nextTime - 0.04) {
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+  }
+}
+
+async function stopPlayback(markStopped = true) {
+  state.streamRunId += 1;
+  if (markStopped) state.stopped = true;
+  window.clearTimeout(state.pollTimer);
+  state.qualityQueue = [];
+  state.qualityAudio.pause();
+  state.qualityAudio.removeAttribute("src");
+  if (state.streamAbort) state.streamAbort.abort();
+  state.streamAbort = null;
+  if (state.currentJob) {
+    const cleanupPath = state.playbackMode === "quality-online"
+      ? `/api/generate-stream/${state.currentJob}/ephemeral-audio`
+      : `/api/generate-stream/${state.currentJob}/close`;
+    fetch(cleanupPath, { method: state.playbackMode === "quality-online" ? "DELETE" : "POST" }).catch(() => {});
+  }
+  state.currentJob = "";
+  if (state.audioContext && state.audioContext.state !== "closed") {
+    try { await state.audioContext.close(); } catch (_) {}
+  }
+  state.audioContext = null;
+  state.paused = false;
+}
+
+async function stopCurrentGeneration() {
+  const button = $("stop-generation");
+  if (button.disabled) return;
+  button.disabled = true;
+  const streamJobId = state.currentJob;
+  const documentActive = Boolean(state.book && ["running", "stopping"].includes(state.book.state));
+  state.stopRequested = true;
+  try {
+    if (streamJobId) {
+      const path = state.playbackMode === "quality-online"
+        ? `/api/generate-stream/${encodeURIComponent(streamJobId)}/ephemeral-audio`
+        : `/api/generate-stream/${encodeURIComponent(streamJobId)}/close`;
+      await jsonFetch(path, { method: state.playbackMode === "quality-online" ? "DELETE" : "POST" });
+    }
+    await stopPlayback(true);
+    if (documentActive) {
+      state.book = await jsonFetch(
+        `/api/document-projects/${encodeURIComponent(state.book.id)}/stop`,
+        { method: "POST" }
+      );
+      state.playbackMode = "quality-generating";
+      $("generation-progress").classList.remove("hidden");
+      $("generation-label").textContent = "正在服务端停止；当前完整段落保存后暂停";
+      renderBook();
+      setActionsEnabled(true);
+      if (state.qualityContext) {
+        state.pollTimer = window.setTimeout(pollQualityGeneration, 450);
+      }
+    } else {
+      state.playbackMode = "";
+      state.playingBlock = null;
+      $("play-toggle").textContent = "▶";
+      $("playback-mode").textContent = "生成已停止";
+      $("playback-seed").textContent = "服务端任务已关闭";
+      renderCurrentChapter();
+      setActionsEnabled(Boolean(state.book));
+      toast("当前实时生成已从服务端停止");
+      state.stopRequested = false;
+    }
+  } catch (error) {
+    setActionsEnabled(Boolean(state.book));
+    toast(error.message, true);
+  }
+}
+
+async function togglePlayback() {
+  if (state.playbackMode === "quality" && state.qualityAudio.src) {
+    if (state.qualityAudio.paused) {
+      await state.qualityAudio.play();
+      $("play-toggle").textContent = "Ⅱ";
+    } else {
+      state.qualityAudio.pause();
+      $("play-toggle").textContent = "▶";
+    }
+    return;
+  }
+  if (state.playbackMode === "stream" && state.audioContext) {
+    if (state.audioContext.state === "running") {
+      await state.audioContext.suspend();
+      $("play-toggle").textContent = "▶";
+    } else {
+      await state.audioContext.resume();
+      $("play-toggle").textContent = "Ⅱ";
+    }
+    return;
+  }
+  startStreamChapter();
+}
+
+function updatePlayer(segment, mode, seed) {
+  $("player-title").textContent = currentChapter()?.title || state.book?.name || "正在播放";
+  $("player-subtitle").textContent = `第 ${segment.index + 1} 块 · ${segment.text.slice(0, 38)}${segment.text.length > 38 ? "…" : ""}`;
+  $("playback-mode").textContent = mode;
+  $("playback-seed").textContent = seed == null ? "Seed 正在确定" : `Seed ${seed}`;
+}
+
+function scrollPlayingBlock() {
+  document.querySelector(`[data-segment-index="${state.playingBlock}"]`)?.scrollIntoView({
+    behavior: "smooth",
+    block: "center",
+  });
+}
+
+async function savePlayback(index, offset) {
+  if (!state.book) return;
+  const form = new FormData();
+  form.append("segment_index", index);
+  form.append("offset_seconds", offset);
+  fetch(`/api/document-projects/${state.book.id}/playback`, { method: "POST", body: form }).catch(() => {});
+}
+
+function moveBlock(delta) {
+  const segments = chapterSegments();
+  if (!segments.length) return;
+  const current = state.selectedBlock ?? segments[0].index;
+  const position = Math.max(0, Math.min(segments.length - 1, segments.findIndex((item) => item.index === current) + delta));
+  selectBlock(segments[position].index);
+  scrollPlayingBlock();
+}
+
+function bindEvents() {
+  $("book-file").onchange = (event) => openImport(event.target.files[0]);
+  $("empty-book-file").onchange = (event) => openImport(event.target.files[0]);
+  $("confirm-import").onclick = confirmImport;
+  $("font-size").oninput = () => {
+    document.documentElement.style.setProperty("--reader-font-size", `${$("font-size").value}px`);
+    localStorage.setItem("qwen-reader-font-size", $("font-size").value);
+  };
+  $("playback-rate").onchange = () => {
+    state.qualityAudio.playbackRate = Number($("playback-rate").value || 1);
+  };
+  $("previous-chapter").onclick = () => selectChapter(state.chapterIndex - 1);
+  $("next-chapter").onclick = () => selectChapter(state.chapterIndex + 1);
+  $("stream-listen").onclick = startStreamChapter;
+  $("quality-generate").onclick = generateQualityChapter;
+  $("generate-whole-book").onclick = generateWholeBook;
+  $("book-progress-detail-button").onclick = () => {
+    $("book-progress-detail").classList.toggle("hidden");
+  };
+  $("book-aac-bitrate").onchange = () => {
+    localStorage.setItem("qwen-reader-aac-bitrate", selectedBookBitrate());
+    updateBitrateLabel();
+  };
+  $("stop-generation").onclick = stopCurrentGeneration;
+  $("play-toggle").onclick = togglePlayback;
+  $("previous-block").onclick = () => moveBlock(-1);
+  $("next-block").onclick = () => moveBlock(1);
+  $("toc-toggle").onclick = () => {
+    const opened = document.body.classList.toggle("toc-open");
+    $("toc-toggle").classList.toggle("active", opened);
+    $("toc-toggle").setAttribute("aria-expanded", String(opened));
+  };
+  $("collapse-toc").onclick = () => {
+    document.body.classList.remove("toc-open");
+    $("toc-toggle").classList.remove("active");
+    $("toc-toggle").setAttribute("aria-expanded", "false");
+  };
+  $("edit-mode-button").onclick = toggleEditMode;
+  const openReaderSettings = () => $("reader-settings-dialog").showModal();
+  $("reader-settings-button").onclick = openReaderSettings;
+  $("listening-settings-card").onclick = openReaderSettings;
+  $("theme-select").onchange = applyAppearance;
+  $("accent-color").oninput = applyAppearance;
+  $("reader-settings-dialog").addEventListener("close", updateListeningSummary);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.body.classList.contains("toc-open")) {
+      document.body.classList.remove("toc-open");
+      $("toc-toggle").classList.remove("active");
+      $("toc-toggle").setAttribute("aria-expanded", "false");
+    }
+  });
+  window.addEventListener("beforeunload", () => stopPlayback());
+}
+
+async function init() {
+  bindEvents();
+  const savedFont = localStorage.getItem("qwen-reader-font-size");
+  if (savedFont) $("font-size").value = savedFont;
+  $("theme-select").value = localStorage.getItem("qwen-reader-theme") || "paper";
+  $("accent-color").value = localStorage.getItem("qwen-reader-accent") || "#6555e8";
+  $("book-aac-bitrate").value = localStorage.getItem("qwen-reader-aac-bitrate") || "80k";
+  applyAppearance();
+  updateBitrateLabel();
+  document.documentElement.style.setProperty("--reader-font-size", `${$("font-size").value}px`);
+  try {
+    await Promise.all([loadHealth(), loadServiceSettings()]);
+    await loadBooks();
+    window.setInterval(() => {
+      loadHealth();
+      loadServiceSettings().catch(() => {});
+    }, 5000);
+    window.setInterval(() => {
+      if (state.book && ["running", "stopping"].includes(state.book.state)) refreshCurrentBook(true).catch(() => {});
+    }, 1600);
+  } catch (error) {
+    toast(error.message, true);
+    showEmpty();
+  }
+}
+
+init();

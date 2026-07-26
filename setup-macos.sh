@@ -6,22 +6,41 @@ RUNTIME="$ROOT/.runtime"
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 FASTER_REF="a70afc0f81f7f5f8801c3227968f1102f43f211c"
 WRAPPER_REF="b0b2da11293fb5a3f84fafc0a4c64524d7635b88"
-QWENTTS_REF="7df559a8ca25f66fee02970514ebe5f01dee9055"
+# qwentts-cpp-python 0.3.1 exposes ABI v2 ctypes structures.  Newer
+# qwentts.cpp revisions use ABI v3/v4 and can corrupt the Python process
+# even though qt_version() itself still succeeds.
+QWENTTS_REF="9dbe7ea26a01b30fccb117ae5e86807c1dc23d42"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   echo "This installer requires an Apple Silicon Mac (Darwin arm64)." >&2
   exit 1
 fi
 
-for command in git cmake ninja ffmpeg "$PYTHON_BIN"; do
+for command in git cmake ninja ffmpeg whisper-server "$PYTHON_BIN"; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Missing $command. Install prerequisites with:" >&2
-    echo "  brew install python@3.12 cmake ninja ffmpeg libsndfile" >&2
+    echo "  brew install python@3.12 cmake ninja ffmpeg libsndfile whisper-cpp" >&2
     exit 1
   fi
 done
 
 mkdir -p "$RUNTIME"
+WHISPER_MODEL_DIR="$RUNTIME/whisper.cpp/models"
+WHISPER_MODEL="$WHISPER_MODEL_DIR/ggml-small.bin"
+WHISPER_MODEL_SHA1="55356645c2b361a969dfd0ef2c5a50d530afd8d5"
+mkdir -p "$WHISPER_MODEL_DIR"
+if [[ ! -f "$WHISPER_MODEL" ]]; then
+  echo "Downloading Whisper small STT model (466 MiB)..."
+  curl --fail --location --retry 3 \
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin" \
+    --output "$WHISPER_MODEL.partial"
+  mv "$WHISPER_MODEL.partial" "$WHISPER_MODEL"
+fi
+if [[ "$(shasum "$WHISPER_MODEL" | awk '{print $1}')" != "$WHISPER_MODEL_SHA1" ]]; then
+  echo "Whisper model checksum failed: $WHISPER_MODEL" >&2
+  exit 1
+fi
+
 "$PYTHON_BIN" -m venv "$ROOT/.venv"
 PYTHON="$ROOT/.venv/bin/python"
 "$PYTHON" -m pip install --upgrade pip setuptools wheel
@@ -87,5 +106,5 @@ if [[ ! -f "$ROOT/.env.macos" ]]; then
 fi
 
 echo
-echo "Metal runtime is ready. Model weights are not stored in this repository."
+echo "TTS and STT Metal runtimes are ready. Model weights are not stored in Git."
 echo "Start with: ./start-macos.sh"

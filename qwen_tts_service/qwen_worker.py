@@ -202,6 +202,8 @@ class WorkerState:
             audio_chunks.append(chunk.copy())
             emitted_samples += int(chunk.size)
             generated_steps = int(timing.get("total_steps_so_far") or generated_steps)
+            if generated_steps <= 0:
+                generated_steps = round(emitted_samples * 12.5 / float(self.sample_rate))
             decode_chunks += 1
             elapsed = max(1e-6, time.perf_counter() - started)
             audio_seconds = emitted_samples / float(self.sample_rate)

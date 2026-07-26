@@ -13,11 +13,16 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-STREAMING_DIR = REPO_ROOT / "moss_tts_local_v1.5"
-sys.path.insert(0, str(STREAMING_DIR))
+QWEN_SERVICE_DIR = REPO_ROOT / "qwen_tts_service"
+sys.path.insert(0, str(QWEN_SERVICE_DIR))
 
 from qwen_runtime import QwenWorkerRuntime  # noqa: E402
-from streaming import StreamingRequest  # noqa: E402
+from qwen_protocol import StreamingRequest  # noqa: E402
+
+
+def absolute_without_resolving(path: Path) -> Path:
+    """Make a path absolute while preserving virtual-environment symlinks."""
+    return path.expanduser() if path.expanduser().is_absolute() else Path.cwd() / path.expanduser()
 
 
 def synthesize_once(
@@ -62,7 +67,7 @@ def synthesize_once(
 def benchmark_lanes(
     *,
     profile_id: str,
-    model_dir: Path,
+    model_dir: str | Path,
     qwen_python: Path,
     worker_script: Path,
     reference_audio: Path,
@@ -80,7 +85,7 @@ def benchmark_lanes(
         log_dir=REPO_ROOT / "logs" / "qwen-benchmark",
     )
     try:
-        warm_text = "这是Qwen音色缓存和CUDA图预热。"
+        warm_text = "这是Qwen音色缓存和Metal图预热。"
         for index in range(lanes):
             synthesize_once(
                 runtime,
@@ -148,9 +153,13 @@ def benchmark_lanes(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile-id", choices=["qwen_0_6b", "qwen_1_7b"], required=True)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--model-dir",
+        required=True,
+        help="Local model directory or Hugging Face model ID.",
+    )
     parser.add_argument("--qwen-python", type=Path, required=True)
-    parser.add_argument("--worker-script", type=Path, default=STREAMING_DIR / "qwen_worker.py")
+    parser.add_argument("--worker-script", type=Path, default=QWEN_SERVICE_DIR / "qwen_worker.py")
     parser.add_argument("--reference-audio", type=Path, required=True)
     parser.add_argument("--max-lanes", type=int, default=4)
     parser.add_argument("--frames", type=int, default=96)
@@ -162,8 +171,8 @@ def main() -> None:
         try:
             result = benchmark_lanes(
                 profile_id=args.profile_id,
-                model_dir=args.model_dir.resolve(),
-                qwen_python=args.qwen_python.resolve(),
+                model_dir=args.model_dir,
+                qwen_python=absolute_without_resolving(args.qwen_python),
                 worker_script=args.worker_script.resolve(),
                 reference_audio=args.reference_audio.resolve(),
                 lanes=lanes,
