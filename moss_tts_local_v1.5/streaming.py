@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import queue
 import threading
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -67,6 +69,38 @@ class StreamingRuntime:
     codec_execution_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     reference_audio_cache_hits: int = 0
     reference_audio_cache_misses: int = 0
+    profile_id: str = "quality_4b"
+    runtime_family: str = "local_v1_5"
+
+
+@dataclass
+class LegacyRuntime:
+    """Runtime for the original 1.7B checkpoint and 24 kHz codec."""
+
+    model: Any
+    processor: Any
+    device: torch.device
+    tts_device: torch.device
+    codec_device: torch.device
+    dtype: torch.dtype
+    model_dir: str | Path
+    codec_dir: str | Path
+    sample_rate: int
+    frame_rate: float
+    n_vq: int
+    attn_implementation: str
+    codec_weight_dtype: str
+    codec_compute_dtype: str
+    profile_id: str = "light_1_7b"
+    runtime_family: str = "legacy_1_7b"
+    reference_audio_cache: OrderedDict[tuple[str, int, int, int], torch.Tensor] = field(
+        default_factory=OrderedDict, repr=False
+    )
+    reference_audio_cache_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    codec_execution_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    generation_execution_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    reference_audio_cache_hits: int = 0
+    reference_audio_cache_misses: int = 0
 
 
 @dataclass
@@ -89,6 +123,12 @@ class StreamingRequest:
     text_top_k: int = 50
     seed: Optional[int] = None
     codec_chunk_frames: int = 8
+    qwen_xvec_only: bool = True
+    qwen_reference_text: str = ""
+    qwen_non_streaming_mode: bool = False
+    qwen_append_silence: bool = True
+    qwen_instruct: str = ""
+    qwen_min_new_tokens: int = 2
 
 
 @dataclass
@@ -258,6 +298,709 @@ def load_runtime(
     if warmup:
         warmup_streaming_runtime(runtime)
     return runtime
+
+
+def ensure_legacy_streaming_checkpoint_patch(model_dir: str | Path) -> None:
+    """Patch the downloaded 1.7B remote-code module for local streaming.
+
+    Model weights and remote-code files live under the ignored ``models``
+    directory, so this small idempotent source transform makes the optimization
+    reproducible after a fresh model download without committing model assets.
+    """
+
+    source_path = Path(model_dir) / "modeling_moss_tts.py"
+    if not source_path.is_file():
+        raise FileNotFoundError(f"1.7B model source not found: {source_path}")
+    source = source_path.read_text(encoding="utf-8")
+    original = source
+
+    if "put_audio_frame = getattr(streamer, \"put_audio_frame\", None)" not in source:
+        old = """            if streamer is not None:
+                streamer.put(next_tokens[:, 0].cpu())
+"""
+        new = """            if streamer is not None:
+                # Preserve the standard text-streamer contract, while allowing
+                # local TTS runtimes to consume the complete RVQ row.
+                put_audio_frame = getattr(streamer, \"put_audio_frame\", None)
+                if callable(put_audio_frame):
+                    put_audio_frame(next_tokens.detach().cpu())
+                else:
+                    streamer.put(next_tokens[:, 0].cpu())
+"""
+        if old not in source:
+            raise RuntimeError("unsupported 1.7B checkpoint: streamer hook changed")
+        source = source.replace(old, new, 1)
+
+    if "sampling_generator = getattr(streamer, \"sampling_generator\", None)" not in source:
+        old = """        # 提取配置参数
+        # assert False
+        speech_pad_idx = self.config.audio_pad_code
+"""
+        new = """        # 提取配置参数
+        # assert False
+        sampling_generator = getattr(streamer, \"sampling_generator\", None)
+        speech_pad_idx = self.config.audio_pad_code
+"""
+        if old not in source:
+            raise RuntimeError("unsupported 1.7B checkpoint: sampler prelude changed")
+        source = source.replace(old, new, 1)
+        old = """                    channel_ntk = torch.multinomial(nn.functional.softmax(next_token_score, dim=-1), num_samples=1).squeeze(1) # (B, )
+"""
+        new = """                    channel_ntk = torch.multinomial(
+                        nn.functional.softmax(next_token_score, dim=-1),
+                        num_samples=1,
+                        generator=sampling_generator,
+                    ).squeeze(1) # (B, )
+"""
+        if old not in source:
+            raise RuntimeError("unsupported 1.7B checkpoint: multinomial call changed")
+        source = source.replace(old, new, 1)
+
+    if "local_past_key_values = None" not in source:
+        old = """            local_trm_dim = self.local_transformer_config.hidden_size
+            local_transformer_inputs = torch.zeros(batch_size, 0, local_trm_dim).to(device).to(dtype) # (B, 0 <= t <= Nq, D), 维护当前 local trm 的输入
+            current_local_transformer_input = self.speech_embedding_to_local_mlp(global_trm_output_hidden_states) # (B, D) 维护当前 timestamp 的 local trm 的输入，
+"""
+        new = """            current_local_transformer_input = self.speech_embedding_to_local_mlp(global_trm_output_hidden_states) # (B, D) 维护当前 timestamp 的 local trm 的输入，
+            local_past_key_values = None
+"""
+        if old not in source:
+            raise RuntimeError("unsupported 1.7B checkpoint: local cache prelude changed")
+        source = source.replace(old, new, 1)
+        old = """                local_transformer_inputs = torch.cat([local_transformer_inputs, current_local_transformer_input.unsqueeze(1)], dim=1) # (B, t, D)
+                local_transformer_outputs = self.local_transformer(
+                    input_ids=None,
+                    attention_mask=None,
+                    inputs_embeds=local_transformer_inputs # (B, t=1+Nq, D)
+                )[0] # (B, t=1+Nq, D)
+                local_transformer_outputs = self.layer_norm_before_lm_heads[layer_index](
+                    self.local_to_speech_embedding_mlps[layer_index](local_transformer_outputs) # (B, t=1+Nq, D)
+                ) # (B, t=1+Nq, D)
+
+                next_token_logit = self.lm_heads[layer_index](local_transformer_outputs[:, -1, :]) # (B, V)
+"""
+        new = """                local_transformer_outputs = self.local_transformer(
+                    input_ids=None,
+                    attention_mask=None,
+                    past_key_values=local_past_key_values,
+                    inputs_embeds=current_local_transformer_input.unsqueeze(1),
+                    use_cache=True,
+                    return_dict=True,
+                )
+                local_past_key_values = local_transformer_outputs.past_key_values
+                local_hidden_state = self.layer_norm_before_lm_heads[layer_index](
+                    self.local_to_speech_embedding_mlps[layer_index](
+                        local_transformer_outputs.last_hidden_state[:, -1:, :]
+                    )
+                )
+
+                next_token_logit = self.lm_heads[layer_index](local_hidden_state[:, -1, :]) # (B, V)
+"""
+        if old not in source:
+            raise RuntimeError("unsupported 1.7B checkpoint: local transformer loop changed")
+        source = source.replace(old, new, 1)
+
+    if source != original:
+        temporary = source_path.with_suffix(".py.tmp")
+        temporary.write_text(source, encoding="utf-8")
+        os.replace(temporary, source_path)
+
+
+def load_legacy_runtime(
+    *,
+    model_dir: str | Path,
+    codec_dir: str | Path,
+    device: str | torch.device = "cuda",
+    tts_device: str | torch.device | None = None,
+    codec_device: str | torch.device | None = None,
+    dtype: str | torch.dtype = "bfloat16",
+    attn_implementation: str = "flash_attention_2",
+) -> LegacyRuntime:
+    """Load the official 1.7B release with its original audio tokenizer.
+
+    The 1.7B repository exposes the regular ``model.generate`` API rather
+    than the v1.5 frame iterator, so it is intentionally handled as a
+    non-streaming backend.
+    """
+
+    model_ref = str(model_dir)
+    codec_ref = str(codec_dir)
+    ensure_legacy_streaming_checkpoint_patch(model_ref)
+    resolved_tts_device = torch.device(tts_device if tts_device is not None else device)
+    resolved_codec_device = torch.device(codec_device if codec_device is not None else resolved_tts_device)
+    if (resolved_tts_device.type == "cuda" or resolved_codec_device.type == "cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false.")
+    resolved_dtype = _resolve_dtype(dtype)
+    resolved_attn = resolve_attn_implementation(attn_implementation, resolved_tts_device, resolved_dtype)
+    local_files_only = Path(model_ref).exists() and Path(codec_ref).exists()
+
+    processor = AutoProcessor.from_pretrained(
+        model_ref,
+        trust_remote_code=True,
+        codec_path=codec_ref,
+    )
+    # The original codec checkpoint is stored as fp32 (~7 GB). Keeping it in
+    # bf16/fp16 on GPU is necessary for 16 GB cards; its RVQ distance math
+    # explicitly promotes codebook operations to fp32 internally.
+    processor.audio_tokenizer = processor.audio_tokenizer.to(
+        device=resolved_codec_device, dtype=resolved_dtype
+    )
+    processor.audio_tokenizer.eval()
+    model = AutoModel.from_pretrained(
+        model_ref,
+        trust_remote_code=True,
+        dtype=resolved_dtype,
+        local_files_only=local_files_only,
+        attn_implementation=resolved_attn,
+    ).to(resolved_tts_device)
+    model.eval()
+
+    sample_rate = int(getattr(processor.model_config, "sampling_rate", 24000))
+    n_vq = int(getattr(model.config, "n_vq", 32))
+    runtime = LegacyRuntime(
+        model=model,
+        processor=processor,
+        device=resolved_tts_device,
+        tts_device=resolved_tts_device,
+        codec_device=resolved_codec_device,
+        dtype=resolved_dtype,
+        model_dir=model_ref,
+        codec_dir=codec_ref,
+        sample_rate=sample_rate,
+        frame_rate=12.5,
+        n_vq=n_vq,
+        attn_implementation=resolved_attn,
+        codec_weight_dtype="fp32",
+        codec_compute_dtype="fp32",
+    )
+    warmup_legacy_runtime(runtime)
+    return runtime
+
+
+@torch.inference_mode()
+def synthesize_legacy_full(
+    runtime: LegacyRuntime,
+    request: StreamingRequest,
+    *,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+) -> Generator[StreamingEvent, None, None]:
+    """Compatibility fallback that generates a complete 1.7B waveform."""
+
+    run_id = f"{int(time.time() * 1000)}_{os.getpid()}"
+    run_dir = Path(output_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    yield StreamingEvent(
+        type="metadata",
+        data={
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "sample_rate": runtime.sample_rate,
+            "frame_rate": runtime.frame_rate,
+            "n_vq": runtime.n_vq,
+            "tts_device": str(runtime.tts_device),
+            "codec_device": str(runtime.codec_device),
+            "attn_implementation": runtime.attn_implementation,
+            "processor_mode": "generation",
+            "model_profile": runtime.profile_id,
+        },
+    )
+
+    user_kwargs: dict[str, Any] = {"text": request.text, "language": request.language or "Chinese"}
+    if request.prompt_audio_path:
+        user_kwargs["reference"] = [request.prompt_audio_path]
+    if request.tokens_control and request.tokens > 0:
+        user_kwargs["tokens"] = int(request.tokens)
+    conversations = [[runtime.processor.build_user_message(**user_kwargs)]]
+    with (
+        torch.autocast(device_type="cuda", dtype=runtime.dtype)
+        if runtime.codec_device.type == "cuda" and runtime.dtype in {torch.float16, torch.bfloat16}
+        else nullcontext()
+    ):
+        batch = runtime.processor(conversations, mode="generation", n_vq=runtime.n_vq)
+    input_ids = batch["input_ids"].to(runtime.tts_device)
+    attention_mask = batch["attention_mask"].to(runtime.tts_device)
+
+    if request.seed is not None:
+        torch.manual_seed(int(request.seed))
+        if runtime.tts_device.type == "cuda":
+            torch.cuda.manual_seed_all(int(request.seed))
+    started_at = time.perf_counter()
+    outputs = runtime.model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=int(request.max_new_frames),
+        audio_temperature=float(request.temperature),
+        audio_top_p=float(request.top_p),
+        audio_top_k=int(request.top_k),
+        audio_repetition_penalty=float(request.repetition_penalty),
+    )
+    with (
+        torch.autocast(device_type="cuda", dtype=runtime.dtype)
+        if runtime.codec_device.type == "cuda" and runtime.dtype in {torch.float16, torch.bfloat16}
+        else nullcontext()
+    ):
+        messages = runtime.processor.decode(outputs)
+    if not messages or messages[0] is None or not messages[0].audio_codes_list:
+        raise RuntimeError("1.7B 模型没有返回可解码音频")
+    waveform = messages[0].audio_codes_list[0]
+    if not torch.is_tensor(waveform):
+        waveform = torch.as_tensor(waveform)
+    waveform = waveform.detach().cpu().to(torch.float32)
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    elif waveform.ndim > 2:
+        waveform = waveform.reshape(-1, waveform.shape[-1])
+    audio_path = run_dir / "generated.wav"
+    tokens_path = run_dir / "generated_tokens.pt"
+    metadata_path = run_dir / "metadata.json"
+    torchaudio.save(str(audio_path), waveform, runtime.sample_rate)
+    torch.save(outputs.detach().cpu() if torch.is_tensor(outputs) else outputs, tokens_path)
+    elapsed = time.perf_counter() - started_at
+    duration = float(waveform.shape[-1]) / float(runtime.sample_rate)
+    metadata = {
+        "run_id": run_id,
+        "model_profile": runtime.profile_id,
+        "generated_frames": int(round(duration * runtime.frame_rate)),
+        "duration_seconds": duration,
+        "generation_seconds": elapsed,
+        "sample_rate": runtime.sample_rate,
+        "channels": int(waveform.shape[0]),
+        "streaming_supported": False,
+    }
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    yield StreamingEvent(
+        type="result",
+        data={
+            "audio_path": str(audio_path),
+            "tokens_path": str(tokens_path),
+            "metadata_path": str(metadata_path),
+            "metadata": metadata,
+        },
+    )
+
+
+class LegacyAudioFrameStreamer:
+    """Receive complete RVQ rows from the legacy model generation loop."""
+
+    def __init__(
+        self,
+        *,
+        sampling_generator: Optional[torch.Generator] = None,
+    ) -> None:
+        self.queue: queue.Queue[Optional[torch.Tensor]] = queue.Queue()
+        self.sampling_generator = sampling_generator
+        self._ended = False
+        self._lock = threading.Lock()
+
+    def put_audio_frame(self, value: torch.Tensor) -> None:
+        self.queue.put(value.detach().cpu())
+
+    def put(self, value: torch.Tensor) -> None:
+        # GenerationMixin emits the complete input prompt once before entering
+        # the checkpoint's custom sampling loop. It is not generated audio and
+        # must not be decoded. Generated rows arrive through put_audio_frame().
+        return
+
+    def end(self) -> None:
+        with self._lock:
+            if self._ended:
+                return
+            self._ended = True
+            self.queue.put(None)
+
+
+def build_legacy_processor_inputs(
+    runtime: LegacyRuntime,
+    request: StreamingRequest,
+) -> dict[str, torch.Tensor]:
+    autocast_context = (
+        torch.autocast(device_type="cuda", dtype=runtime.dtype)
+        if runtime.codec_device.type == "cuda"
+        and runtime.dtype in {torch.float16, torch.bfloat16}
+        else nullcontext()
+    )
+    with autocast_context:
+        user_kwargs: dict[str, Any] = {
+            "text": request.text,
+            "language": request.language or "Chinese",
+        }
+        if request.prompt_audio_path:
+            user_kwargs["reference"] = [
+                cached_reference_audio_codes(runtime, request.prompt_audio_path)
+            ]
+        if request.tokens_control and request.tokens > 0:
+            user_kwargs["tokens"] = int(request.tokens)
+        conversations = [[runtime.processor.build_user_message(**user_kwargs)]]
+        batch = runtime.processor(conversations, mode="generation", n_vq=runtime.n_vq)
+    return _move_batch_to_device(batch, runtime.tts_device)
+
+
+@torch.inference_mode()
+def warmup_legacy_runtime(runtime: LegacyRuntime, *, codec_frames: int = 4) -> None:
+    """Warm the legacy codec; TTS is warmed naturally by the first real request."""
+    try:
+        frames = max(1, int(codec_frames))
+        dummy_codes = torch.zeros((frames, runtime.n_vq), dtype=torch.long)
+        with runtime.codec_execution_lock:
+            with StatefulCodecDecoder(runtime.processor.audio_tokenizer, n_vq=runtime.n_vq) as decoder:
+                with (
+                    torch.autocast(device_type="cuda", dtype=runtime.dtype)
+                    if runtime.codec_device.type == "cuda"
+                    and runtime.dtype in {torch.float16, torch.bfloat16}
+                    else nullcontext()
+                ):
+                    _ = decoder.decode_codes(
+                        dummy_codes.to(device=decoder.device, dtype=torch.long)
+                    )
+        if runtime.codec_device.type == "cuda":
+            torch.cuda.synchronize(runtime.codec_device)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[moss_tts_local.v1.5] 1.7B codec warmup skipped: {exc}")
+
+
+def _synthesize_legacy_stream_unlocked(
+    runtime: LegacyRuntime,
+    request: StreamingRequest,
+    *,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+) -> Generator[StreamingEvent, None, None]:
+    """Stream the original 1.7B model with cached prompts and chunked decoding."""
+
+    batch = build_legacy_processor_inputs(runtime, request)
+    output_dir = Path(output_dir)
+    run_id = f"{int(time.time() * 1000)}_{abs(hash((request.text, request.mode, runtime.profile_id))) % 1000000:06d}"
+    run_dir = output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    yield StreamingEvent(
+        type="metadata",
+        data={
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "sample_rate": runtime.sample_rate,
+            "frame_rate": runtime.frame_rate,
+            "n_vq": runtime.n_vq,
+            "tts_device": str(runtime.tts_device),
+            "codec_device": str(runtime.codec_device),
+            "attn_implementation": runtime.attn_implementation,
+            "processor_mode": "generation",
+            "model_profile": runtime.profile_id,
+        },
+    )
+
+    sampling_generator: Optional[torch.Generator] = None
+    if request.seed is not None and int(request.seed) >= 0:
+        sampling_generator = torch.Generator(device=runtime.tts_device)
+        sampling_generator.manual_seed(int(request.seed))
+
+    frame_streamer = LegacyAudioFrameStreamer(
+        sampling_generator=sampling_generator,
+    )
+    generation_result: dict[str, Any] = {}
+    generation_error: list[BaseException] = []
+
+    def _generation_worker() -> None:
+        try:
+            with torch.inference_mode():
+                generation_result["outputs"] = runtime.model.generate(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                    max_new_tokens=int(request.max_new_frames),
+                    text_temperature=float(request.text_temperature),
+                    text_top_p=float(request.text_top_p),
+                    text_top_k=int(request.text_top_k),
+                    audio_temperature=float(request.temperature),
+                    audio_top_p=float(request.top_p),
+                    audio_top_k=int(request.top_k),
+                    audio_repetition_penalty=float(request.repetition_penalty),
+                    n_vq_for_inference=runtime.n_vq,
+                    streamer=frame_streamer,
+                )
+        except BaseException as exc:  # noqa: BLE001
+            generation_error.append(exc)
+        finally:
+            frame_streamer.end()
+
+    pending_frames: list[torch.Tensor] = []
+    emitted_segments: list[torch.Tensor] = []
+    generated_audio_tokens: list[torch.Tensor] = []
+    generated_frames = 0
+    emitted_audio_seconds = 0.0
+    generation_start = time.perf_counter()
+    first_audio_emitted_at: Optional[float] = None
+    generated_frames_at_first_audio = 0
+    decode_chunks_submitted = 0
+    decode_input_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue()
+    decode_output_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    speech_pad_idx = int(runtime.model.config.audio_pad_code)
+
+    def _codec_worker() -> None:
+        try:
+            with runtime.codec_execution_lock:
+                with StatefulCodecDecoder(runtime.processor.audio_tokenizer, n_vq=runtime.n_vq) as decoder:
+                    while True:
+                        item = decode_input_queue.get()
+                        if item is None:
+                            break
+                        codes = item["codes"]
+                        with (
+                            torch.autocast(device_type="cuda", dtype=runtime.dtype)
+                            if runtime.codec_device.type == "cuda"
+                            and runtime.dtype in {torch.float16, torch.bfloat16}
+                            else nullcontext()
+                        ):
+                            audio = decoder.decode_codes(
+                                codes.to(device=decoder.device, dtype=torch.long)
+                            )
+                        decode_output_queue.put(
+                            {
+                                "type": "audio",
+                                "waveform": audio.detach().cpu(),
+                                "generated_frames": int(item["generated_frames"]),
+                                "chunk_frames": int(codes.shape[0]),
+                            }
+                        )
+        except BaseException as exc:  # noqa: BLE001
+            decode_output_queue.put({"type": "error", "error": repr(exc)})
+        finally:
+            decode_output_queue.put({"type": "done"})
+
+    def _metrics(*, now: Optional[float] = None) -> dict[str, Any]:
+        current_time = time.perf_counter() if now is None else now
+        elapsed = max(0.0, current_time - generation_start)
+        generated_seconds = generated_frames / float(runtime.frame_rate)
+        first_latency = (
+            None
+            if first_audio_emitted_at is None
+            else max(0.0, first_audio_emitted_at - generation_start)
+        )
+        post_first_factor: Optional[float] = None
+        playback_lead: Optional[float] = None
+        if first_audio_emitted_at is not None:
+            post_elapsed = max(0.0, current_time - first_audio_emitted_at)
+            post_generated = max(
+                0.0,
+                (generated_frames - generated_frames_at_first_audio) / float(runtime.frame_rate),
+            )
+            post_first_factor = post_generated / post_elapsed if post_elapsed > 0 else 0.0
+            playback_lead = emitted_audio_seconds - post_elapsed
+        return {
+            "generated_audio_seconds": generated_seconds,
+            "generation_elapsed_seconds": elapsed,
+            "generation_realtime_factor": generated_seconds / elapsed if elapsed > 0 else 0.0,
+            "post_first_generation_realtime_factor": post_first_factor,
+            "playback_lead_seconds": playback_lead,
+            "first_audio_latency_seconds": first_latency,
+            "decode_chunks_submitted": decode_chunks_submitted,
+            "decode_queue_depth": decode_input_queue.qsize(),
+            "pending_decode_frames": len(pending_frames),
+        }
+
+    decoder_thread = threading.Thread(
+        target=_codec_worker,
+        name="moss-tts-legacy-codec-worker",
+        daemon=True,
+    )
+    generation_thread = threading.Thread(
+        target=_generation_worker,
+        name="moss-tts-legacy-generation-worker",
+        daemon=True,
+    )
+    decoder_thread.start()
+    generation_thread.start()
+
+    decoder_done = False
+
+    def _drain_decoder_outputs(*, block: bool = False) -> list[StreamingEvent]:
+        nonlocal emitted_audio_seconds, first_audio_emitted_at
+        nonlocal generated_frames_at_first_audio, decoder_done
+        events: list[StreamingEvent] = []
+        while True:
+            try:
+                item = decode_output_queue.get(
+                    block=block and not events,
+                    timeout=0.05 if block and not events else 0.0,
+                )
+            except queue.Empty:
+                break
+            if item.get("type") == "done":
+                decoder_done = True
+                continue
+            if item.get("type") == "error":
+                raise RuntimeError(f"1.7B codec worker failed: {item.get('error')}")
+            audio = item["waveform"]
+            if audio.numel() <= 0:
+                continue
+            emitted_segments.append(audio)
+            now = time.perf_counter()
+            if first_audio_emitted_at is None:
+                first_audio_emitted_at = now
+                generated_frames_at_first_audio = int(item["generated_frames"])
+            emitted_audio_seconds += int(audio.shape[-1]) / float(runtime.sample_rate)
+            events.append(
+                StreamingEvent(
+                    type="audio",
+                    data={
+                        "waveform": audio,
+                        "sample_rate": runtime.sample_rate,
+                        "generated_frames": int(item["generated_frames"]),
+                        "emitted_audio_seconds": emitted_audio_seconds,
+                        "chunk_frames": int(item["chunk_frames"]),
+                        "tts_device": str(runtime.tts_device),
+                        "codec_device": str(runtime.codec_device),
+                        **_metrics(now=now),
+                    },
+                )
+            )
+        return events
+
+    try:
+        while True:
+            for audio_event in _drain_decoder_outputs(block=False):
+                yield audio_event
+            try:
+                row = frame_streamer.queue.get(timeout=0.05)
+            except queue.Empty:
+                if generation_error:
+                    raise RuntimeError(f"1.7B generation failed: {generation_error[0]!r}")
+                continue
+            if row is None:
+                break
+            if row.ndim != 2 or int(row.shape[0]) != 1 or int(row.shape[1]) < runtime.n_vq + 1:
+                raise RuntimeError(f"unexpected 1.7B streamed row shape: {tuple(row.shape)}")
+            frame = row[0, 1 : runtime.n_vq + 1].contiguous().long()
+            if bool(frame.eq(speech_pad_idx).all().item()):
+                continue
+            generated_audio_tokens.append(frame)
+            pending_frames.append(frame)
+            generated_frames += 1
+            decode_budget = _decode_budget_from_stream_state(
+                lead_seconds=(generated_frames / float(runtime.frame_rate))
+                - (time.perf_counter() - generation_start)
+                - emitted_audio_seconds,
+                default_budget=int(request.codec_chunk_frames),
+                first_decode_submitted=decode_chunks_submitted > 0,
+                first_audio_emitted=first_audio_emitted_at is not None,
+                decode_queue_depth=decode_input_queue.qsize(),
+                decode_chunks_submitted=decode_chunks_submitted,
+                n_vq=runtime.n_vq,
+            )
+            if len(pending_frames) >= decode_budget:
+                codes = torch.stack(pending_frames, dim=0).contiguous()
+                pending_frames.clear()
+                decode_chunks_submitted += 1
+                decode_input_queue.put(
+                    {"codes": codes, "generated_frames": generated_frames}
+                )
+            for audio_event in _drain_decoder_outputs(block=False):
+                yield audio_event
+            yield StreamingEvent(
+                type="progress",
+                data={
+                    "generated_frames": generated_frames,
+                    "emitted_audio_seconds": emitted_audio_seconds,
+                    "tts_device": str(runtime.tts_device),
+                    "codec_device": str(runtime.codec_device),
+                    **_metrics(),
+                },
+            )
+        if generation_error:
+            raise RuntimeError(f"1.7B generation failed: {generation_error[0]!r}")
+        if pending_frames:
+            codes = torch.stack(pending_frames, dim=0).contiguous()
+            pending_frames.clear()
+            decode_chunks_submitted += 1
+            decode_input_queue.put({"codes": codes, "generated_frames": generated_frames})
+    finally:
+        decode_input_queue.put(None)
+
+    while not decoder_done or not decode_output_queue.empty():
+        for audio_event in _drain_decoder_outputs(block=True):
+            yield audio_event
+        if decoder_done:
+            break
+    generation_thread.join(timeout=5.0)
+    decoder_thread.join(timeout=5.0)
+
+    final_audio = (
+        torch.cat(emitted_segments, dim=-1)
+        if emitted_segments
+        else torch.empty((1, 0), dtype=torch.float32)
+    )
+    final_tokens = (
+        torch.stack(generated_audio_tokens, dim=0)
+        if generated_audio_tokens
+        else torch.empty((0, runtime.n_vq), dtype=torch.long)
+    )
+    if final_audio.numel() <= 0:
+        raise RuntimeError("1.7B 模型没有返回可解码音频")
+    audio_path = run_dir / "generated.wav"
+    tokens_path = run_dir / "generated_tokens.pt"
+    metadata_path = run_dir / "metadata.json"
+    _save_waveform(audio_path, final_audio, runtime.sample_rate)
+    torch.save(final_tokens, tokens_path)
+    final_metrics = _metrics()
+    metadata = {
+        "run_id": run_id,
+        "model_profile": runtime.profile_id,
+        "generated_frames": int(final_tokens.shape[0]),
+        "duration_seconds": final_audio.shape[-1] / float(runtime.sample_rate),
+        "generation_seconds": time.perf_counter() - generation_start,
+        "sample_rate": runtime.sample_rate,
+        "channels": int(final_audio.shape[0]),
+        "streaming_supported": True,
+        "first_audio_latency_seconds": final_metrics["first_audio_latency_seconds"],
+        "generation_realtime_factor": final_metrics["generation_realtime_factor"],
+        "post_first_generation_realtime_factor": final_metrics[
+            "post_first_generation_realtime_factor"
+        ],
+        "decode_chunks_submitted": final_metrics["decode_chunks_submitted"],
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    yield StreamingEvent(
+        type="result",
+        data={
+            "waveform": final_audio,
+            "sample_rate": runtime.sample_rate,
+            "audio_path": str(audio_path),
+            "tokens_path": str(tokens_path),
+            "metadata_path": str(metadata_path),
+            "metadata": metadata,
+            "audio_token_ids": final_tokens,
+        },
+    )
+
+
+def synthesize_legacy_stream(
+    runtime: LegacyRuntime,
+    request: StreamingRequest,
+    *,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+) -> Generator[StreamingEvent, None, None]:
+    # The official 1.7B checkpoint mutates generation/cache state on the model
+    # instance and is not safe for concurrent generate() calls. Keeping one
+    # resident instance and serializing complete jobs is both faster and much
+    # less memory-intensive than loading a second ~13 GB model+codec runtime.
+    with runtime.generation_execution_lock:
+        yield from _synthesize_legacy_stream_unlocked(
+            runtime,
+            request,
+            output_dir=output_dir,
+        )
+
+
+def synthesize_for_runtime(
+    runtime: StreamingRuntime | LegacyRuntime,
+    request: StreamingRequest,
+    *,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+) -> Generator[StreamingEvent, None, None]:
+    if isinstance(runtime, LegacyRuntime):
+        yield from synthesize_legacy_stream(runtime, request, output_dir=output_dir)
+    else:
+        yield from synthesize_stream(runtime, request, output_dir=output_dir)
 
 
 def _build_prompt_fields(request: StreamingRequest) -> dict[str, Any]:
@@ -447,7 +1190,10 @@ def build_processor_inputs(
     return _move_batch_to_device(batch, runtime.tts_device), prompt_audio_codes, processor_mode
 
 
-def cached_reference_audio_codes(runtime: StreamingRuntime, prompt_audio_path: str) -> torch.Tensor:
+def cached_reference_audio_codes(
+    runtime: StreamingRuntime | LegacyRuntime,
+    prompt_audio_path: str,
+) -> torch.Tensor:
     """Encode a clone reference once and reuse its CPU audio codes across requests."""
     resolved = Path(prompt_audio_path).resolve(strict=True)
     stat = resolved.stat()
@@ -694,8 +1440,18 @@ class StatefulCodecDecoder:
             raise ValueError(f"Expected codes shape [T, {self.n_vq}], got {tuple(codes.shape)}.")
         codes_qbt = codes.transpose(0, 1).contiguous().unsqueeze(1).to(device=self.device, dtype=torch.long)
         codes_lengths = torch.tensor([codes_qbt.shape[-1]], device=self.device, dtype=torch.long)
-        active_mask = torch.tensor([codes_qbt.shape[-1] > 0], device=self.device, dtype=torch.bool)
-        self.audio_tokenizer._set_streaming_exec_mask(active_mask)
+        set_streaming_exec_mask = getattr(
+            self.audio_tokenizer,
+            "_set_streaming_exec_mask",
+            None,
+        )
+        if callable(set_streaming_exec_mask):
+            active_mask = torch.tensor(
+                [codes_qbt.shape[-1] > 0],
+                device=self.device,
+                dtype=torch.bool,
+            )
+            set_streaming_exec_mask(active_mask)
         decoded = self.audio_tokenizer._decode_frame(codes_qbt, codes_lengths)
         if decoded.audio is None or decoded.audio_lengths is None:
             raise RuntimeError("audio tokenizer did not return audio/audio_lengths.")

@@ -11,6 +11,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree
@@ -119,7 +120,7 @@ class DocumentProjectManager:
         self,
         *,
         root_dir: str | Path,
-        runtime_getter: Callable[[], Any],
+        runtime_session: Callable[[str], AbstractContextManager[Any]],
         synthesize_fn: Callable[..., Any],
         request_cls: type,
         generation_lock: threading.Lock,
@@ -127,7 +128,7 @@ class DocumentProjectManager:
     ) -> None:
         self.root_dir = Path(root_dir).resolve()
         self.root_dir.mkdir(parents=True, exist_ok=True)
-        self.runtime_getter = runtime_getter
+        self.runtime_session = runtime_session
         self.synthesize_fn = synthesize_fn
         self.request_cls = request_cls
         self.generation_lock = generation_lock
@@ -152,7 +153,28 @@ class DocumentProjectManager:
         path = self._manifest_path(project_id)
         if not path.exists():
             raise FileNotFoundError(project_id)
-        return json.loads(path.read_text(encoding="utf-8"))
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        self._migrate_model_profile(manifest)
+        return manifest
+
+    @staticmethod
+    def _migrate_model_profile(manifest: dict[str, Any]) -> bool:
+        """Bind projects created before multi-model support to the original 4B model."""
+        changed = False
+        settings = manifest.setdefault("settings", {})
+        if not settings.get("model_profile"):
+            settings["model_profile"] = "quality_4b"
+            changed = True
+        profile = str(settings["model_profile"])
+        for segment in manifest.get("segments", []):
+            if segment.get("status") == "completed" and not segment.get("model_profile"):
+                segment["model_profile"] = profile
+                changed = True
+        if changed:
+            # This is a metadata migration only. Existing audio is deliberately
+            # retained and the new fingerprint becomes the project's baseline.
+            manifest["settings_fingerprint"] = settings_fingerprint(settings)
+        return changed
 
     def _save(self, manifest: dict[str, Any]) -> None:
         manifest["updated_at"] = _now()
@@ -162,6 +184,7 @@ class DocumentProjectManager:
         for manifest_path in self.root_dir.glob("*/manifest.json"):
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                migrated = self._migrate_model_profile(manifest)
                 if manifest.get("state") in {"running", "stopping"}:
                     manifest["state"] = "paused"
                     manifest["message"] = "服务重启后已暂停，可继续生成"
@@ -169,6 +192,8 @@ class DocumentProjectManager:
                     for segment in manifest.get("segments", []):
                         if segment.get("status") in {"generating", "encoding"}:
                             segment["status"] = "pending"
+                    _atomic_json_write(manifest_path, manifest)
+                elif migrated:
                     _atomic_json_write(manifest_path, manifest)
             except Exception:
                 continue
@@ -271,6 +296,7 @@ class DocumentProjectManager:
                     "duration_seconds": 0.0,
                     "generation_seconds": 0.0,
                     "error": None,
+                    "model_profile": None,
                 }
             )
             cursor += len(chunk)
@@ -509,7 +535,12 @@ class DocumentProjectManager:
         working_dir = project_dir / "working"
         working_dir.mkdir(parents=True, exist_ok=True)
         text = segment["text"]
-        estimated_frames = max(80, min(int(settings.get("max_new_tokens", 7500)), int(len(text) * 4.2)))
+        qwen_profile = str(settings.get("model_profile") or "").startswith("qwen_")
+        estimated_frames = (
+            max(24, min(int(settings.get("max_new_tokens", 2048)), int(len(text) * 3.2)))
+            if qwen_profile
+            else max(80, min(int(settings.get("max_new_tokens", 7500)), int(len(text) * 4.2)))
+        )
         request = self.request_cls(
             text=text,
             mode="voice_clone",
@@ -526,14 +557,21 @@ class DocumentProjectManager:
             repetition_penalty=float(settings.get("repetition_penalty", 1.0)),
             seed=None if int(settings.get("seed", 1234)) < 0 else int(settings.get("seed", 1234)),
             codec_chunk_frames=max(1, int(settings.get("codec_chunk_frames", 16))),
+            qwen_xvec_only=str(settings.get("qwen_clone_mode") or "xvec") != "icl",
+            qwen_reference_text=str(settings.get("qwen_reference_text") or ""),
+            qwen_non_streaming_mode=bool(settings.get("qwen_non_streaming_mode", False)),
+            qwen_append_silence=bool(settings.get("qwen_append_silence", True)),
+            qwen_instruct=str(settings.get("qwen_instruct") or ""),
+            qwen_min_new_tokens=max(2, int(settings.get("qwen_min_new_tokens", 2))),
         )
         result_event: dict[str, Any] | None = None
         with self.generation_lock:
             started_at = time.perf_counter()
-            runtime = self.runtime_getter()
-            for event in self.synthesize_fn(runtime, request, output_dir=working_dir):
-                if event.type == "result":
-                    result_event = event.data
+            model_profile = str(settings.get("model_profile") or "quality_4b")
+            with self.runtime_session(model_profile) as runtime:
+                for event in self.synthesize_fn(runtime, request, output_dir=working_dir):
+                    if event.type == "result":
+                        result_event = event.data
             generation_seconds = time.perf_counter() - started_at
         if result_event is None:
             raise RuntimeError("模型没有返回完整音频")
@@ -542,6 +580,7 @@ class DocumentProjectManager:
             "source_wav": str(source_wav),
             "duration_seconds": float(result_event.get("metadata", {}).get("duration_seconds", 0.0)),
             "generation_seconds": generation_seconds,
+            "model_profile": str(settings.get("model_profile") or "quality_4b"),
         }
 
     def _encode_segment_aac(

@@ -55,6 +55,7 @@ local-app = [
     "uvicorn[standard]==0.51.0",
     "python-multipart==0.0.32",
     "huggingface-hub>=1.0.0",
+    "modelscope>=1.31,<2",
 ]
 
 # llama.cpp backend — torch-free core
