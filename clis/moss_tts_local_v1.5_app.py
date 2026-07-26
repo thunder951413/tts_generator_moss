@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import gc
+import hashlib
+import hmac
+import html as html_lib
 import json
 import logging
 import mimetypes
 import os
 import queue
 import re
+import secrets
 import shutil
 import sys
 import threading
@@ -17,14 +23,14 @@ import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote
 
 import orjson
 import torch
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STREAMING_MODULE_DIR = REPO_ROOT / "moss_tts_local_v1.5"
@@ -37,10 +43,13 @@ from streaming import (
     DEFAULT_OUTPUT_DIR,
     StreamingRequest,
     StreamingRuntime,
+    LegacyRuntime,
+    load_legacy_runtime,
     load_runtime,
-    synthesize_stream,
+    synthesize_for_runtime,
 )
 from document_projects import DocumentProjectManager
+from qwen_runtime import QwenWorkerRuntime
 
 
 torch.backends.cuda.enable_cudnn_sdp(False)
@@ -50,6 +59,22 @@ torch.backends.cuda.enable_math_sdp(True)
 
 DEFAULT_UPLOAD_DIR = Path("outputs/moss_tts_local_v1_5_uploads")
 DEFAULT_DOCUMENT_PROJECT_DIR = REPO_ROOT / "outputs" / "moss_tts_document_projects"
+DEFAULT_SERVICE_JOB_DIR = REPO_ROOT / "outputs" / "moss_tts_service_jobs"
+SERVICE_AUTH_COOKIE = "moss_tts_service_session"
+DEFAULT_LITE_MODEL_DIR = REPO_ROOT / "models" / "MOSS-TTS-Local-Transformer"
+DEFAULT_LITE_CODEC_DIR = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer"
+DEFAULT_QWEN_ROOT = REPO_ROOT.parent / "faster-qwen3-tts"
+DEFAULT_QWEN_PYTHON = DEFAULT_QWEN_ROOT / ".venv" / "Scripts" / "python.exe"
+DEFAULT_QWEN_WORKER_SCRIPT = STREAMING_MODULE_DIR / "qwen_worker.py"
+DEFAULT_QWEN_0_6B_MODEL_DIR = DEFAULT_QWEN_ROOT / "models" / "Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_QWEN_1_7B_MODEL_DIR = DEFAULT_QWEN_ROOT / "models" / "Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_MODEL_PROFILE = "qwen_0_6b"
+MODEL_PROFILE_LABELS = {
+    "quality_4b": "高质量 4B（v1.5）",
+    "light_1_7b": "轻量 1.7B（v1.0）",
+    "qwen_0_6b": "Qwen3-TTS 0.6B（极速克隆）",
+    "qwen_1_7b": "Qwen3-TTS 1.7B（高质量克隆）",
+}
 DEFAULT_MAX_NEW_TOKENS = 7500
 MODE_CLONE = "Clone"
 MODE_CONTINUE = "Continuation"
@@ -149,16 +174,25 @@ def build_bailian_voice_rows() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     if not BAILIAN_VOICES_TSV_PATH.exists():
         return rows
-    with open(BAILIAN_VOICES_TSV_PATH, "r", encoding="utf-8-sig") as f:
-        header = next(f, "")
-        for line in f:
-            parts = line.rstrip("\r\n").split("\t")
-            if len(parts) < 3:
+    with open(BAILIAN_VOICES_TSV_PATH, "r", encoding="utf-8-sig", newline="") as f:
+        for item in csv.DictReader(f, delimiter="\t"):
+            name = str(item.get("name") or "").strip()
+            description = str(item.get("description") or "").strip()
+            filename = str(item.get("filename") or "").strip()
+            if not name or not filename:
                 continue
-            name, description, filename = parts[:3]
             audio_path = BAILIAN_VOICES_TSV_PATH.parent / filename
             if audio_path.exists():
-                rows.append({"name": name, "description": description, "audio_path": str(audio_path)})
+                rows.append(
+                    {
+                        "name": name,
+                        "description": description,
+                        "audio_path": str(audio_path),
+                        "language": str(item.get("language") or "Chinese").strip(),
+                        "transcript": str(item.get("transcript") or "").strip(),
+                        "transcript_source": str(item.get("transcript_source") or "").strip(),
+                    }
+                )
     return rows
 
 
@@ -206,10 +240,13 @@ def _decode_reference_path(path: str) -> str:
     return decoded
 
 
-def _pcm16le_bytes(waveform: torch.Tensor) -> bytes:
+def _pcm16le_bytes(waveform: torch.Tensor, channels: int = 2) -> bytes:
     if waveform.ndim == 1:
         waveform = waveform.unsqueeze(0)
-    if waveform.shape[0] == 1:
+    target_channels = 1 if int(channels) == 1 else 2
+    if target_channels == 1:
+        waveform = waveform.mean(dim=0, keepdim=True) if waveform.shape[0] > 1 else waveform[:1]
+    elif waveform.shape[0] == 1:
         waveform = waveform.repeat(2, 1)
     elif waveform.shape[0] > 2:
         waveform = waveform[:2]
@@ -224,6 +261,14 @@ class RuntimeManager:
         *,
         model_dir: str,
         codec_dir: str,
+        lite_model_dir: str,
+        lite_codec_dir: str,
+        qwen_python: str,
+        qwen_worker_script: str,
+        qwen_0_6b_model_dir: str,
+        qwen_1_7b_model_dir: str,
+        qwen_0_6b_lanes: int,
+        qwen_1_7b_lanes: int,
         device: str,
         tts_device: str,
         codec_device: str,
@@ -233,8 +278,54 @@ class RuntimeManager:
         codec_compute_dtype: str,
         warmup: bool,
     ) -> None:
-        self.model_dir = str(model_dir)
-        self.codec_dir = str(codec_dir)
+        self.profiles = {
+            "quality_4b": {
+                "label": MODEL_PROFILE_LABELS["quality_4b"],
+                "model_dir": str(model_dir),
+                "codec_dir": str(codec_dir),
+                "sample_rate": 48000,
+                "channels": 2,
+                "streaming": True,
+                "backend": "moss",
+                "family": "moss",
+            },
+            "light_1_7b": {
+                "label": MODEL_PROFILE_LABELS["light_1_7b"],
+                "model_dir": str(lite_model_dir),
+                "codec_dir": str(lite_codec_dir),
+                "sample_rate": 24000,
+                "channels": 1,
+                "streaming": True,
+                "backend": "moss",
+                "family": "moss",
+            },
+            "qwen_0_6b": {
+                "label": MODEL_PROFILE_LABELS["qwen_0_6b"],
+                "model_dir": str(qwen_0_6b_model_dir),
+                "codec_dir": str(qwen_0_6b_model_dir),
+                "sample_rate": 24000,
+                "channels": 1,
+                "streaming": True,
+                "backend": "qwen",
+                "family": "qwen",
+                "lanes": max(1, int(qwen_0_6b_lanes)),
+                "base_port": 7870,
+            },
+            "qwen_1_7b": {
+                "label": MODEL_PROFILE_LABELS["qwen_1_7b"],
+                "model_dir": str(qwen_1_7b_model_dir),
+                "codec_dir": str(qwen_1_7b_model_dir),
+                "sample_rate": 24000,
+                "channels": 1,
+                "streaming": True,
+                "backend": "qwen",
+                "family": "qwen",
+                "lanes": max(1, int(qwen_1_7b_lanes)),
+                "base_port": 7880,
+            },
+        }
+        self.qwen_python = str(qwen_python)
+        self.qwen_worker_script = str(qwen_worker_script)
         self.device = device
         self.tts_device = tts_device
         self.codec_device = codec_device
@@ -244,8 +335,12 @@ class RuntimeManager:
         self.codec_compute_dtype = codec_compute_dtype
         self.warmup = bool(warmup)
         self._lock = threading.Lock()
+        self._session_condition = threading.Condition()
+        self._session_count = 0
+        self._switching = False
+        self._active_profile: str | None = None
         self._status_lock = threading.Lock()
-        self._runtime: StreamingRuntime | None = None
+        self._runtime: StreamingRuntime | LegacyRuntime | QwenWorkerRuntime | None = None
         self._loader_thread: threading.Thread | None = None
         self._state = "not_loaded"
         self._error: str | None = None
@@ -277,8 +372,10 @@ class RuntimeManager:
             "load_started_at": load_started_at,
             "ready_at": ready_at,
             "load_elapsed_seconds": elapsed,
-            "model_dir": self.model_dir,
-            "codec_dir": self.codec_dir,
+            "active_profile": self._active_profile,
+            "active_profile_label": MODEL_PROFILE_LABELS.get(self._active_profile or "", ""),
+            "model_dir": None if self._active_profile is None else self.profiles[self._active_profile]["model_dir"],
+            "codec_dir": None if self._active_profile is None else self.profiles[self._active_profile]["codec_dir"],
             "device": self.device,
             "tts_device": self.tts_device,
             "codec_device": self.codec_device,
@@ -300,6 +397,25 @@ class RuntimeManager:
             "reference_cache_entries": 0 if self._runtime is None else len(self._runtime.reference_audio_cache),
             "reference_cache_hits": 0 if self._runtime is None else int(self._runtime.reference_audio_cache_hits),
             "reference_cache_misses": 0 if self._runtime is None else int(self._runtime.reference_audio_cache_misses),
+            "profiles": [
+                {
+                    "id": profile_id,
+                    **profile,
+                    "available": (
+                        Path(profile["model_dir"]).exists()
+                        and Path(profile["codec_dir"]).exists()
+                        and (
+                            profile.get("backend") != "qwen"
+                            or (
+                                Path(self.qwen_python).is_file()
+                                and Path(self.qwen_worker_script).is_file()
+                            )
+                        )
+                    ),
+                    "loaded": profile_id == self._active_profile and self._runtime is not None,
+                }
+                for profile_id, profile in self.profiles.items()
+            ],
         }
 
     def preload_async(self) -> None:
@@ -311,35 +427,109 @@ class RuntimeManager:
 
         def _load() -> None:
             try:
-                self.get()
+                with self.session(DEFAULT_MODEL_PROFILE):
+                    pass
             except Exception:
                 logging.exception("failed to preload MOSS-TTS Local v1.5 streaming runtime")
 
         self._loader_thread = threading.Thread(target=_load, name="moss-tts-local-v1.5-runtime-loader", daemon=True)
         self._loader_thread.start()
 
-    def get(self) -> StreamingRuntime:
+    def _release_runtime(self) -> None:
+        runtime = self._runtime
+        if runtime is not None and hasattr(runtime, "close"):
+            try:
+                runtime.close()
+            except Exception:
+                logging.exception("failed to close runtime")
+        self._runtime = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def close(self) -> None:
         with self._lock:
-            if self._runtime is None:
+            self._release_runtime()
+            self._active_profile = None
+            self._set_status(state="not_loaded")
+
+    def _load(self, profile_id: str) -> StreamingRuntime | LegacyRuntime | QwenWorkerRuntime:
+        if profile_id not in self.profiles:
+            raise ValueError(f"unknown model profile: {profile_id}")
+        profile = self.profiles[profile_id]
+        if not Path(profile["model_dir"]).exists() or not Path(profile["codec_dir"]).exists():
+            raise RuntimeError(f"模型档位尚未下载完整：{profile['label']}")
+        with self._lock:
+            if self._runtime is None or self._active_profile != profile_id:
                 self._set_status(state="loading")
                 try:
-                    self._runtime = load_runtime(
-                        model_dir=self.model_dir,
-                        codec_dir=self.codec_dir,
-                        device=self.device,
-                        tts_device=self.tts_device,
-                        codec_device=self.codec_device,
-                        dtype=self.dtype,
-                        attn_implementation=self.attn_implementation,
-                        codec_weight_dtype=self.codec_weight_dtype,
-                        codec_compute_dtype=self.codec_compute_dtype,
-                        warmup=self.warmup,
-                    )
+                    self._release_runtime()
+                    if profile.get("backend") == "qwen":
+                        if not Path(self.qwen_python).is_file():
+                            raise RuntimeError(f"Qwen Python环境不存在：{self.qwen_python}")
+                        self._runtime = QwenWorkerRuntime(
+                            profile_id=profile_id,
+                            model_dir=profile["model_dir"],
+                            python_executable=self.qwen_python,
+                            worker_script=self.qwen_worker_script,
+                            lanes=int(profile.get("lanes") or 1),
+                            base_port=int(profile["base_port"]),
+                            log_dir=REPO_ROOT / "logs" / "qwen-workers",
+                        )
+                    elif profile_id == "light_1_7b":
+                        self._runtime = load_legacy_runtime(
+                            model_dir=profile["model_dir"], codec_dir=profile["codec_dir"],
+                            device=self.device, tts_device=self.tts_device, codec_device=self.codec_device,
+                            dtype=self.dtype, attn_implementation=self.attn_implementation,
+                        )
+                    else:
+                        self._runtime = load_runtime(
+                            model_dir=profile["model_dir"], codec_dir=profile["codec_dir"],
+                            device=self.device, tts_device=self.tts_device, codec_device=self.codec_device,
+                            dtype=self.dtype, attn_implementation=self.attn_implementation,
+                            codec_weight_dtype=self.codec_weight_dtype,
+                            codec_compute_dtype=self.codec_compute_dtype, warmup=self.warmup,
+                        )
+                    self._active_profile = profile_id
                 except Exception as exc:
                     self._set_status(state="error", error=str(exc))
                     raise
                 self._set_status(state="ready")
             return self._runtime
+
+    @contextmanager
+    def session(self, profile_id: str):
+        """Allow parallel requests for one model, but switch only when idle."""
+        profile_id = profile_id if profile_id in self.profiles else DEFAULT_MODEL_PROFILE
+        needs_load = False
+        with self._session_condition:
+            while self._switching or (self._session_count > 0 and self._active_profile != profile_id):
+                self._session_condition.wait()
+            if self._active_profile != profile_id or self._runtime is None:
+                self._switching = True
+                needs_load = True
+            else:
+                self._session_count += 1
+        if needs_load:
+            try:
+                runtime = self._load(profile_id)
+            except Exception:
+                with self._session_condition:
+                    self._switching = False
+                    self._session_condition.notify_all()
+                raise
+            with self._session_condition:
+                self._switching = False
+                self._session_count = 1
+                self._session_condition.notify_all()
+        else:
+            runtime = self._runtime
+        try:
+            yield runtime
+        finally:
+            with self._session_condition:
+                self._session_count = max(0, self._session_count - 1)
+                self._session_condition.notify_all()
 
 
 class GpuGenerationScheduler:
@@ -402,14 +592,22 @@ class GpuGenerationScheduler:
 
 
 class StreamingJob:
-    def __init__(self, job_id: str) -> None:
+    def __init__(
+        self,
+        job_id: str,
+        *,
+        status: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        persist_callback: Callable[["StreamingJob"], None] | None = None,
+    ) -> None:
         self.job_id = job_id
         self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
         self.status_lock = threading.Lock()
-        self.status: dict[str, Any] = {
+        default_status: dict[str, Any] = {
             "job_id": job_id,
             "state": "queued",
             "created_at": time.time(),
+            "updated_at": time.time(),
             "started_at": None,
             "first_audio_at": None,
             "sample_rate": 48000,
@@ -422,29 +620,107 @@ class StreamingJob:
             "error": None,
             "closed": False,
         }
-        self.result: dict[str, Any] | None = None
+        if status:
+            default_status.update(status)
+        self.status = default_status
+        self.result = result
         self.thread: threading.Thread | None = None
-        self.is_closed = False
+        self.is_closed = bool(self.status.get("closed", False))
+        self._persist_callback = persist_callback
+        self._last_persist_at = 0.0
+        self._persist_lock = threading.Lock()
 
     def update(self, **kwargs: Any) -> None:
+        should_persist = False
         with self.status_lock:
             self.status.update(kwargs)
+            self.status["updated_at"] = time.time()
+            should_persist = (
+                str(self.status.get("state")) in {"finished", "error", "closed", "interrupted"}
+                or self.status["updated_at"] - self._last_persist_at >= 0.5
+            )
+        if should_persist:
+            self.persist()
+
+    def set_result(self, result: dict[str, Any]) -> None:
+        with self.status_lock:
+            self.result = result
+            self.status["updated_at"] = time.time()
+        self.persist()
 
     def snapshot(self) -> dict[str, Any]:
         with self.status_lock:
-            return dict(self.status)
+            return {**self.status, "result_ready": self.result is not None}
+
+    def persist(self) -> None:
+        if self._persist_callback is not None:
+            with self._persist_lock:
+                self._persist_callback(self)
+                self._last_persist_at = time.time()
+
+    def manifest(self) -> dict[str, Any]:
+        with self.status_lock:
+            return {"status": dict(self.status), "result": self.result}
 
 
 class StreamingJobManager:
-    def __init__(self) -> None:
+    def __init__(self, root_dir: str | Path) -> None:
         self._jobs: dict[str, StreamingJob] = {}
         self._lock = threading.Lock()
+        self.root_dir = Path(root_dir).resolve()
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self._load_existing()
 
-    def create(self) -> StreamingJob:
-        job = StreamingJob(uuid.uuid4().hex)
+    def _manifest_path(self, job_id: str) -> Path:
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id or ""):
+            raise ValueError("invalid job id")
+        return self.root_dir / f"{job_id}.json"
+
+    def _load_existing(self) -> None:
+        for path in self.root_dir.glob("*.json"):
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                status = dict(manifest.get("status") or {})
+                job_id = str(status.get("job_id") or path.stem)
+                if status.get("state") in {"queued", "loading_runtime", "running"}:
+                    status.update(
+                        state="interrupted",
+                        error="服务重启时任务仍未完成，请重新提交",
+                        closed=True,
+                        updated_at=time.time(),
+                    )
+                job = StreamingJob(
+                    job_id,
+                    status=status,
+                    result=manifest.get("result"),
+                    persist_callback=self._persist,
+                )
+                self._jobs[job_id] = job
+                job.persist()
+            except Exception:
+                logging.exception("failed to restore service job manifest: %s", path)
+
+    def _persist(self, job: StreamingJob) -> None:
+        path = self._manifest_path(job.job_id)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(job.manifest(), ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+
+    def create(self, *, summary: dict[str, Any] | None = None) -> StreamingJob:
+        job = StreamingJob(uuid.uuid4().hex, persist_callback=self._persist)
+        if summary:
+            job.update(**summary)
         with self._lock:
             self._jobs[job.job_id] = job
+        job.persist()
         return job
+
+    def list(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        snapshots = [job.snapshot() for job in jobs]
+        snapshots.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+        return snapshots[: max(1, int(limit))]
 
     def get(self, job_id: str) -> StreamingJob:
         with self._lock:
@@ -464,6 +740,7 @@ class StreamingJobManager:
                 job.audio_queue.put_nowait(None)
             except queue.Full:
                 pass
+        job.persist()
         return job
 
 
@@ -471,6 +748,14 @@ def create_app(
     *,
     model_dir: str,
     codec_dir: str,
+    lite_model_dir: str | Path = DEFAULT_LITE_MODEL_DIR,
+    lite_codec_dir: str | Path = DEFAULT_LITE_CODEC_DIR,
+    qwen_python: str | Path = DEFAULT_QWEN_PYTHON,
+    qwen_worker_script: str | Path = DEFAULT_QWEN_WORKER_SCRIPT,
+    qwen_0_6b_model_dir: str | Path = DEFAULT_QWEN_0_6B_MODEL_DIR,
+    qwen_1_7b_model_dir: str | Path = DEFAULT_QWEN_1_7B_MODEL_DIR,
+    qwen_0_6b_lanes: int = 1,
+    qwen_1_7b_lanes: int = 1,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     upload_dir: str | Path = DEFAULT_UPLOAD_DIR,
     device: str = "cuda",
@@ -483,10 +768,19 @@ def create_app(
     warmup: bool = True,
     preload: bool = True,
     max_parallel_generations: int = 2,
+    access_password: str = "",
 ) -> FastAPI:
     runtime_manager = RuntimeManager(
         model_dir=str(model_dir),
         codec_dir=str(codec_dir),
+        lite_model_dir=str(lite_model_dir),
+        lite_codec_dir=str(lite_codec_dir),
+        qwen_python=str(qwen_python),
+        qwen_worker_script=str(qwen_worker_script),
+        qwen_0_6b_model_dir=str(qwen_0_6b_model_dir),
+        qwen_1_7b_model_dir=str(qwen_1_7b_model_dir),
+        qwen_0_6b_lanes=max(1, int(qwen_0_6b_lanes)),
+        qwen_1_7b_lanes=max(1, int(qwen_1_7b_lanes)),
         device=device,
         tts_device=tts_device,
         codec_device=codec_device,
@@ -496,17 +790,23 @@ def create_app(
         codec_compute_dtype=codec_compute_dtype,
         warmup=warmup,
     )
-    jobs = StreamingJobManager()
+    jobs = StreamingJobManager(DEFAULT_SERVICE_JOB_DIR)
     output_dir = Path(output_dir)
     upload_dir = Path(upload_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     upload_dir.mkdir(parents=True, exist_ok=True)
     generation_scheduler = GpuGenerationScheduler(max_parallel=max_parallel_generations)
     ffmpeg_path = shutil.which("ffmpeg") or str(REPO_ROOT / ".ffmpeg-runtime" / "Library" / "bin" / "ffmpeg.exe")
+    def synthesize_for_profile_runtime(runtime: Any, request: StreamingRequest, *, output_dir: str | Path):
+        if isinstance(runtime, QwenWorkerRuntime):
+            yield from runtime.synthesize(request, output_dir=output_dir)
+            return
+        yield from synthesize_for_runtime(runtime, request, output_dir=output_dir)
+
     document_projects = DocumentProjectManager(
         root_dir=DEFAULT_DOCUMENT_PROJECT_DIR,
-        runtime_getter=runtime_manager.get,
-        synthesize_fn=synthesize_stream,
+        runtime_session=runtime_manager.session,
+        synthesize_fn=synthesize_for_profile_runtime,
         request_cls=StreamingRequest,
         generation_lock=generation_scheduler,
         ffmpeg_path=ffmpeg_path,
@@ -515,10 +815,66 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if preload:
-            runtime_manager.get()
-        yield
+            with runtime_manager.session(DEFAULT_MODEL_PROFILE):
+                pass
+        try:
+            yield
+        finally:
+            runtime_manager.close()
 
-    app = FastAPI(title="MOSS-TTS Local v1.5 Realtime Streaming", lifespan=lifespan)
+    app = FastAPI(title="MOSS + Qwen Local TTS Service", lifespan=lifespan)
+    resolved_access_password = str(access_password or "")
+    expected_session = hmac.new(
+        resolved_access_password.encode("utf-8"), b"moss-tts-service-session", hashlib.sha256
+    ).hexdigest()
+
+    @app.middleware("http")
+    async def require_service_login(request: Request, call_next):
+        if not resolved_access_password or request.url.path in {"/login", "/api/health"}:
+            return await call_next(request)
+        supplied = request.cookies.get(SERVICE_AUTH_COOKIE, "")
+        if hmac.compare_digest(supplied, expected_session):
+            return await call_next(request)
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "authentication required"}, status_code=401)
+        next_path = request.url.path if request.url.path.startswith("/") else "/"
+        return RedirectResponse(url=f"/login?next={next_path}", status_code=303)
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request):
+        if not resolved_access_password:
+            return RedirectResponse(url="/", status_code=303)
+        supplied = request.cookies.get(SERVICE_AUTH_COOKIE, "")
+        if hmac.compare_digest(supplied, expected_session):
+            return RedirectResponse(url="/", status_code=303)
+        next_path = request.query_params.get("next", "/")
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            next_path = "/"
+        return HTMLResponse(_login_html(next_path=next_path, error=""))
+
+    @app.post("/login", response_class=HTMLResponse)
+    async def login_submit(password: str = Form(""), next_path: str = Form("/")):
+        if not resolved_access_password:
+            return RedirectResponse(url="/", status_code=303)
+        if not hmac.compare_digest(str(password), resolved_access_password):
+            return HTMLResponse(_login_html(next_path=next_path, error="密码不正确"), status_code=401)
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            next_path = "/"
+        response = RedirectResponse(url=next_path, status_code=303)
+        response.set_cookie(
+            SERVICE_AUTH_COOKIE,
+            expected_session,
+            max_age=30 * 24 * 60 * 60,
+            httponly=True,
+            samesite="strict",
+        )
+        return response
+
+    @app.post("/logout")
+    async def logout() -> RedirectResponse:
+        response = RedirectResponse(url="/login", status_code=303)
+        response.delete_cookie(SERVICE_AUTH_COOKIE)
+        return response
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -538,29 +894,52 @@ def create_app(
         )
 
     def _put_stream_audio(job: StreamingJob, pcm_bytes: bytes) -> None:
-        while True:
-            with job.status_lock:
-                if job.is_closed:
-                    return
+        with job.status_lock:
+            if job.is_closed:
+                return
+        try:
+            job.audio_queue.put_nowait(pcm_bytes)
+        except queue.Full:
+            # Browser playback is best-effort. Never let a disconnected or
+            # slow client block the server-side generation task.
             try:
-                job.audio_queue.put(pcm_bytes, timeout=0.1)
+                job.audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                job.audio_queue.put_nowait(pcm_bytes)
+            except queue.Full:
+                pass
+
+    def _finish_stream_audio(job: StreamingJob) -> None:
+        while True:
+            try:
+                job.audio_queue.put_nowait(None)
                 return
             except queue.Full:
-                continue
+                try:
+                    job.audio_queue.get_nowait()
+                except queue.Empty:
+                    return
 
-    def _run_job(job: StreamingJob, request: StreamingRequest, mode_name: str, streaming_generation: bool) -> None:
+    def _run_job(
+        job: StreamingJob, request: StreamingRequest, mode_name: str,
+        streaming_generation: bool, model_profile: str,
+    ) -> None:
         try:
             job.update(
                 state="loading_runtime",
                 started_at=time.time(),
                 max_new_tokens=int(request.max_new_frames),
                 mode=mode_name,
+                model_profile=model_profile,
                 streaming_generation=streaming_generation,
             )
             with generation_scheduler.interactive_slot():
-                runtime = runtime_manager.get()
-                job.update(state="running", sample_rate=runtime.sample_rate, channels=2, n_vq=runtime.n_vq)
-                for event in synthesize_stream(runtime, request, output_dir=output_dir):
+              with runtime_manager.session(model_profile) as runtime:
+                channels = int(runtime_manager.profiles[model_profile]["channels"])
+                job.update(state="running", sample_rate=runtime.sample_rate, channels=channels, n_vq=runtime.n_vq)
+                for event in synthesize_for_profile_runtime(runtime, request, output_dir=output_dir):
                     with job.status_lock:
                         if job.is_closed:
                             break
@@ -575,7 +954,7 @@ def create_app(
                             if job.status.get("first_audio_at") is None:
                                 job.status["first_audio_at"] = time.time()
                         if streaming_generation:
-                            _put_stream_audio(job, _pcm16le_bytes(waveform))
+                            _put_stream_audio(job, _pcm16le_bytes(waveform, channels))
                         job.update(
                             generated_frames=event.data.get("generated_frames", job.snapshot().get("generated_frames", 0)),
                             emitted_audio_seconds=event.data.get("emitted_audio_seconds", 0.0),
@@ -597,28 +976,26 @@ def create_app(
                         )
                     elif event.type == "result":
                         metadata = dict(event.data["metadata"])
-                        job.result = {
+                        task_seed_status = job.snapshot()
+                        metadata["seed"] = int(request.seed) if request.seed is not None else None
+                        metadata["configured_seed"] = task_seed_status.get("configured_seed")
+                        metadata["seed_mode"] = task_seed_status.get("seed_mode")
+                        job.set_result({
                             "audio_path": event.data["audio_path"],
                             "tokens_path": event.data["tokens_path"],
                             "metadata_path": event.data["metadata_path"],
                             "metadata": metadata,
-                        }
+                        })
                         job.update(
                             state="finished",
                             generated_frames=metadata.get("generated_frames", 0),
                             emitted_audio_seconds=metadata.get("duration_seconds", 0.0),
                             audio_path=event.data["audio_path"],
                         )
-            try:
-                job.audio_queue.put_nowait(None)
-            except queue.Full:
-                pass
+            _finish_stream_audio(job)
         except Exception as exc:  # noqa: BLE001
             job.update(state="error", error=str(exc))
-            try:
-                job.audio_queue.put_nowait(None)
-            except queue.Full:
-                pass
+            _finish_stream_audio(job)
 
     @app.post("/api/generate-stream/start")
     async def generate_stream_start(
@@ -635,7 +1012,15 @@ def create_app(
         top_p: float = Form(0.8),
         top_k: int = Form(25),
         repetition_penalty: float = Form(1.0),
+        model_profile: str = Form(DEFAULT_MODEL_PROFILE),
+        voice_name: str = Form("本地克隆音色"),
         streaming_generation: int = Form(1),
+        qwen_clone_mode: str = Form("xvec"),
+        qwen_reference_text: str = Form(""),
+        qwen_non_streaming_mode: int = Form(0),
+        qwen_append_silence: int = Form(1),
+        qwen_instruct: str = Form(""),
+        qwen_min_new_tokens: int = Form(2),
         example_audio_path: str = Form(""),
         prompt_audio: UploadFile | None = File(None),
     ) -> JSONResponse:
@@ -671,6 +1056,16 @@ def create_app(
         )
         codec_chunk_frames = _safe_int(codec_chunk_frames, default=16, minimum=0, maximum=32)
         streaming_generation_enabled = bool(_safe_int(streaming_generation, default=1, minimum=0, maximum=1))
+        if model_profile not in runtime_manager.profiles:
+            raise HTTPException(status_code=400, detail="invalid model profile")
+        if runtime_manager.profiles[model_profile].get("backend") == "qwen":
+            max_new_tokens = _safe_int(max_new_tokens, default=2048, minimum=2, maximum=2048)
+            codec_chunk_frames = _safe_int(codec_chunk_frames, default=8, minimum=1, maximum=24)
+        configured_seed = _safe_int(seed, default=1234, minimum=-1, maximum=999999)
+        seed_mode = "random" if configured_seed < 0 else "fixed"
+        resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
+        if not runtime_manager.profiles[model_profile]["streaming"]:
+            streaming_generation_enabled = False
         request = StreamingRequest(
             text=text,
             mode="voice_clone",
@@ -685,11 +1080,39 @@ def create_app(
             top_p=_safe_float(top_p, default=0.8, minimum=0.1, maximum=1.0),
             top_k=_safe_int(top_k, default=25, minimum=1, maximum=200),
             repetition_penalty=_safe_float(repetition_penalty, default=1.0, minimum=0.8, maximum=2.0),
-            seed=None if int(seed) < 0 else int(seed),
+            seed=None if resolved_seed < 0 else resolved_seed,
             codec_chunk_frames=codec_chunk_frames,
+            qwen_xvec_only=str(qwen_clone_mode or "xvec") != "icl",
+            qwen_reference_text=str(qwen_reference_text or "").strip(),
+            qwen_non_streaming_mode=bool(
+                _safe_int(qwen_non_streaming_mode, default=0, minimum=0, maximum=1)
+            ),
+            qwen_append_silence=bool(
+                _safe_int(qwen_append_silence, default=1, minimum=0, maximum=1)
+            ),
+            qwen_instruct=str(qwen_instruct or "").strip()[:500],
+            qwen_min_new_tokens=_safe_int(
+                qwen_min_new_tokens, default=2, minimum=2, maximum=256
+            ),
         )
-        job = jobs.create()
-        thread = threading.Thread(target=_run_job, args=(job, request, mode_name, streaming_generation_enabled), daemon=True)
+        job = jobs.create(
+            summary={
+                "task_type": "text_generation",
+                "title": text[:80],
+                "text_preview": text[:240],
+                "model_profile": model_profile,
+                "model_label": MODEL_PROFILE_LABELS[model_profile],
+                "voice_name": str(voice_name or "本地克隆音色")[:120],
+                "seed": resolved_seed,
+                "configured_seed": configured_seed,
+                "seed_mode": seed_mode,
+            }
+        )
+        thread = threading.Thread(
+            target=_run_job,
+            args=(job, request, mode_name, streaming_generation_enabled, model_profile),
+            daemon=True,
+        )
         job.thread = thread
         thread.start()
         return JSONResponse(
@@ -698,8 +1121,13 @@ def create_app(
                 "audio_url": f"/api/generate-stream/{job.job_id}/audio",
                 "status_url": f"/api/generate-stream/{job.job_id}/status",
                 "result_url": f"/api/generate-stream/{job.job_id}/result",
-                "sample_rate": runtime_manager.status().get("sample_rate") or 48000,
-                "channels": 2,
+                "sample_rate": runtime_manager.profiles[model_profile]["sample_rate"],
+                "channels": runtime_manager.profiles[model_profile]["channels"],
+                "model_profile": model_profile,
+                "streaming_generation": streaming_generation_enabled,
+                "seed": resolved_seed,
+                "configured_seed": configured_seed,
+                "seed_mode": seed_mode,
             }
         )
 
@@ -787,6 +1215,74 @@ def create_app(
     async def health() -> JSONResponse:
         return JSONResponse({**runtime_manager.status(), "generation_scheduler": generation_scheduler.status()})
 
+    @app.get("/api/service/tasks")
+    async def service_tasks() -> JSONResponse:
+        tasks: list[dict[str, Any]] = []
+        for item in jobs.list(limit=100):
+            state = str(item.get("state") or "unknown")
+            tasks.append(
+                {
+                    "type": "text",
+                    "id": item["job_id"],
+                    "title": item.get("title") or item.get("text_preview") or "文本生成",
+                    "state": state,
+                    "active": state in {"queued", "loading_runtime", "running"},
+                    "created_at": item.get("created_at"),
+                    "updated_at": item.get("updated_at"),
+                    "model_profile": item.get("model_profile") or DEFAULT_MODEL_PROFILE,
+                    "model_label": item.get("model_label") or MODEL_PROFILE_LABELS.get(
+                        str(item.get("model_profile") or DEFAULT_MODEL_PROFILE), ""
+                    ),
+                    "voice_name": item.get("voice_name") or "",
+                    "seed": item.get("seed"),
+                    "configured_seed": item.get("configured_seed"),
+                    "seed_mode": item.get("seed_mode"),
+                    "generated_frames": item.get("generated_frames", 0),
+                    "max_new_tokens": item.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS),
+                    "duration_seconds": item.get("emitted_audio_seconds", 0.0),
+                    "result_ready": bool(item.get("result_ready")),
+                    "error": item.get("error"),
+                }
+            )
+        for project in document_projects.list_projects():
+            state = str(project.get("state") or "unknown")
+            stats = project.get("stats") or {}
+            tasks.append(
+                {
+                    "type": "document",
+                    "id": project["id"],
+                    "title": project.get("name") or "文档项目",
+                    "state": state,
+                    "active": state in {"running", "stopping"},
+                    "created_at": project.get("created_at"),
+                    "updated_at": project.get("updated_at"),
+                    "model_profile": (project.get("settings") or {}).get("model_profile", DEFAULT_MODEL_PROFILE),
+                    "model_label": (project.get("settings") or {}).get("model_label") or MODEL_PROFILE_LABELS[
+                        (project.get("settings") or {}).get("model_profile", DEFAULT_MODEL_PROFILE)
+                    ],
+                    "voice_name": (project.get("settings") or {}).get("voice_name", ""),
+                    "seed": (project.get("settings") or {}).get("seed"),
+                    "configured_seed": (project.get("settings") or {}).get("configured_seed"),
+                    "seed_mode": (project.get("settings") or {}).get("seed_mode"),
+                    "completed_segments": stats.get("completed_segments", 0),
+                    "total_segments": stats.get("total_segments", 0),
+                    "progress": stats.get("progress", 0.0),
+                    "eta_seconds": stats.get("eta_seconds"),
+                    "error": project.get("message") if state == "error" else None,
+                }
+            )
+        tasks.sort(
+            key=lambda item: (bool(item.get("active")), float(item.get("updated_at") or 0)),
+            reverse=True,
+        )
+        return JSONResponse(
+            {
+                "tasks": tasks[:100],
+                "active_count": sum(1 for item in tasks if item.get("active")),
+                "server_time": time.time(),
+            }
+        )
+
     def document_settings(raw: str) -> dict[str, Any]:
         try:
             incoming = json.loads(raw or "{}")
@@ -800,7 +1296,20 @@ def create_app(
                 raise ValueError
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="invalid clone reference audio") from exc
+        model_profile = str(incoming.get("model_profile") or DEFAULT_MODEL_PROFILE)
+        if model_profile not in runtime_manager.profiles:
+            raise HTTPException(status_code=400, detail="invalid model profile")
+        qwen_profile = runtime_manager.profiles[model_profile].get("backend") == "qwen"
+        qwen_clone_mode = "icl" if str(incoming.get("qwen_clone_mode") or "xvec") == "icl" else "xvec"
+        qwen_reference_text = str(incoming.get("qwen_reference_text") or "").strip()
+        if qwen_profile and qwen_clone_mode == "icl" and not qwen_reference_text:
+            raise HTTPException(status_code=400, detail="Qwen ICL克隆模式必须填写参考音频文字")
+        configured_seed = _safe_int(incoming.get("seed"), default=1234, minimum=-1, maximum=999999)
+        seed_mode = "random" if configured_seed < 0 else "fixed"
+        resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
         return {
+            "model_profile": model_profile,
+            "model_label": MODEL_PROFILE_LABELS[model_profile],
             "reference_audio_path": str(reference_candidate),
             "voice_name": str(incoming.get("voice_name") or "本地克隆音色")[:120],
             "language": "Chinese",
@@ -811,10 +1320,28 @@ def create_app(
                 incoming.get("repetition_penalty"), default=1.0, minimum=0.8, maximum=2.0
             ),
             "max_new_tokens": _safe_int(
-                incoming.get("max_new_tokens"), default=DEFAULT_MAX_NEW_TOKENS, minimum=80, maximum=DEFAULT_MAX_NEW_TOKENS
+                incoming.get("max_new_tokens"),
+                default=2048 if qwen_profile else DEFAULT_MAX_NEW_TOKENS,
+                minimum=24 if qwen_profile else 80,
+                maximum=2048 if qwen_profile else DEFAULT_MAX_NEW_TOKENS,
             ),
-            "codec_chunk_frames": _safe_int(incoming.get("codec_chunk_frames"), default=16, minimum=1, maximum=32),
-            "seed": _safe_int(incoming.get("seed"), default=1234, minimum=-1, maximum=999999),
+            "codec_chunk_frames": _safe_int(
+                incoming.get("codec_chunk_frames"),
+                default=8 if qwen_profile else 16,
+                minimum=1,
+                maximum=24 if qwen_profile else 32,
+            ),
+            "seed": resolved_seed,
+            "configured_seed": configured_seed,
+            "seed_mode": seed_mode,
+            "qwen_clone_mode": qwen_clone_mode,
+            "qwen_reference_text": qwen_reference_text,
+            "qwen_non_streaming_mode": bool(incoming.get("qwen_non_streaming_mode", False)),
+            "qwen_append_silence": bool(incoming.get("qwen_append_silence", True)),
+            "qwen_instruct": str(incoming.get("qwen_instruct") or "").strip()[:500],
+            "qwen_min_new_tokens": _safe_int(
+                incoming.get("qwen_min_new_tokens"), default=2, minimum=2, maximum=256
+            ),
             "aac_bitrate": "192k",
             "sample_rate": 48000,
             "channels": 2,
@@ -864,9 +1391,11 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/document-projects/{project_id}/start")
-    async def start_document_project(project_id: str, settings_json: str = Form("{}")) -> JSONResponse:
+    async def start_document_project(project_id: str) -> JSONResponse:
         try:
-            return JSONResponse(document_projects.start(project_id, settings=document_settings(settings_json)))
+            # A project is immutable with respect to voice/model parameters.
+            # Resume always uses its saved settings, never the page's current controls.
+            return JSONResponse(document_projects.start(project_id, settings=None))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
         except (RuntimeError, ValueError) as exc:
@@ -914,6 +1443,26 @@ def create_app(
         return FileResponse(str(media_path), media_type=media_type, filename=media_path.name)
 
     return app
+
+
+def _login_html(*, next_path: str, error: str) -> str:
+    safe_next = html_lib.escape(next_path, quote=True)
+    safe_error = html_lib.escape(error)
+    error_block = f'<div class="error">{safe_error}</div>' if safe_error else ""
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MOSS-TTS 服务登录</title><style>
+body{{margin:0;background:#f3f4f6;font-family:Inter,"Microsoft YaHei",sans-serif;color:#171717;display:grid;place-items:center;min-height:100vh}}
+.card{{width:min(420px,calc(100vw - 40px));background:#fff;border:1px solid #ddd;border-radius:12px;padding:28px;box-shadow:0 12px 35px #00000012}}
+h1{{font-size:22px;margin:0 0 8px}}p{{color:#666;margin:0 0 22px}}label{{display:block;font-weight:700;margin-bottom:8px}}
+input{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #bbb;border-radius:7px;font-size:16px}}
+button{{width:100%;margin-top:16px;padding:11px;border:0;border-radius:7px;background:#166534;color:#fff;font-weight:700;font-size:15px;cursor:pointer}}
+.error{{color:#b91c1c;background:#fef2f2;padding:9px;border-radius:6px;margin-bottom:14px}}
+</style></head><body><form class="card" method="post" action="/login">
+<h1>MOSS-TTS 服务登录</h1><p>输入服务密码后可查看和管理所有生成任务。</p>{error_block}
+<input type="hidden" name="next_path" value="{safe_next}"><label for="password">服务密码</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+<button type="submit">登录</button></form></body></html>"""
 
 
 def _html(*, defaults: dict[str, Any], examples: list[dict[str, str]], voices: list[dict[str, str]], languages: list[str], runtime: dict[str, Any]) -> str:
@@ -966,6 +1515,22 @@ INDEX_HTML = r"""
     }
     .app-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; letter-spacing: 0.2px; }
     .app-subtitle { color: var(--muted); font-size: 14px; }
+    .app-header-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .model-profile-row { display: grid; grid-template-columns: 150px minmax(260px, 420px); gap: 10px; align-items: center; margin-top: 12px; }
+    .model-profile-row select { min-width: 0; }
+    .logout-button { padding: 7px 11px; background: #f3f4f6; color: var(--muted); font-size: 12px; }
+    .service-task-center { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+    .service-task-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 9px; }
+    .service-task-title { font-weight: 700; font-size: 15px; }
+    .service-task-list { max-height: 230px; overflow-y: auto; border: 1px solid var(--line); border-radius: 5px; }
+    .service-task-item { display: grid; grid-template-columns: 86px minmax(180px,1fr) 180px 160px 72px; gap: 10px; align-items: center; padding: 9px 10px; border-bottom: 1px solid #eef0f3; }
+    .service-task-item:last-child { border-bottom: 0; }
+    .service-task-item.active { background: #ecfdf5; }
+    .service-task-kind { color: var(--muted); font-size: 12px; }
+    .service-task-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
+    .service-task-meta { color: var(--muted); font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .service-task-open { padding: 6px 9px; background: #e5e7eb; color: var(--ink); font-size: 12px; }
+    .service-task-empty { color: var(--muted); padding: 18px; text-align: center; }
     .layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(360px, 2fr); gap: 16px; align-items: start; }
     .stack { display: flex; flex-direction: column; gap: 16px; }
     .panel {
@@ -1051,6 +1616,50 @@ INDEX_HTML = r"""
     .accordion-body { padding: 12px; display: grid; gap: 14px; }
     .control-row { display: grid; grid-template-columns: 1fr 92px; gap: 12px; align-items: center; }
     .control-row input[type="range"] { width: 100%; accent-color: var(--orange); }
+    .field-block {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fafafa;
+    }
+    .field-block > label { margin: 0; color: var(--ink); font-weight: 700; }
+    .field-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .field-heading > label { margin: 0; color: var(--ink); font-weight: 700; }
+    .icl-status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #ecfdf5;
+      color: #047857;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .icl-status.needs-text { background: #fff7ed; color: #c2410c; }
+    .icl-transcript { min-height: 92px; line-height: 1.65; }
+    .field-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .field-footer .hint { margin: 0; }
+    .text-button { padding: 6px 9px; background: #eef2f7; color: var(--muted); font-size: 12px; }
+    .qwen-toggle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .toggle-card {
+      display: flex;
+      align-items: flex-start;
+      gap: 9px;
+      min-height: 48px;
+      margin: 0;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fafafa;
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .toggle-card input { flex: 0 0 auto; margin-top: 3px; accent-color: var(--accent); }
+    .compact-field-row { display: grid; grid-template-columns: minmax(0, 1fr) 160px; gap: 12px; align-items: center; }
+    .compact-field-row label { margin: 0; }
     .range-label { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
     .range-minmax { display: flex; justify-content: space-between; color: #9ca3af; font-size: 11px; margin-top: 2px; }
     .button-row { display: grid; grid-template-columns: 1fr 150px 120px; gap: 10px; }
@@ -1094,6 +1703,7 @@ INDEX_HTML = r"""
     .clone-voice-info { min-width: 0; flex: 1; }
     .clone-voice-name { color: var(--ink); font-weight: 700; }
     .clone-voice-description { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .clone-voice-meta { color: #047857; font-size: 11px; margin-top: 3px; }
     .clone-voice-controls { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
     .clone-voice-action { padding: 7px 10px; background: #fff; color: var(--muted); border: 1px solid var(--line); font-size: 12px; }
     .clone-voice-action:hover { background: #f3f4f6; color: var(--ink); }
@@ -1143,14 +1753,45 @@ INDEX_HTML = r"""
       .button-row { grid-template-columns: 1fr; }
       .document-toolbar, .document-body { grid-template-columns: 1fr; }
       .document-inline { grid-template-columns: 1fr; }
+      .service-task-item { grid-template-columns: 72px minmax(0,1fr) 72px; }
+      .service-task-item .service-task-meta:nth-of-type(n+2) { display: none; }
+    }
+    @media (max-width: 640px) {
+      .model-profile-row { grid-template-columns: 1fr; }
+      .control-row, .compact-field-row, .qwen-toggle-grid { grid-template-columns: 1fr; }
+      .control-row { gap: 7px; }
+      .control-row > input[type="number"] { max-width: none; }
+      .field-footer { align-items: stretch; }
+      .field-footer .text-button { width: 100%; }
     }
   </style>
 </head>
 <body>
   <div class="page">
     <div class="app-card">
-      <div class="app-title">MOSS-TTS Local v1.5 Realtime Streaming</div>
-      <div class="app-subtitle">固定使用中文语音克隆模式，支持本地音色选择、参考音频上传与实时流式播放</div>
+      <div class="app-header-row"><div><div class="app-title">MOSS + Qwen 本地语音生成</div>
+      <div class="app-subtitle">后台服务持续执行任务；关闭页面后可从其他设备登录并查看进度</div></div>
+      <form method="post" action="/logout"><button class="logout-button" type="submit">退出登录</button></form></div>
+      <div class="model-profile-row">
+        <label for="model-profile" style="margin:0;font-weight:700;">生成模型</label>
+        <select id="model-profile">
+          <optgroup label="Qwen3-TTS / Faster CUDA Graph">
+            <option value="qwen_0_6b" selected>Qwen3-TTS 0.6B（极速克隆）</option>
+            <option value="qwen_1_7b">Qwen3-TTS 1.7B（高质量克隆）</option>
+          </optgroup>
+          <optgroup label="MOSS-TTS">
+            <option value="quality_4b">MOSS 高质量 4B（v1.5）</option>
+            <option value="light_1_7b">MOSS 轻量 1.7B（v1.0）</option>
+          </optgroup>
+        </select>
+      </div>
+      <div id="model-profile-hint" class="hint" style="margin-top:6px;">Qwen 0.6B：CUDA Graph极速音色克隆。新建文件项目会锁定当前模型和参数。</div>
+    </div>
+
+    <div class="service-task-center">
+      <div class="service-task-header"><div><span class="service-task-title">服务任务中心</span> <span id="service-active-count" class="hint">正在连接…</span></div>
+      <button id="service-task-refresh" class="secondary small-button" type="button">刷新</button></div>
+      <div id="service-task-list" class="service-task-list"><div class="service-task-empty">正在读取后台任务…</div></div>
     </div>
 
     <div class="workspace-tabs" role="tablist" aria-label="工作模式">
@@ -1204,17 +1845,17 @@ INDEX_HTML = r"""
         <div id="mode-hint" class="hidden"></div>
         <div id="reference-transcript-panel" class="hidden"><textarea id="prompt-text"></textarea></div>
 
-        <div class="panel">
+        <div id="moss-duration-panel" class="panel hidden">
           <label><input id="tokens-control" type="checkbox"> Enable Duration Control (Expected Audio Tokens)</label>
           <div id="tokens-wrap" class="hidden" style="margin-top: 10px;">
             <label for="tokens">expected_tokens</label>
             <input id="tokens" type="number" min="1" step="1" value="1">
           </div>
         </div>
-        <div id="duration-hint" class="hint">Duration control is disabled.</div>
+        <div id="duration-hint" class="hint hidden">Duration control is disabled.</div>
 
-        <details class="accordion" open>
-          <summary>Sampling Parameters (Audio)</summary>
+        <details id="moss-params-panel" class="accordion hidden" open>
+          <summary>MOSS Sampling Parameters</summary>
           <div class="accordion-body">
             <div class="control-row" data-pair="temperature">
               <div>
@@ -1266,7 +1907,7 @@ INDEX_HTML = r"""
             </div>
             <div class="control-row">
               <label for="initial-playback-delay">流式播放最小预缓冲（秒，自动调整）</label>
-              <input id="initial-playback-delay" type="number" min="0.3" max="12" step="0.1" value="1.5">
+              <input id="initial-playback-delay" type="number" min="0.3" max="60" step="0.1" value="1.5">
             </div>
             <div class="control-row" data-pair="seed">
               <div>
@@ -1277,6 +1918,108 @@ INDEX_HTML = r"""
               <input id="seed" type="number" min="-1" step="1" value="__DEFAULT_SEED__">
             </div>
             <label style="margin-top: 14px;"><input id="streaming-generation" type="checkbox" checked> Enable Streaming Generation</label>
+          </div>
+        </details>
+
+        <details id="qwen-params-panel" class="accordion" open>
+          <summary>Qwen Sampling Parameters</summary>
+          <div class="accordion-body">
+            <div class="field-block">
+              <label for="qwen-clone-mode">克隆方式</label>
+              <select id="qwen-clone-mode">
+                <option value="xvec" selected>X-vector（无需参考文字，速度与跨语言稳定）</option>
+                <option value="icl">ICL（相似度更高，需要准确参考文字）</option>
+              </select>
+              <div class="hint">ICL 会使用所选音色的预置台词；上传或录制自定义音频时需要手动填写。</div>
+            </div>
+            <div id="qwen-reference-text-wrap" class="field-block hidden">
+              <div class="field-heading">
+                <label for="qwen-reference-text">参考音频准确文字</label>
+                <span id="qwen-transcript-status" class="icl-status needs-text">需要填写</span>
+              </div>
+              <textarea id="qwen-reference-text" class="icl-transcript" placeholder="必须与参考音频逐字对应"></textarea>
+              <div class="field-footer">
+                <span id="qwen-transcript-hint" class="hint">选择本地音色后会自动填入预置台词。</span>
+                <button id="qwen-transcript-reset" class="text-button" type="button">恢复预置台词</button>
+              </div>
+            </div>
+            <div class="field-block">
+              <label for="qwen-instruct">风格指令（可选）</label>
+              <input id="qwen-instruct" type="text" maxlength="500" placeholder="例如：自然、沉稳地朗读">
+            </div>
+            <div class="control-row" data-pair="qwen-temperature">
+              <div>
+                <div class="range-label">temperature</div>
+                <input id="qwen-temperature-range" type="range" min="0.1" max="2" step="0.05" value="0.9">
+                <div class="range-minmax"><span>0.1</span><span>2</span></div>
+              </div>
+              <input id="qwen-temperature" type="number" min="0.1" max="2" step="0.05" value="0.9">
+            </div>
+            <div class="control-row" data-pair="qwen-top-p">
+              <div>
+                <div class="range-label">top_p</div>
+                <input id="qwen-top-p-range" type="range" min="0.1" max="1" step="0.01" value="1">
+                <div class="range-minmax"><span>0.1</span><span>1</span></div>
+              </div>
+              <input id="qwen-top-p" type="number" min="0.1" max="1" step="0.01" value="1">
+            </div>
+            <div class="control-row" data-pair="qwen-top-k">
+              <div>
+                <div class="range-label">top_k</div>
+                <input id="qwen-top-k-range" type="range" min="1" max="200" step="1" value="50">
+                <div class="range-minmax"><span>1</span><span>200</span></div>
+              </div>
+              <input id="qwen-top-k" type="number" min="1" max="200" step="1" value="50">
+            </div>
+            <div class="control-row" data-pair="qwen-repetition-penalty">
+              <div>
+                <div class="range-label">repetition_penalty</div>
+                <input id="qwen-repetition-penalty-range" type="range" min="0.8" max="2" step="0.01" value="1.05">
+                <div class="range-minmax"><span>0.8</span><span>2</span></div>
+              </div>
+              <input id="qwen-repetition-penalty" type="number" min="0.8" max="2" step="0.01" value="1.05">
+            </div>
+            <div class="control-row" data-pair="qwen-max-new-tokens">
+              <div>
+                <div class="range-label">max_new_tokens</div>
+                <input id="qwen-max-new-tokens-range" type="range" min="24" max="2048" step="1" value="2048">
+                <div class="range-minmax"><span>24</span><span>2048</span></div>
+              </div>
+              <input id="qwen-max-new-tokens" type="number" min="24" max="2048" step="1" value="2048">
+            </div>
+            <div class="control-row" data-pair="qwen-chunk-size">
+              <div>
+                <div class="range-label">流式块大小（帧）</div>
+                <input id="qwen-chunk-size-range" type="range" min="1" max="24" step="1" value="8">
+                <div class="range-minmax"><span>1</span><span>24</span></div>
+              </div>
+              <input id="qwen-chunk-size" type="number" min="1" max="24" step="1" value="8">
+            </div>
+            <div class="control-row" data-pair="qwen-min-new-tokens">
+              <div>
+                <div class="range-label">min_new_tokens</div>
+                <input id="qwen-min-new-tokens-range" type="range" min="2" max="256" step="1" value="2">
+                <div class="range-minmax"><span>2</span><span>256</span></div>
+              </div>
+              <input id="qwen-min-new-tokens" type="number" min="2" max="256" step="1" value="2">
+            </div>
+            <div class="control-row" data-pair="qwen-seed">
+              <div>
+                <div class="range-label">seed (-1=random)</div>
+                <input id="qwen-seed-range" type="range" min="-1" max="999999" step="1" value="1234">
+                <div class="range-minmax"><span>-1</span><span>999999</span></div>
+              </div>
+              <input id="qwen-seed" type="number" min="-1" max="999999" step="1" value="1234">
+            </div>
+            <div class="qwen-toggle-grid">
+              <label class="toggle-card"><input id="qwen-non-streaming-mode" type="checkbox"> <span>一次性输入完整文本（音频仍可流式输出）</span></label>
+              <label class="toggle-card"><input id="qwen-append-silence" type="checkbox" checked> <span>参考音频尾部自动补静音，降低首音节污染</span></label>
+            </div>
+            <div class="compact-field-row">
+              <label for="qwen-initial-playback-delay">流式播放最小预缓冲（秒，自动调整）</label>
+              <input id="qwen-initial-playback-delay" type="number" min="0.1" max="20" step="0.1" value="0.8">
+            </div>
+            <label class="toggle-card"><input id="qwen-streaming-generation" type="checkbox" checked> <span>启用流式生成与边生成边试听</span></label>
           </div>
         </details>
 
@@ -1367,17 +2110,24 @@ const INITIAL_RUNTIME = __RUNTIME_JSON__;
 const DEFAULT_TEXT = __DEFAULT_TEXT__;
 const CONTINUATION_NOTICE = "Continuation mode is active. Fill Reference Audio Transcript with the transcript of the reference audio.";
 const HIDDEN_CLONE_VOICES_STORAGE_KEY = "moss-tts-hidden-clone-voices-v1";
+const ICL_TRANSCRIPT_OVERRIDES_STORAGE_KEY = "moss-tts-icl-transcript-overrides-v1";
 const UI_STATE_STORAGE_KEY = "moss-tts-ui-state-v1";
-const UI_OPTIMIZATION_DEFAULTS_VERSION = 3;
+const UI_OPTIMIZATION_DEFAULTS_VERSION = 4;
 const PERSISTED_VALUE_FIELDS = [
+  "model-profile",
   "temperature", "top-p", "top-k", "repetition-penalty", "max-new-tokens",
   "codec-chunk-frames", "seed", "initial-playback-delay", "tokens",
+  "qwen-clone-mode", "qwen-reference-text", "qwen-instruct",
+  "qwen-temperature", "qwen-top-p", "qwen-top-k", "qwen-repetition-penalty",
+  "qwen-max-new-tokens", "qwen-chunk-size", "qwen-min-new-tokens",
+  "qwen-seed", "qwen-initial-playback-delay",
   "document-max-chars", "document-project-name"
 ];
 
 let activeWorkspaceTab = "text";
 let activeCloneVoiceTab = "favorites";
 let hiddenCloneVoicePaths = new Set();
+let iclTranscriptOverrides = {};
 let uiStateReady = false;
 try {
   const savedHiddenVoices = JSON.parse(localStorage.getItem(HIDDEN_CLONE_VOICES_STORAGE_KEY) || "[]");
@@ -1386,8 +2136,22 @@ try {
 } catch (err) {
   hiddenCloneVoicePaths = new Set();
 }
+try {
+  const savedOverrides = JSON.parse(localStorage.getItem(ICL_TRANSCRIPT_OVERRIDES_STORAGE_KEY) || "{}");
+  const availablePaths = new Set(CLONE_VOICES.map((voice) => voice.audio_path));
+  if (savedOverrides && typeof savedOverrides === "object") {
+    iclTranscriptOverrides = Object.fromEntries(
+      Object.entries(savedOverrides).filter(
+        ([path, text]) => availablePaths.has(path) && typeof text === "string"
+      )
+    );
+  }
+} catch (err) {
+  iclTranscriptOverrides = {};
+}
 
 let currentJob = null;
+let currentJobOwned = false;
 let audioContext = null;
 let nextPlaybackTime = 0;
 let statusTimer = null;
@@ -1401,7 +2165,7 @@ let currentInitialPlaybackDelaySeconds = 1.5;
 let adaptiveRealtimeBufferTargetSeconds = 1.5;
 let estimatedRealtimeAudioSeconds = 0;
 let latestRealtimeGenerationRate = 0;
-const MAX_ADAPTIVE_PLAYBACK_BUFFER_SECONDS = 12;
+const MAX_ADAPTIVE_PLAYBACK_BUFFER_SECONDS = 60;
 const ADAPTIVE_PLAYBACK_BUFFER_SAFETY_SECONDS = 0.75;
 let pendingRealtimePcmChunks = [];
 let pendingRealtimePcmSeconds = 0;
@@ -1420,6 +2184,7 @@ let referenceRecordingStartedAt = 0;
 let referenceRecordingTimer = null;
 let currentDocumentProject = null;
 let documentProjectPollTimer = null;
+let serviceTasksPollTimer = null;
 let documentPlaybackIndex = null;
 let documentPlaybackActive = false;
 let lastPlaybackSaveAt = 0;
@@ -1455,6 +2220,15 @@ function setStatus(obj) {
     const pct = Math.min(100, 100 * Number(obj.generated_frames || 0) / Number(obj.max_new_tokens || 1));
     field("bar").style.width = pct.toFixed(1) + "%";
   }
+}
+function formatSeed(value, seedMode = "") {
+  if (value === null || value === undefined || value === "") {
+    return seedMode === "random" ? "等待生成" : "—";
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  if (numeric < 0) return seedMode === "random" ? "等待生成" : "旧任务未记录";
+  return `${Math.trunc(numeric)}${seedMode === "random" ? "（随机）" : ""}`;
 }
 function fetchJson(url, options) {
   return fetch(url, options).then(async (response) => {
@@ -1560,6 +2334,7 @@ function setReferenceSourceMode(mode) {
     field("example-audio-path").value = "";
     field("clone-voice").value = "";
     syncCloneVoiceListSelection();
+    clearIclTranscriptForCustomReference();
   }
   updateReferencePreview();
   updateReferenceLabel();
@@ -1650,6 +2425,7 @@ async function startReferenceRecording() {
   field("example-audio-path").value = "";
   field("clone-voice").value = "";
   syncCloneVoiceListSelection();
+  clearIclTranscriptForCustomReference();
   recordedReferenceFile = null;
   clearReferencePreview();
   referenceRecordingChunks = [];
@@ -1724,6 +2500,131 @@ function clearReferenceAudio() {
   const fallbackVoice = visibleVoices.find((voice) => voice.name === "龙嫱") || visibleVoices[0];
   if (fallbackVoice) selectCloneVoice(fallbackVoice.audio_path, false);
 }
+function serviceTaskStateLabel(state) {
+  return ({queued:"排队", loading_runtime:"加载模型", running:"执行中", stopping:"停止中", paused:"已暂停", ready:"就绪", completed:"已完成", finished:"已完成", error:"错误", interrupted:"已中断", closed:"已停止"})[state] || state || "未知";
+}
+function renderServiceTasks(data) {
+  const list = field("service-task-list");
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  field("service-active-count").textContent = `运行中 ${Number(data.active_count || 0)} · 最近 ${tasks.length}`;
+  list.innerHTML = "";
+  if (!tasks.length) {
+    list.innerHTML = '<div class="service-task-empty">暂时没有后台任务</div>';
+    return;
+  }
+  for (const task of tasks) {
+    const row = document.createElement("div");
+    row.className = "service-task-item" + (task.active ? " active" : "");
+    const kind = document.createElement("div");
+    kind.className = "service-task-kind";
+    kind.textContent = task.type === "document" ? "文件项目" : "文本生成";
+    const name = document.createElement("div");
+    name.className = "service-task-name";
+    name.textContent = task.title || "未命名任务";
+    name.title = name.textContent;
+    const state = document.createElement("div");
+    state.className = "service-task-meta";
+    if (task.type === "document") {
+      state.textContent = `${serviceTaskStateLabel(task.state)} · ${task.completed_segments || 0}/${task.total_segments || 0} 段`;
+    } else {
+      state.textContent = `${serviceTaskStateLabel(task.state)} · ${task.generated_frames || 0}/${task.max_new_tokens || 0} 帧`;
+    }
+    const profile = document.createElement("div");
+    profile.className = "service-task-meta";
+    profile.textContent = `${task.model_label || ""}${task.voice_name ? " · " + task.voice_name : ""} · Seed ${formatSeed(task.seed, task.seed_mode)}`;
+    profile.title = profile.textContent;
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "service-task-open";
+    open.textContent = "查看";
+    open.onclick = () => openServiceTask(task);
+    row.append(kind, name, state, profile, open);
+    list.appendChild(row);
+  }
+}
+async function pollServiceTasks() {
+  try {
+    renderServiceTasks(await fetchJson(apiUrl("api/service/tasks")));
+  } catch (err) {
+    field("service-active-count").textContent = "连接失败";
+  }
+}
+async function openServiceTask(task) {
+  if (task.type === "document") {
+    setWorkspaceTab("document");
+    localStorage.setItem(DOCUMENT_PROJECT_SELECTION_KEY, task.id);
+    await loadDocumentProjects(task.id);
+    return;
+  }
+  setWorkspaceTab("text");
+  currentJob = task.id;
+  currentJobOwned = false;
+  currentStreamingGenerationEnabled = false;
+  if (statusTimer) clearInterval(statusTimer);
+  statusTimer = setInterval(() => pollStatus(currentJob), 500);
+  await pollStatus(currentJob);
+  const status = await fetchJson(apiUrl(`api/generate-stream/${task.id}/status`));
+  setGenerationActive(["queued", "loading_runtime", "running"].includes(status.state));
+}
+function selectedModelProfile() {
+  const value = field("model-profile").value;
+  return ["quality_4b", "light_1_7b", "qwen_0_6b", "qwen_1_7b"].includes(value)
+    ? value
+    : "qwen_0_6b";
+}
+function isQwenProfile(profile = selectedModelProfile()) {
+  return String(profile).startsWith("qwen_");
+}
+function activeGenerationParameters() {
+  if (isQwenProfile()) {
+    return {
+      temperature: field("qwen-temperature").value,
+      topP: field("qwen-top-p").value,
+      topK: field("qwen-top-k").value,
+      repetitionPenalty: field("qwen-repetition-penalty").value,
+      maxNewTokens: field("qwen-max-new-tokens").value,
+      chunkFrames: field("qwen-chunk-size").value,
+      seed: field("qwen-seed").value,
+      initialPlaybackDelay: field("qwen-initial-playback-delay").value,
+      streaming: field("qwen-streaming-generation").checked,
+    };
+  }
+  return {
+    temperature: field("temperature").value,
+    topP: field("top-p").value,
+    topK: field("top-k").value,
+    repetitionPenalty: field("repetition-penalty").value,
+    maxNewTokens: field("max-new-tokens").value,
+    chunkFrames: field("codec-chunk-frames").value,
+    seed: field("seed").value,
+    initialPlaybackDelay: field("initial-playback-delay").value,
+    streaming: field("streaming-generation").checked,
+  };
+}
+function applyModelProfileCapabilities(persist = true) {
+  const profile = selectedModelProfile();
+  const qwen = isQwenProfile(profile);
+  field("moss-params-panel").classList.toggle("hidden", qwen);
+  field("moss-duration-panel").classList.toggle("hidden", qwen);
+  field("duration-hint").classList.toggle("hidden", qwen);
+  field("qwen-params-panel").classList.toggle("hidden", !qwen);
+  field("qwen-reference-text-wrap").classList.toggle(
+    "hidden",
+    !qwen || field("qwen-clone-mode").value !== "icl"
+  );
+  field("streaming-generation").disabled = false;
+  field("qwen-streaming-generation").disabled = false;
+  const hints = {
+    qwen_0_6b: "Qwen 0.6B：Faster CUDA Graph极速克隆，默认X-vector无需参考文字。新项目会锁定模型与Qwen参数。",
+    qwen_1_7b: "Qwen 1.7B：更高克隆质量，支持X-vector与ICL克隆。ICL必须填写准确参考文字。新项目会锁定全部参数。",
+    light_1_7b: "MOSS 1.7B：参考音频缓存、本地KV缓存和分块流式解码；建议块大小4–8。新项目会锁定此模型。",
+    quality_4b: "MOSS 4B：高质量v1.5，支持流式生成。新项目会锁定此模型。",
+  };
+  field("model-profile-hint").textContent = hints[profile] || hints.qwen_0_6b;
+  updateIclTranscriptStatus();
+  updateDurationControls();
+  if (persist) saveUiState();
+}
 
 function favoriteCloneVoices() {
   return CLONE_VOICES.filter((voice) => !hiddenCloneVoicePaths.has(voice.audio_path));
@@ -1762,7 +2663,11 @@ function saveUiState() {
     activeCloneVoiceTab,
     tokensControl: field("tokens-control").checked,
     streamingGeneration: field("streaming-generation").checked,
-    samplingOpen: document.querySelector(".accordion").open,
+    qwenStreamingGeneration: field("qwen-streaming-generation").checked,
+    qwenNonStreamingMode: field("qwen-non-streaming-mode").checked,
+    qwenAppendSilence: field("qwen-append-silence").checked,
+    mossSamplingOpen: field("moss-params-panel").open,
+    qwenSamplingOpen: field("qwen-params-panel").open,
     optimizationDefaultsVersion: UI_OPTIMIZATION_DEFAULTS_VERSION,
     values,
   };
@@ -1794,9 +2699,18 @@ function restoreUiState() {
   if (Number(state.optimizationDefaultsVersion || 0) < 3) {
     field("initial-playback-delay").value = "1.5";
   }
+  if (Number(state.optimizationDefaultsVersion || 0) < 4) {
+    field("model-profile").value = "qwen_0_6b";
+  }
   if (typeof state.tokensControl === "boolean") field("tokens-control").checked = state.tokensControl;
   if (typeof state.streamingGeneration === "boolean") field("streaming-generation").checked = state.streamingGeneration;
-  if (typeof state.samplingOpen === "boolean") document.querySelector(".accordion").open = state.samplingOpen;
+  if (typeof state.qwenStreamingGeneration === "boolean") field("qwen-streaming-generation").checked = state.qwenStreamingGeneration;
+  if (typeof state.qwenNonStreamingMode === "boolean") field("qwen-non-streaming-mode").checked = state.qwenNonStreamingMode;
+  if (typeof state.qwenAppendSilence === "boolean") field("qwen-append-silence").checked = state.qwenAppendSilence;
+  applyModelProfileCapabilities(false);
+  if (typeof state.mossSamplingOpen === "boolean") field("moss-params-panel").open = state.mossSamplingOpen;
+  else if (typeof state.samplingOpen === "boolean") field("moss-params-panel").open = state.samplingOpen;
+  if (typeof state.qwenSamplingOpen === "boolean") field("qwen-params-panel").open = state.qwenSamplingOpen;
   setWorkspaceTab(state.activeWorkspaceTab, false);
   activeCloneVoiceTab = state.activeCloneVoiceTab === "hidden" ? "hidden" : "favorites";
   setupCloneVoices();
@@ -1816,12 +2730,19 @@ function setupUiStatePersistence() {
   field("clone-voice").addEventListener("change", saveUiState);
   field("tokens-control").addEventListener("change", saveUiState);
   field("streaming-generation").addEventListener("change", saveUiState);
+  field("qwen-streaming-generation").addEventListener("change", saveUiState);
+  field("qwen-non-streaming-mode").addEventListener("change", saveUiState);
+  field("qwen-append-silence").addEventListener("change", saveUiState);
+  field("qwen-clone-mode").addEventListener("change", () => applyModelProfileCapabilities(true));
+  field("qwen-reference-text").addEventListener("input", saveCurrentIclTranscriptOverride);
+  field("model-profile").addEventListener("change", () => applyModelProfileCapabilities(true));
   for (const id of PERSISTED_VALUE_FIELDS) {
     field(id).addEventListener("input", saveUiState);
     const range = field(`${id}-range`);
     if (range) range.addEventListener("input", saveUiState);
   }
-  document.querySelector(".accordion").addEventListener("toggle", saveUiState);
+  field("moss-params-panel").addEventListener("toggle", saveUiState);
+  field("qwen-params-panel").addEventListener("toggle", saveUiState);
 }
 
 function setCloneVoiceTab(tabName) {
@@ -1859,6 +2780,104 @@ function syncCloneVoiceListSelection() {
   }
 }
 
+function selectedCloneVoice() {
+  const selectedPath = field("clone-voice").value;
+  return CLONE_VOICES.find((voice) => voice.audio_path === selectedPath) || null;
+}
+
+function persistIclTranscriptOverrides() {
+  try {
+    localStorage.setItem(
+      ICL_TRANSCRIPT_OVERRIDES_STORAGE_KEY,
+      JSON.stringify(iclTranscriptOverrides)
+    );
+  } catch (err) {}
+}
+
+function updateIclTranscriptStatus() {
+  const voice = selectedCloneVoice();
+  const textarea = field("qwen-reference-text");
+  const status = field("qwen-transcript-status");
+  const hint = field("qwen-transcript-hint");
+  const reset = field("qwen-transcript-reset");
+  const hasPreset = Boolean(voice && String(voice.transcript || "").trim());
+  const hasText = Boolean(textarea.value.trim());
+  const hasOverride = Boolean(
+    voice && Object.prototype.hasOwnProperty.call(iclTranscriptOverrides, voice.audio_path)
+  );
+  status.classList.toggle("needs-text", !hasText);
+  reset.disabled = !hasPreset;
+  if (!voice) {
+    status.textContent = hasText ? "自定义台词" : "需要填写";
+    hint.textContent = "上传或录制的参考音频需要手动填写逐字台词。";
+    return;
+  }
+  if (!hasText) {
+    status.textContent = "需要填写";
+    hint.textContent = `${voice.name} 暂无可用台词，请手动填写。`;
+    return;
+  }
+  status.textContent = hasOverride ? "已保存修订" : "预置台词已匹配";
+  const language = voice.language || "Chinese";
+  hint.textContent = `${voice.name} · ${language} · 可直接用于 ICL，也可以在此修正。`;
+}
+
+function applySelectedVoiceTranscript(force = false) {
+  const voice = selectedCloneVoice();
+  if (!voice) {
+    if (force) field("qwen-reference-text").value = "";
+    field("qwen-reference-text").dataset.voicePath = "";
+    updateIclTranscriptStatus();
+    return;
+  }
+  const textarea = field("qwen-reference-text");
+  const voiceChanged = textarea.dataset.voicePath !== voice.audio_path;
+  if (force || voiceChanged) {
+    const override = Object.prototype.hasOwnProperty.call(
+      iclTranscriptOverrides, voice.audio_path
+    ) ? iclTranscriptOverrides[voice.audio_path] : null;
+    textarea.value = override == null ? String(voice.transcript || "") : String(override);
+  }
+  textarea.dataset.voicePath = voice.audio_path;
+  updateIclTranscriptStatus();
+}
+
+function clearIclTranscriptForCustomReference() {
+  field("qwen-reference-text").value = "";
+  field("qwen-reference-text").dataset.voicePath = "";
+  updateIclTranscriptStatus();
+  saveUiState();
+}
+
+function saveCurrentIclTranscriptOverride() {
+  const voice = selectedCloneVoice();
+  if (!voice) {
+    updateIclTranscriptStatus();
+    saveUiState();
+    return;
+  }
+  const text = field("qwen-reference-text").value;
+  if (text.trim() && text.trim() !== String(voice.transcript || "").trim()) {
+    iclTranscriptOverrides[voice.audio_path] = text;
+  } else {
+    delete iclTranscriptOverrides[voice.audio_path];
+  }
+  persistIclTranscriptOverrides();
+  updateIclTranscriptStatus();
+  saveUiState();
+}
+
+function resetCurrentIclTranscript() {
+  const voice = selectedCloneVoice();
+  if (!voice) return;
+  delete iclTranscriptOverrides[voice.audio_path];
+  persistIclTranscriptOverrides();
+  field("qwen-reference-text").value = String(voice.transcript || "");
+  field("qwen-reference-text").dataset.voicePath = voice.audio_path;
+  updateIclTranscriptStatus();
+  saveUiState();
+}
+
 function selectCloneVoice(audioPath, autoplay = false) {
   const select = field("clone-voice");
   if (!audioPath) {
@@ -1877,6 +2896,7 @@ function selectCloneVoice(audioPath, autoplay = false) {
   updateReferenceLabel();
   syncCloneVoiceListSelection();
   const selectedVoice = CLONE_VOICES.find((voice) => voice.audio_path === audioPath);
+  applySelectedVoiceTranscript(true);
   setStatus(`已选择克隆音色：${selectedVoice ? `${selectedVoice.name} — ${selectedVoice.description}` : audioPath}`);
   if (autoplay) {
     const preview = field("reference-audio-preview");
@@ -1919,6 +2939,12 @@ function renderCloneVoiceList() {
     description.className = "clone-voice-description";
     description.textContent = voice.description;
     info.append(name, description);
+    if (String(voice.transcript || "").trim()) {
+      const meta = document.createElement("div");
+      meta.className = "clone-voice-meta";
+      meta.textContent = `ICL 文案已就绪 · ${voice.language || "Chinese"}`;
+      info.appendChild(meta);
+    }
     const controls = document.createElement("div");
     controls.className = "clone-voice-controls";
     const actionButton = document.createElement("button");
@@ -2075,16 +3101,24 @@ function mergeUint8Arrays(a, b) {
 
 function documentSettingsSnapshot() {
   const voiceSelect = field("clone-voice");
+  const params = activeGenerationParameters();
   return {
+    model_profile: selectedModelProfile(),
     reference_audio_path: field("example-audio-path").value || voiceSelect.value,
     voice_name: voiceSelect.selectedOptions[0] ? voiceSelect.selectedOptions[0].textContent : "本地克隆音色",
-    temperature: field("temperature").value,
-    top_p: field("top-p").value,
-    top_k: field("top-k").value,
-    repetition_penalty: field("repetition-penalty").value,
-    max_new_tokens: field("max-new-tokens").value,
-    codec_chunk_frames: field("codec-chunk-frames").value,
-    seed: field("seed").value,
+    temperature: params.temperature,
+    top_p: params.topP,
+    top_k: params.topK,
+    repetition_penalty: params.repetitionPenalty,
+    max_new_tokens: params.maxNewTokens,
+    codec_chunk_frames: params.chunkFrames,
+    seed: params.seed,
+    qwen_clone_mode: field("qwen-clone-mode").value,
+    qwen_reference_text: field("qwen-reference-text").value,
+    qwen_non_streaming_mode: field("qwen-non-streaming-mode").checked,
+    qwen_append_silence: field("qwen-append-silence").checked,
+    qwen_instruct: field("qwen-instruct").value,
+    qwen_min_new_tokens: field("qwen-min-new-tokens").value,
   };
 }
 
@@ -2177,8 +3211,8 @@ function renderDocumentProject(project) {
     `${stats.completed_chars || 0}/${stats.total_chars || 0} 字 · 已生成 ${formatDocumentDuration(stats.completed_audio_seconds || 0)} · ` +
     `速度 ${speed > 0 ? speed.toFixed(2) + "×实时" : "计算中"} · 预计剩余 ${eta}`;
   field("document-project-status").textContent =
-    `${project.name}\n${project.message || project.state}\n音色：${project.settings.voice_name || ""}\n` +
-    `参数指纹：${String(project.settings_fingerprint || "").slice(0, 12)}`;
+    `${project.name}\n${project.message || project.state}\n模型：${project.settings.model_label || (project.settings.model_profile === "light_1_7b" ? "轻量 1.7B（v1.0）" : "高质量 4B（v1.5）")}（项目已锁定）\n音色：${project.settings.voice_name || ""}\n` +
+    `Seed：${formatSeed(project.settings.seed, project.settings.seed_mode)}\n参数指纹：${String(project.settings_fingerprint || "").slice(0, 12)}`;
   startButton.disabled = project.state === "running" || project.state === "stopping";
   stopButton.disabled = project.state !== "running";
   deleteButton.disabled = project.state === "running" || project.state === "stopping";
@@ -2257,9 +3291,7 @@ async function appendDocumentToProject(file) {
 
 async function startDocumentProject() {
   if (!currentDocumentProject) return;
-  const form = new FormData();
-  form.append("settings_json", JSON.stringify(documentSettingsSnapshot()));
-  const response = await fetch(documentProjectUrl(currentDocumentProject.id, "/start"), {method: "POST", body: form});
+  const response = await fetch(documentProjectUrl(currentDocumentProject.id, "/start"), {method: "POST"});
   if (!response.ok) throw new Error(await response.text());
   currentDocumentProject = await response.json();
   renderDocumentProject(currentDocumentProject);
@@ -2354,17 +3386,20 @@ function updatePauseButtonState() {
   pauseBtn.textContent = "Pause Playback";
 }
 function resolveInitialPlaybackDelaySeconds() {
-  const raw = Number(field("initial-playback-delay").value || 1.5);
-  return Number.isFinite(raw) ? Math.max(0.3, Math.min(12, raw)) : 1.5;
+  const fallback = isQwenProfile() ? 0.8 : 1.5;
+  const raw = Number(activeGenerationParameters().initialPlaybackDelay || fallback);
+  return Number.isFinite(raw) ? Math.max(0.3, Math.min(60, raw)) : fallback;
 }
 function estimateRealtimeAudioDurationSeconds() {
-  if (field("tokens-control").checked) {
+  if (!isQwenProfile() && field("tokens-control").checked) {
     return Math.max(0.1, Number(field("tokens").value || 1) / 12.5);
   }
   const text = field("text").value || "";
-  const factor = detectTextLanguage(text) === "zh" ? 3.098411951313033 : 0.8673376262755219;
-  const estimated = Math.max(0.1, text.length * factor / 12.5);
-  const configuredMaximum = Math.max(1, Number(field("max-new-tokens").value || 7500)) / 12.5;
+  const qwen = isQwenProfile();
+  const frameRate = qwen ? 12 : 12.5;
+  const factor = qwen ? 3.2 : (detectTextLanguage(text) === "zh" ? 3.098411951313033 : 0.8673376262755219);
+  const estimated = Math.max(0.1, text.length * factor / frameRate);
+  const configuredMaximum = Math.max(1, Number(activeGenerationParameters().maxNewTokens || (qwen ? 2048 : 7500))) / frameRate;
   return Math.min(estimated, configuredMaximum);
 }
 function calculateAdaptiveRealtimeBufferTarget(minimumSeconds, expectedAudioSeconds, generationRate) {
@@ -2479,7 +3514,7 @@ async function prepareRealtimePlayback(sampleRate) {
   playbackPaused = false;
   updatePauseButtonState();
 }
-async function closeRealtimeStream() {
+async function closeRealtimeStream(stopTrackedJob = currentJobOwned) {
   clearPlaybackCompletionTimer();
   if (statusTimer) {
     window.clearInterval(statusTimer);
@@ -2489,10 +3524,11 @@ async function closeRealtimeStream() {
     currentStreamAbortController.abort();
     currentStreamAbortController = null;
   }
-  if (currentJob) {
+  if (currentJob && stopTrackedJob) {
     fetch(apiUrl(`api/generate-stream/${currentJob}/close`), { method: "POST" }).catch(() => {});
-    currentJob = null;
   }
+  currentJob = null;
+  currentJobOwned = false;
   if (audioContext) {
     try { await audioContext.close(); } catch (err) {}
     audioContext = null;
@@ -2555,7 +3591,7 @@ async function pollStatus(jobId) {
   const bufferedSeconds = realtimePlaybackStarted && audioContext
     ? Math.max(0, nextPlaybackTime - audioContext.currentTime)
     : pendingRealtimePcmSeconds;
-  field("summary").textContent = `${status.state} | mode=${status.mode || selectedModeName()} | frames=${status.generated_frames || 0} | emitted=${Number(status.emitted_audio_seconds || 0).toFixed(2)}s | generation=${Number(latestRealtimeGenerationRate || 0).toFixed(2)}× | buffer=${bufferedSeconds.toFixed(2)}/${adaptiveRealtimeBufferTargetSeconds.toFixed(2)}s`;
+  field("summary").textContent = `${status.state} | mode=${status.mode || selectedModeName()} | seed=${formatSeed(status.seed, status.seed_mode)} | frames=${status.generated_frames || 0} | emitted=${Number(status.emitted_audio_seconds || 0).toFixed(2)}s | generation=${Number(latestRealtimeGenerationRate || 0).toFixed(2)}× | buffer=${bufferedSeconds.toFixed(2)}/${adaptiveRealtimeBufferTargetSeconds.toFixed(2)}s`;
   if (status.state === "finished") {
     clearInterval(statusTimer);
     statusTimer = null;
@@ -2595,16 +3631,25 @@ field("start").onclick = async () => {
   form.append("language", "Chinese");
   form.append("text", field("text").value);
   form.append("prompt_text", field("prompt-text").value);
-  form.append("max_new_tokens", field("max-new-tokens").value);
-  form.append("codec_chunk_frames", field("codec-chunk-frames").value);
-  form.append("seed", field("seed").value);
+  const params = activeGenerationParameters();
+  form.append("max_new_tokens", params.maxNewTokens);
+  form.append("codec_chunk_frames", params.chunkFrames);
+  form.append("seed", params.seed);
   form.append("tokens_control", field("tokens-control").checked ? "1" : "0");
   form.append("tokens", field("tokens").value);
-  form.append("temperature", field("temperature").value);
-  form.append("top_p", field("top-p").value);
-  form.append("top_k", field("top-k").value);
-  form.append("repetition_penalty", field("repetition-penalty").value);
-  currentStreamingGenerationEnabled = field("streaming-generation").checked;
+  form.append("temperature", params.temperature);
+  form.append("top_p", params.topP);
+  form.append("top_k", params.topK);
+  form.append("repetition_penalty", params.repetitionPenalty);
+  form.append("model_profile", selectedModelProfile());
+  form.append("voice_name", field("clone-voice").selectedOptions[0]?.textContent || "本地克隆音色");
+  form.append("qwen_clone_mode", field("qwen-clone-mode").value);
+  form.append("qwen_reference_text", field("qwen-reference-text").value);
+  form.append("qwen_non_streaming_mode", field("qwen-non-streaming-mode").checked ? "1" : "0");
+  form.append("qwen_append_silence", field("qwen-append-silence").checked ? "1" : "0");
+  form.append("qwen_instruct", field("qwen-instruct").value);
+  form.append("qwen_min_new_tokens", field("qwen-min-new-tokens").value);
+  currentStreamingGenerationEnabled = params.streaming;
   form.append("streaming_generation", currentStreamingGenerationEnabled ? "1" : "0");
   form.append("example_audio_path", field("example-audio-path").value);
   const file = field("prompt-audio").files[0] || recordedReferenceFile;
@@ -2613,11 +3658,27 @@ field("start").onclick = async () => {
     if ((selectedMode() === "continuation" || selectedMode() === "continuation_clone") && hasReference() && !field("prompt-text").value.trim()) {
       throw new Error("Reference Audio Transcript is required for Continuation modes.");
     }
-    setStatus("starting...");
+    if (isQwenProfile() && field("qwen-clone-mode").value === "icl" && !field("qwen-reference-text").value.trim()) {
+      throw new Error("Qwen ICL克隆模式必须填写与参考音频逐字对应的文字。");
+    }
+    const configuredSeed = Number(params.seed);
+    setStatus({
+      state: "starting",
+      seed: configuredSeed >= 0 ? configuredSeed : null,
+      configured_seed: configuredSeed,
+      seed_mode: configuredSeed < 0 ? "random" : "fixed",
+    });
     const response = await fetch(apiUrl("api/generate-stream/start"), { method: "POST", body: form });
     if (!response.ok) throw new Error(await response.text());
     const start = await response.json();
+    setStatus({
+      state: "queued",
+      seed: start.seed,
+      configured_seed: start.configured_seed,
+      seed_mode: start.seed_mode,
+    });
     currentJob = start.job_id;
+    currentJobOwned = true;
     currentInitialPlaybackDelaySeconds = resolveInitialPlaybackDelaySeconds();
     if (currentStreamingGenerationEnabled) {
       currentStreamAbortController = new AbortController();
@@ -2633,6 +3694,7 @@ field("start").onclick = async () => {
     if (statusTimer) clearInterval(statusTimer);
     statusTimer = setInterval(() => pollStatus(currentJob), 500);
     pollStatus(currentJob);
+    pollServiceTasks();
   } catch (err) {
     setGenerationActive(false);
     setStatus(String(err));
@@ -2640,7 +3702,7 @@ field("start").onclick = async () => {
 };
 field("stop").onclick = async () => {
   if (!generationActive) return;
-  await closeRealtimeStream();
+  await closeRealtimeStream(true);
   field("summary").textContent = "已停止当前生成";
   setStatus("当前生成已停止，未播放的流式音频缓冲已清空。已完成的文档项目内容不受影响。");
 };
@@ -2662,6 +3724,7 @@ setupCloneVoices();
 renderCloneVoiceList();
 field("workspace-tab-text").onclick = () => setWorkspaceTab("text");
 field("workspace-tab-document").onclick = () => setWorkspaceTab("document");
+field("service-task-refresh").onclick = () => pollServiceTasks();
 field("clone-tab-favorites").onclick = () => setCloneVoiceTab("favorites");
 field("clone-tab-hidden").onclick = () => setCloneVoiceTab("hidden");
 const initialVisibleVoices = favoriteCloneVoices();
@@ -2670,6 +3733,9 @@ if (initialCloneVoice) selectCloneVoice(initialCloneVoice.audio_path, false);
 renderRuntime(INITIAL_RUNTIME);
 for (const id of ["temperature", "top-p", "top-k", "repetition-penalty", "max-new-tokens", "codec-chunk-frames", "seed"]) {
   setupRangePair(id, ["top-k", "max-new-tokens", "codec-chunk-frames", "seed"].includes(id));
+}
+for (const id of ["qwen-temperature", "qwen-top-p", "qwen-top-k", "qwen-repetition-penalty", "qwen-max-new-tokens", "qwen-chunk-size", "qwen-min-new-tokens", "qwen-seed"]) {
+  setupRangePair(id, ["qwen-top-k", "qwen-max-new-tokens", "qwen-chunk-size", "qwen-min-new-tokens", "qwen-seed"].includes(id));
 }
 field("tokens-control").onchange = updateDurationControls;
 field("text").oninput = updateDurationControls;
@@ -2681,6 +3747,7 @@ field("prompt-audio").onchange = () => {
     field("example-audio-path").value = "";
     field("clone-voice").value = "";
     syncCloneVoiceListSelection();
+    clearIclTranscriptForCustomReference();
     syncReferenceSourceControls();
   }
   updateReferencePreview();
@@ -2690,6 +3757,7 @@ field("reference-source-upload").onclick = () => setReferenceSourceMode("upload"
 field("reference-source-record").onclick = () => setReferenceSourceMode("record");
 field("reference-record-button").onclick = () => toggleReferenceRecording();
 field("clear-reference").onclick = clearReferenceAudio;
+field("qwen-transcript-reset").onclick = resetCurrentIclTranscript;
 field("document-create-file").onchange = async () => {
   try { await createDocumentProject(field("document-create-file").files[0]); }
   catch (err) { field("document-project-status").textContent = String(err); }
@@ -2741,6 +3809,8 @@ restoreUiState();
 updateReferenceLabel();
 loadDocumentProjects().catch((err) => { field("document-project-status").textContent = String(err); });
 documentProjectPollTimer = setInterval(pollCurrentDocumentProject, 1000);
+serviceTasksPollTimer = setInterval(pollServiceTasks, 1000);
+pollServiceTasks();
 setInterval(pollRuntime, 1500);
 pollRuntime();
 </script>
@@ -2755,6 +3825,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "7861")))
     parser.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", str(DEFAULT_MODEL_DIR)))
     parser.add_argument("--codec-dir", default=os.environ.get("CODEC_DIR", str(DEFAULT_CODEC_DIR)))
+    parser.add_argument("--lite-model-dir", default=os.environ.get("LITE_MODEL_DIR", str(DEFAULT_LITE_MODEL_DIR)))
+    parser.add_argument("--lite-codec-dir", default=os.environ.get("LITE_CODEC_DIR", str(DEFAULT_LITE_CODEC_DIR)))
+    parser.add_argument("--qwen-python", default=os.environ.get("QWEN_TTS_PYTHON", str(DEFAULT_QWEN_PYTHON)))
+    parser.add_argument(
+        "--qwen-worker-script",
+        default=os.environ.get("QWEN_TTS_WORKER_SCRIPT", str(DEFAULT_QWEN_WORKER_SCRIPT)),
+    )
+    parser.add_argument(
+        "--qwen-0-6b-model-dir",
+        default=os.environ.get("QWEN_TTS_0_6B_MODEL_DIR", str(DEFAULT_QWEN_0_6B_MODEL_DIR)),
+    )
+    parser.add_argument(
+        "--qwen-1-7b-model-dir",
+        default=os.environ.get("QWEN_TTS_1_7B_MODEL_DIR", str(DEFAULT_QWEN_1_7B_MODEL_DIR)),
+    )
+    parser.add_argument(
+        "--qwen-0-6b-lanes",
+        type=int,
+        default=int(os.environ.get("QWEN_TTS_0_6B_LANES", "1")),
+    )
+    parser.add_argument(
+        "--qwen-1-7b-lanes",
+        type=int,
+        default=int(os.environ.get("QWEN_TTS_1_7B_LANES", "1")),
+    )
     parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
     parser.add_argument("--upload-dir", default=os.environ.get("UPLOAD_DIR", str(DEFAULT_UPLOAD_DIR)))
     parser.add_argument("--device", default=os.environ.get("DEVICE", "cuda"))
@@ -2789,6 +3884,14 @@ def main() -> None:
     app = create_app(
         model_dir=args.model_dir,
         codec_dir=args.codec_dir,
+        lite_model_dir=args.lite_model_dir,
+        lite_codec_dir=args.lite_codec_dir,
+        qwen_python=args.qwen_python,
+        qwen_worker_script=args.qwen_worker_script,
+        qwen_0_6b_model_dir=args.qwen_0_6b_model_dir,
+        qwen_1_7b_model_dir=args.qwen_1_7b_model_dir,
+        qwen_0_6b_lanes=max(1, int(args.qwen_0_6b_lanes)),
+        qwen_1_7b_lanes=max(1, int(args.qwen_1_7b_lanes)),
         output_dir=args.output_dir,
         upload_dir=args.upload_dir,
         device=args.device,
@@ -2801,6 +3904,7 @@ def main() -> None:
         warmup=not args.no_warmup,
         preload=not args.no_preload,
         max_parallel_generations=max(1, int(args.max_parallel_generations)),
+        access_password=os.environ.get("MOSS_TTS_ACCESS_PASSWORD", ""),
     )
     uvicorn.run(app, host=args.host, port=int(args.port))
 

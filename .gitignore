@@ -218,5 +218,7 @@ models/
 .ffmpeg-runtime/
 logs/
 moss-tts.pid
+.moss-tts-password
 
 outputs/*
+assets/audio/bailian/transcripts.auto.json
