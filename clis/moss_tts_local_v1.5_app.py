@@ -15,6 +15,7 @@ import mimetypes
 import os
 import queue
 import re
+import secrets
 import shutil
 import sys
 import threading
@@ -975,6 +976,10 @@ def create_app(
                         )
                     elif event.type == "result":
                         metadata = dict(event.data["metadata"])
+                        task_seed_status = job.snapshot()
+                        metadata["seed"] = int(request.seed) if request.seed is not None else None
+                        metadata["configured_seed"] = task_seed_status.get("configured_seed")
+                        metadata["seed_mode"] = task_seed_status.get("seed_mode")
                         job.set_result({
                             "audio_path": event.data["audio_path"],
                             "tokens_path": event.data["tokens_path"],
@@ -1056,7 +1061,9 @@ def create_app(
         if runtime_manager.profiles[model_profile].get("backend") == "qwen":
             max_new_tokens = _safe_int(max_new_tokens, default=2048, minimum=2, maximum=2048)
             codec_chunk_frames = _safe_int(codec_chunk_frames, default=8, minimum=1, maximum=24)
-        resolved_seed = _safe_int(seed, default=1234, minimum=-1, maximum=999999)
+        configured_seed = _safe_int(seed, default=1234, minimum=-1, maximum=999999)
+        seed_mode = "random" if configured_seed < 0 else "fixed"
+        resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
         if not runtime_manager.profiles[model_profile]["streaming"]:
             streaming_generation_enabled = False
         request = StreamingRequest(
@@ -1097,6 +1104,8 @@ def create_app(
                 "model_label": MODEL_PROFILE_LABELS[model_profile],
                 "voice_name": str(voice_name or "本地克隆音色")[:120],
                 "seed": resolved_seed,
+                "configured_seed": configured_seed,
+                "seed_mode": seed_mode,
             }
         )
         thread = threading.Thread(
@@ -1117,6 +1126,8 @@ def create_app(
                 "model_profile": model_profile,
                 "streaming_generation": streaming_generation_enabled,
                 "seed": resolved_seed,
+                "configured_seed": configured_seed,
+                "seed_mode": seed_mode,
             }
         )
 
@@ -1224,6 +1235,8 @@ def create_app(
                     ),
                     "voice_name": item.get("voice_name") or "",
                     "seed": item.get("seed"),
+                    "configured_seed": item.get("configured_seed"),
+                    "seed_mode": item.get("seed_mode"),
                     "generated_frames": item.get("generated_frames", 0),
                     "max_new_tokens": item.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS),
                     "duration_seconds": item.get("emitted_audio_seconds", 0.0),
@@ -1249,6 +1262,8 @@ def create_app(
                     ],
                     "voice_name": (project.get("settings") or {}).get("voice_name", ""),
                     "seed": (project.get("settings") or {}).get("seed"),
+                    "configured_seed": (project.get("settings") or {}).get("configured_seed"),
+                    "seed_mode": (project.get("settings") or {}).get("seed_mode"),
                     "completed_segments": stats.get("completed_segments", 0),
                     "total_segments": stats.get("total_segments", 0),
                     "progress": stats.get("progress", 0.0),
@@ -1289,6 +1304,9 @@ def create_app(
         qwen_reference_text = str(incoming.get("qwen_reference_text") or "").strip()
         if qwen_profile and qwen_clone_mode == "icl" and not qwen_reference_text:
             raise HTTPException(status_code=400, detail="Qwen ICL克隆模式必须填写参考音频文字")
+        configured_seed = _safe_int(incoming.get("seed"), default=1234, minimum=-1, maximum=999999)
+        seed_mode = "random" if configured_seed < 0 else "fixed"
+        resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
         return {
             "model_profile": model_profile,
             "model_label": MODEL_PROFILE_LABELS[model_profile],
@@ -1313,7 +1331,9 @@ def create_app(
                 minimum=1,
                 maximum=24 if qwen_profile else 32,
             ),
-            "seed": _safe_int(incoming.get("seed"), default=1234, minimum=-1, maximum=999999),
+            "seed": resolved_seed,
+            "configured_seed": configured_seed,
+            "seed_mode": seed_mode,
             "qwen_clone_mode": qwen_clone_mode,
             "qwen_reference_text": qwen_reference_text,
             "qwen_non_streaming_mode": bool(incoming.get("qwen_non_streaming_mode", False)),
@@ -2201,11 +2221,14 @@ function setStatus(obj) {
     field("bar").style.width = pct.toFixed(1) + "%";
   }
 }
-function formatSeed(value) {
-  if (value === null || value === undefined || value === "") return "—";
+function formatSeed(value, seedMode = "") {
+  if (value === null || value === undefined || value === "") {
+    return seedMode === "random" ? "等待生成" : "—";
+  }
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return String(value);
-  return numeric < 0 ? "-1（随机）" : String(Math.trunc(numeric));
+  if (numeric < 0) return seedMode === "random" ? "等待生成" : "旧任务未记录";
+  return `${Math.trunc(numeric)}${seedMode === "random" ? "（随机）" : ""}`;
 }
 function fetchJson(url, options) {
   return fetch(url, options).then(async (response) => {
@@ -2508,7 +2531,7 @@ function renderServiceTasks(data) {
     }
     const profile = document.createElement("div");
     profile.className = "service-task-meta";
-    profile.textContent = `${task.model_label || ""}${task.voice_name ? " · " + task.voice_name : ""} · Seed ${formatSeed(task.seed)}`;
+    profile.textContent = `${task.model_label || ""}${task.voice_name ? " · " + task.voice_name : ""} · Seed ${formatSeed(task.seed, task.seed_mode)}`;
     profile.title = profile.textContent;
     const open = document.createElement("button");
     open.type = "button";
@@ -3189,7 +3212,7 @@ function renderDocumentProject(project) {
     `速度 ${speed > 0 ? speed.toFixed(2) + "×实时" : "计算中"} · 预计剩余 ${eta}`;
   field("document-project-status").textContent =
     `${project.name}\n${project.message || project.state}\n模型：${project.settings.model_label || (project.settings.model_profile === "light_1_7b" ? "轻量 1.7B（v1.0）" : "高质量 4B（v1.5）")}（项目已锁定）\n音色：${project.settings.voice_name || ""}\n` +
-    `Seed：${formatSeed(project.settings.seed)}\n参数指纹：${String(project.settings_fingerprint || "").slice(0, 12)}`;
+    `Seed：${formatSeed(project.settings.seed, project.settings.seed_mode)}\n参数指纹：${String(project.settings_fingerprint || "").slice(0, 12)}`;
   startButton.disabled = project.state === "running" || project.state === "stopping";
   stopButton.disabled = project.state !== "running";
   deleteButton.disabled = project.state === "running" || project.state === "stopping";
@@ -3568,7 +3591,7 @@ async function pollStatus(jobId) {
   const bufferedSeconds = realtimePlaybackStarted && audioContext
     ? Math.max(0, nextPlaybackTime - audioContext.currentTime)
     : pendingRealtimePcmSeconds;
-  field("summary").textContent = `${status.state} | mode=${status.mode || selectedModeName()} | seed=${formatSeed(status.seed)} | frames=${status.generated_frames || 0} | emitted=${Number(status.emitted_audio_seconds || 0).toFixed(2)}s | generation=${Number(latestRealtimeGenerationRate || 0).toFixed(2)}× | buffer=${bufferedSeconds.toFixed(2)}/${adaptiveRealtimeBufferTargetSeconds.toFixed(2)}s`;
+  field("summary").textContent = `${status.state} | mode=${status.mode || selectedModeName()} | seed=${formatSeed(status.seed, status.seed_mode)} | frames=${status.generated_frames || 0} | emitted=${Number(status.emitted_audio_seconds || 0).toFixed(2)}s | generation=${Number(latestRealtimeGenerationRate || 0).toFixed(2)}× | buffer=${bufferedSeconds.toFixed(2)}/${adaptiveRealtimeBufferTargetSeconds.toFixed(2)}s`;
   if (status.state === "finished") {
     clearInterval(statusTimer);
     statusTimer = null;
@@ -3638,10 +3661,22 @@ field("start").onclick = async () => {
     if (isQwenProfile() && field("qwen-clone-mode").value === "icl" && !field("qwen-reference-text").value.trim()) {
       throw new Error("Qwen ICL克隆模式必须填写与参考音频逐字对应的文字。");
     }
-    setStatus({ state: "starting", seed: Number(params.seed) });
+    const configuredSeed = Number(params.seed);
+    setStatus({
+      state: "starting",
+      seed: configuredSeed >= 0 ? configuredSeed : null,
+      configured_seed: configuredSeed,
+      seed_mode: configuredSeed < 0 ? "random" : "fixed",
+    });
     const response = await fetch(apiUrl("api/generate-stream/start"), { method: "POST", body: form });
     if (!response.ok) throw new Error(await response.text());
     const start = await response.json();
+    setStatus({
+      state: "queued",
+      seed: start.seed,
+      configured_seed: start.configured_seed,
+      seed_mode: start.seed_mode,
+    });
     currentJob = start.job_id;
     currentJobOwned = true;
     currentInitialPlaybackDelaySeconds = resolveInitialPlaybackDelaySeconds();

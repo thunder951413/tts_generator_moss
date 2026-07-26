@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -164,6 +165,19 @@ class DocumentProjectManager:
         settings = manifest.setdefault("settings", {})
         if not settings.get("model_profile"):
             settings["model_profile"] = "quality_4b"
+            changed = True
+        if settings.get("seed_mode") not in {"fixed", "random"}:
+            try:
+                configured_seed = int(settings.get("seed", 1234))
+            except (TypeError, ValueError):
+                configured_seed = 1234
+            settings["configured_seed"] = configured_seed
+            if configured_seed < 0:
+                settings["seed"] = secrets.randbelow(1_000_000)
+                settings["seed_mode"] = "random"
+            else:
+                settings["seed"] = configured_seed
+                settings["seed_mode"] = "fixed"
             changed = True
         profile = str(settings["model_profile"])
         for segment in manifest.get("segments", []):
@@ -581,6 +595,8 @@ class DocumentProjectManager:
             "duration_seconds": float(result_event.get("metadata", {}).get("duration_seconds", 0.0)),
             "generation_seconds": generation_seconds,
             "model_profile": str(settings.get("model_profile") or "quality_4b"),
+            "seed": int(settings.get("seed", 1234)),
+            "seed_mode": str(settings.get("seed_mode") or "fixed"),
         }
 
     def _encode_segment_aac(
@@ -625,6 +641,8 @@ class DocumentProjectManager:
             "audio_file": f"segments/{output_name}",
             "duration_seconds": float(synthesis.get("duration_seconds", 0.0)),
             "generation_seconds": float(synthesis.get("generation_seconds", 0.0)),
+            "seed": int(synthesis.get("seed", 1234)),
+            "seed_mode": str(synthesis.get("seed_mode") or "fixed"),
         }
 
     def _merge_final_audio(self, manifest: dict[str, Any]) -> None:
