@@ -19,6 +19,15 @@ if [[ ! -x "$ROOT/.venv/bin/python" || ! -f "$LIBQWEN" ]]; then
   exit 1
 fi
 
+SERVICE_HOST="${HOST:-127.0.0.1}"
+SERVICE_PASSWORD="${QWEN_TTS_ACCESS_PASSWORD:-}"
+if [[ "$SERVICE_HOST" == "0.0.0.0" || "$SERVICE_HOST" == "::" ]]; then
+  if [[ ${#SERVICE_PASSWORD} -lt 4 || "$SERVICE_PASSWORD" == "change-me" ]]; then
+    echo "Refusing LAN exposure with an empty/weak password. Set QWEN_TTS_ACCESS_PASSWORD to at least 4 characters." >&2
+    exit 1
+  fi
+fi
+
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "Qwen3-TTS is already running with PID $(cat "$PID_FILE")."
   exit 0
@@ -31,7 +40,7 @@ export QWENTTS_CPP_LIBRARY="$LIBQWEN"
 export DYLD_LIBRARY_PATH="$LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 nohup "$ROOT/.venv/bin/python" "$ROOT/clis/qwen_tts_app.py" \
-  --host "${HOST:-0.0.0.0}" \
+  --host "$SERVICE_HOST" \
   --port "${PORT:-7861}" \
   --qwen-backend ggml \
   --qwen-quant "${QWEN_TTS_QUANT:-Q4_K_M}" \
@@ -41,4 +50,4 @@ nohup "$ROOT/.venv/bin/python" "$ROOT/clis/qwen_tts_app.py" \
   </dev/null &
 
 echo "$!" >"$PID_FILE"
-echo "Qwen3-TTS started with PID $! at http://${HOST:-0.0.0.0}:${PORT:-7861}"
+echo "Qwen3-TTS started with PID $! at http://${SERVICE_HOST}:${PORT:-7861}"

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sys
+import threading
 import time
 import types
+import wave
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -14,6 +17,16 @@ from fastapi.testclient import TestClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def silent_wav_bytes(*, sample_rate: int = 24000, duration: float = 0.1) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes(b"\0\0" * max(1, int(sample_rate * duration)))
+    return output.getvalue()
 
 
 def load_app_module():
@@ -59,8 +72,33 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert '"/api/presets"' not in reader_script.text
         assert 'form.set("qwen_non_streaming_mode", "1")' in reader_script.text
         assert 'ephemeral-audio' in reader_script.text
+        assert "queueQualityBlock" in reader_script.text
+        assert "qualityJobs: new Set()" in reader_script.text
         assert "renderWholeBookProgress" in reader_script.text
+        assert 'window.addEventListener("pagehide"' in reader_script.text
+        assert "超过 60 秒没有数据" in reader_script.text
         assert 'stopCurrentGeneration' in reader_script.text
+
+        native_source = (ROOT / "macos" / "NativeStudio.swift").read_text(encoding="utf-8")
+        assert "final class NativePCMStreamPlayer" in native_source
+        assert "final class SystemAudioRecorder" in native_source
+        assert "SCStreamOutput" in native_source
+        assert "struct SystemAudioTrimView" in native_source
+        assert "struct ReferenceAudioLibraryView" in native_source
+        assert 'api/generate-stream/\\(jobID)/audio' in native_source
+        service_source = (ROOT / "clis" / "qwen_tts_app.py").read_text(encoding="utf-8")
+        assert "await request.is_disconnected()" in service_source
+        start_script = (ROOT / "start-macos.sh").read_text(encoding="utf-8")
+        assert "Refusing LAN exposure with an empty/weak password" in start_script
+
+        disallowed_cors = client.options(
+            "/api/health",
+            headers={
+                "Origin": "https://untrusted.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert "access-control-allow-origin" not in disallowed_cors.headers
 
         service_settings = client.get("/api/service-settings")
         assert service_settings.status_code == 200
@@ -97,7 +135,7 @@ def test_voice_presets_are_persistent_and_can_import_reference_audio(tmp_path: P
     with TestClient(app) as client:
         imported = client.post(
             "/api/presets/reference-audio",
-            files={"audio": ("my-voice.wav", b"RIFFfake-wave-data", "audio/wav")},
+            files={"audio": ("my-voice.wav", silent_wav_bytes(), "audio/wav")},
         )
         assert imported.status_code == 200
         reference_path = imported.json()["reference_audio_path"]
@@ -183,6 +221,79 @@ def test_voice_presets_are_persistent_and_can_import_reference_audio(tmp_path: P
         deleted = client.delete(f"/api/presets/{preset['id']}")
         assert deleted.status_code == 200
         assert client.get("/api/presets").json()["presets"] == []
+
+
+def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Path) -> None:
+    module = load_app_module()
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        access_password="",
+    )
+    with TestClient(app) as client:
+        imported = client.post(
+            "/api/presets/reference-audio",
+            files={"audio": ("narrator.wav", silent_wav_bytes(sample_rate=48000), "audio/wav")},
+        )
+        assert imported.status_code == 200
+        reference_path = imported.json()["reference_audio_path"]
+        custom = next(
+            item
+            for item in client.get(
+                "/api/reference-audio-library",
+                params={"include_hidden": True},
+            ).json()["references"]
+            if item["path"] == reference_path
+        )
+        assert custom["kind"] == "custom"
+        assert custom["name"] == "narrator"
+        assert any(item["audio_path"] == reference_path for item in client.get("/api/voices").json()["voices"])
+
+        hidden = client.put(
+            f"/api/reference-audio-library/{custom['id']}/visibility",
+            json={"hidden": True},
+        )
+        assert hidden.status_code == 200
+        assert all(item["audio_path"] != reference_path for item in client.get("/api/voices").json()["voices"])
+        restored = client.put(
+            f"/api/reference-audio-library/{custom['id']}/visibility",
+            json={"hidden": False},
+        )
+        assert restored.status_code == 200
+
+        applied = client.put(
+            "/api/service-settings",
+            json={
+                "name": "引用保护",
+                "settings": {
+                    "model_profile": "qwen_0_6b",
+                    "reference_audio_path": reference_path,
+                },
+            },
+        )
+        assert applied.status_code == 200
+        blocked = client.delete(f"/api/reference-audio-library/{custom['id']}")
+        assert blocked.status_code == 409
+        assert Path(reference_path).is_file()
+
+        assert client.delete("/api/service-settings").status_code == 200
+        deleted = client.delete(f"/api/reference-audio-library/{custom['id']}")
+        assert deleted.status_code == 200
+        assert not Path(reference_path).exists()
+
+        builtin = next(
+            item
+            for item in client.get(
+                "/api/reference-audio-library",
+                params={"include_hidden": True},
+            ).json()["references"]
+            if item["kind"] == "builtin"
+        )
+        assert client.delete(f"/api/reference-audio-library/{builtin['id']}").status_code == 400
 
 
 def test_service_accepts_bearer_api_clients_and_stt_uploads(
@@ -359,6 +470,9 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
         status = client.get(f"/api/generate-stream/{job_id}/status").json()
         assert status["state"] == "finished"
         assert status["generated_frames"] == 2
+        completed_result = client.get(f"/api/generate-stream/{job_id}/result").json()
+        Path(completed_result["audio_path"]).unlink()
+        assert client.get(f"/api/generate-stream/{job_id}/result-audio").status_code == 404
 
         def fake_ffmpeg(command, **_kwargs):
             Path(command[-1]).write_bytes(b"fake-aac")
@@ -397,8 +511,8 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
         assert encoded.status_code == 200
         assert encoded.headers["content-type"].startswith("audio/mp4")
         assert encoded.content == b"fake-aac"
-        cleaned = client.delete(
-            f"/api/generate-stream/{ephemeral_job_id}/ephemeral-audio"
+        cleaned = client.post(
+            f"/api/generate-stream/{ephemeral_job_id}/ephemeral-audio/close"
         )
         assert cleaned.status_code == 200
         assert not any(path.exists() for path in source_paths)
@@ -407,6 +521,79 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
         ).json()
         assert cleaned_status["ephemeral_cleaned"] is True
         assert cleaned_status["result_ready"] is False
+
+
+def test_dead_qwen_worker_is_retired_and_restarted(tmp_path: Path) -> None:
+    module = load_app_module()
+
+    class FakeProcess:
+        def __init__(self, return_code):
+            self.return_code = return_code
+
+        def poll(self):
+            return self.return_code
+
+    class DeadWorker:
+        lane_index = 0
+        process = FakeProcess(9)
+        closed = False
+
+        def generate(self, _payload):
+            if False:
+                yield {}
+            raise RuntimeError("worker crashed")
+
+        def health(self):
+            raise ConnectionError("worker is gone")
+
+        def close(self):
+            self.closed = True
+
+    class ReplacementWorker:
+        lane_index = 0
+        process = FakeProcess(None)
+
+        def health(self):
+            return {"ok": True}
+
+        def close(self):
+            return None
+
+    dead = DeadWorker()
+    replacement = ReplacementWorker()
+    runtime = object.__new__(module.QwenWorkerRuntime)
+    runtime.profile_id = "qwen_0_6b"
+    runtime._closed = False
+    runtime._workers = [dead]
+    runtime._available = module.queue.Queue()
+    runtime._available.put(dead)
+    runtime._worker_lock = threading.RLock()
+    runtime._worker_config = {}
+    runtime.reference_audio_cache = {}
+    runtime.reference_audio_cache_hits = 0
+    runtime.reference_audio_cache_misses = 0
+    runtime.reference_audio_cache_lock = threading.RLock()
+    runtime._create_worker = lambda _lane_index: replacement
+    request = module.StreamingRequest(
+        text="触发 worker 崩溃恢复",
+        prompt_audio_path=str(tmp_path / "reference.wav"),
+    )
+
+    try:
+        list(runtime.synthesize(request, output_dir=tmp_path / "output"))
+    except RuntimeError as exc:
+        assert "worker crashed" in str(exc)
+    else:
+        raise AssertionError("dead worker failure should reach the caller")
+
+    for _ in range(100):
+        if replacement in runtime._workers:
+            break
+        time.sleep(0.01)
+    assert dead.closed is True
+    assert dead not in runtime._workers
+    assert replacement in runtime._workers
+    assert runtime._available.get_nowait() is replacement
 
 
 def test_ggml_worker_passes_effective_seed_to_native_stream(tmp_path: Path) -> None:

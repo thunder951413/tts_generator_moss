@@ -28,5 +28,9 @@
   <true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Qwen TTS 使用麦克风录制声音，作为本地语音克隆的参考音频。</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Qwen TTS 使用屏幕与系统音频录制权限来捕获 Mac 正在播放的声音，作为本地语音克隆的参考音频。</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Qwen TTS 仅在你主动开始录制时捕获 Mac 的系统播放声音，并在停止后提供裁剪和导入。</string>
 </dict>
 </plist>

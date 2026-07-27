@@ -7,6 +7,9 @@ const state = {
   serviceSettingsName: "正在读取服务设置",
   serviceSettingsSource: "default",
   serviceSettingsFingerprint: "",
+  authRedirecting: false,
+  bookRefreshSerial: 0,
+  bookRefreshApplied: 0,
   streamRunId: 0,
   qualityContext: null,
   stopRequested: false,
@@ -15,6 +18,8 @@ const state = {
   playingBlock: null,
   playbackMode: "",
   qualityQueue: [],
+  qualityJobs: new Set(),
+  qualityPlaybackReject: null,
   qualityAudio: new Audio(),
   audioContext: null,
   streamAbort: null,
@@ -32,6 +37,12 @@ function api(path) {
 
 async function jsonFetch(path, options = {}) {
   const response = await fetch(api(path), options);
+  if (response.status === 401 && !state.authRedirecting) {
+    state.authRedirecting = true;
+    const next = `${window.location.pathname}${window.location.search}`;
+    window.location.assign(`/login?next=${encodeURIComponent(next)}`);
+    throw new DOMException("Authentication required", "AbortError");
+  }
   if (!response.ok) {
     let message = await response.text();
     try { message = JSON.parse(message).detail || message; } catch (_) {}
@@ -357,8 +368,14 @@ async function toggleEditMode() {
   toast(state.editMode ? "编辑模式已开启；离开文字块时自动保存" : "已回到浏览模式");
 }
 
-function selectChapter(index) {
+async function selectChapter(index) {
   if (!state.book) return;
+  const audioActive = Boolean(
+    state.currentJob
+    || state.qualityJobs.size
+    || ["stream", "quality", "quality-online", "preview"].includes(state.playbackMode)
+  );
+  if (audioActive) await stopPlayback(true);
   state.chapterIndex = Math.max(0, Math.min(index, state.book.chapters.length - 1));
   state.selectedBlock = currentChapter().segment_start;
   localStorage.setItem(`qwen-reader-chapter-${state.book.id}`, state.chapterIndex);
@@ -373,6 +390,12 @@ function selectChapter(index) {
 function selectBlock(index) {
   state.selectedBlock = index;
   renderCurrentChapter();
+  if (
+    ["running", "stopping"].includes(state.book?.state)
+    || state.playbackMode === "quality-generating"
+  ) {
+    return;
+  }
   const segment = state.book?.segments?.find((item) => item.index === index);
   if (segment?.status === "completed" && segment.audio_file) {
     playQualitySegments([segment]);
@@ -382,6 +405,7 @@ function selectBlock(index) {
 function setActionsEnabled(enabled) {
   const generating = Boolean(
     state.currentJob
+    || state.qualityJobs.size
     || ["running", "stopping"].includes(state.book?.state)
     || state.playbackMode === "quality-generating"
     || state.playbackMode === "quality-online"
@@ -437,7 +461,7 @@ function applyAppearance() {
 
 function updateBitrateLabel() {
   const bitrate = $("book-aac-bitrate")?.value || state.serviceSettings?.aac_bitrate || "80k";
-  $("quality-bitrate-label").textContent = `整段非流式 · AAC ${bitrate} 单声道`;
+  $("quality-bitrate-label").textContent = `逐段非流式 · 双路预取 · AAC ${bitrate}`;
   updateListeningSummary();
 }
 
@@ -531,7 +555,17 @@ async function confirmImport() {
 
 async function refreshCurrentBook(render = true) {
   if (!state.book) return null;
-  state.book = await jsonFetch(`/api/document-projects/${encodeURIComponent(state.book.id)}`);
+  const bookId = state.book.id;
+  const requestSerial = ++state.bookRefreshSerial;
+  const refreshed = await jsonFetch(`/api/document-projects/${encodeURIComponent(bookId)}`);
+  if (
+    state.book?.id !== bookId
+    || requestSerial < state.bookRefreshApplied
+  ) {
+    return state.book;
+  }
+  state.bookRefreshApplied = requestSerial;
+  state.book = refreshed;
   if (render) renderBook();
   return state.book;
 }
@@ -577,6 +611,7 @@ async function beginQualityGeneration() {
     pollQualityGeneration();
   } catch (error) {
     state.qualityContext = null;
+    state.stopRequested = false;
     state.playbackMode = "";
     setActionsEnabled(true);
     toast(error.message, true);
@@ -591,12 +626,17 @@ function generateWholeBook() {
   return beginQualityGeneration();
 }
 
-function waitForJob(jobId) {
+function waitForJob(jobId, runId) {
   return new Promise((resolve, reject) => {
+    const deadline = Date.now() + 10 * 60 * 1000;
     const check = async () => {
       try {
+        if (Date.now() > deadline) {
+          reject(new Error("该文字块生成超过 10 分钟，任务已停止"));
+          return;
+        }
         const status = await jsonFetch(`/api/generate-stream/${encodeURIComponent(jobId)}/status`);
-        if (state.stopped || jobId !== state.currentJob) {
+        if (state.stopped || runId !== state.streamRunId || !state.qualityJobs.has(jobId)) {
           reject(new DOMException("Stopped", "AbortError"));
         } else if (status.state === "finished" && status.result_ready) {
           resolve(status);
@@ -613,16 +653,24 @@ function waitForJob(jobId) {
   });
 }
 
-function playTemporaryAAC(jobId) {
+function playTemporaryAAC(prepared) {
   return new Promise((resolve, reject) => {
     const audio = state.qualityAudio;
-    audio.src = `/api/generate-stream/${encodeURIComponent(jobId)}/result-audio-aac?bitrate=${encodeURIComponent(selectedBookBitrate())}`;
+    const fail = (error) => {
+      state.qualityPlaybackReject = null;
+      reject(error);
+    };
+    state.qualityPlaybackReject = fail;
+    audio.src = prepared.objectURL;
     audio.playbackRate = Number($("playback-rate").value || 1);
-    audio.onended = resolve;
-    audio.onerror = () => reject(new Error("临时 AAC 无法播放"));
+    audio.onended = () => {
+      state.qualityPlaybackReject = null;
+      resolve();
+    };
+    audio.onerror = () => fail(new Error("临时 AAC 无法播放"));
     audio.play().then(() => {
       $("play-toggle").textContent = "Ⅱ";
-    }).catch(reject);
+    }).catch(fail);
   });
 }
 
@@ -631,6 +679,50 @@ async function removeTemporaryAudio(jobId) {
   await fetch(`/api/generate-stream/${encodeURIComponent(jobId)}/ephemeral-audio`, {
     method: "DELETE",
   }).catch(() => {});
+  state.qualityJobs.delete(jobId);
+  if (state.currentJob === jobId) {
+    state.currentJob = [...state.qualityJobs][0] || "";
+  }
+}
+
+async function prepareQualityBlock(segment, runId) {
+  const form = streamForm(segment);
+  form.set("streaming_generation", "0");
+  form.set("qwen_non_streaming_mode", "1");
+  form.set("ephemeral_audio", "1");
+  const started = await jsonFetch("/api/generate-stream/start", { method: "POST", body: form });
+  const jobId = started.job_id;
+  state.qualityJobs.add(jobId);
+  state.currentJob = jobId;
+  setActionsEnabled(true);
+  try {
+    await waitForJob(jobId, runId);
+    if (state.stopped || runId !== state.streamRunId) {
+      throw new DOMException("Stopped", "AbortError");
+    }
+    const response = await fetch(
+      `/api/generate-stream/${encodeURIComponent(jobId)}/result-audio-aac?bitrate=${encodeURIComponent(selectedBookBitrate())}`
+    );
+    if (!response.ok) throw new Error(await response.text());
+    const blob = await response.blob();
+    return {
+      segment,
+      jobId,
+      seed: started.seed,
+      seedMode: started.seed_mode,
+      objectURL: URL.createObjectURL(blob),
+    };
+  } catch (error) {
+    await removeTemporaryAudio(jobId);
+    throw error;
+  }
+}
+
+function queueQualityBlock(segment, runId) {
+  return prepareQualityBlock(segment, runId).then(
+    (prepared) => ({ prepared, error: null }),
+    (error) => ({ prepared: null, error })
+  );
 }
 
 async function startQualityChapter() {
@@ -646,36 +738,56 @@ async function startQualityChapter() {
   state.stopRequested = false;
   state.playbackMode = "quality-online";
   setActionsEnabled(true);
+  state.playingBlock = segments[0].index;
+  state.selectedBlock = segments[0].index;
+  updatePlayer(segments[0], "高质量非流式 · 正在完整生成", null);
+  renderCurrentChapter();
+  scrollPlayingBlock();
+  let pendingPreparation = queueQualityBlock(segments[0], runId);
   try {
-    for (const segment of segments) {
-      if (state.stopped || runId !== state.streamRunId) break;
+    for (let index = 0; index < segments.length; index += 1) {
+      const outcome = await pendingPreparation;
+      pendingPreparation = null;
+      if (outcome.error) throw outcome.error;
+      const prepared = outcome.prepared;
+      if (state.stopped || runId !== state.streamRunId) {
+        URL.revokeObjectURL(prepared.objectURL);
+        await removeTemporaryAudio(prepared.jobId);
+        break;
+      }
+      const segment = prepared.segment;
       state.playingBlock = segment.index;
       state.selectedBlock = segment.index;
-      updatePlayer(segment, "高质量非流式 · 正在生成", null);
+      updatePlayer(segment, `高质量 AAC ${selectedBookBitrate()} · 双路预取`, prepared.seed);
       renderCurrentChapter();
       scrollPlayingBlock();
-      const form = streamForm(segment);
-      form.set("streaming_generation", "0");
-      form.set("qwen_non_streaming_mode", "1");
-      form.set("ephemeral_audio", "1");
-      const started = await jsonFetch("/api/generate-stream/start", { method: "POST", body: form });
-      state.currentJob = started.job_id;
-      $("playback-seed").textContent = `Seed ${started.seed}${started.seed_mode === "random" ? " · 本次随机" : ""}`;
-      setActionsEnabled(true);
+      $("playback-seed").textContent = `Seed ${prepared.seed}${prepared.seedMode === "random" ? " · 本次随机" : ""}`;
+      if (index + 1 < segments.length) {
+        // While the current complete AAC block is playing, use the free
+        // generation lane to prepare exactly one following block.
+        pendingPreparation = queueQualityBlock(segments[index + 1], runId);
+      }
       try {
-        await waitForJob(started.job_id);
-        if (state.stopped || runId !== state.streamRunId) break;
-        $("playback-mode").textContent = `高质量 AAC ${selectedBookBitrate()}`;
-        await playTemporaryAAC(started.job_id);
+        await playTemporaryAAC(prepared);
         await savePlayback(segment.index, 0);
       } finally {
-        await removeTemporaryAudio(started.job_id);
-        if (state.currentJob === started.job_id) state.currentJob = "";
+        state.qualityAudio.pause();
+        state.qualityAudio.removeAttribute("src");
+        state.qualityAudio.load();
+        URL.revokeObjectURL(prepared.objectURL);
+        await removeTemporaryAudio(prepared.jobId);
       }
     }
   } catch (error) {
     if (!state.stopped && error.name !== "AbortError") toast(error.message, true);
   } finally {
+    if (pendingPreparation) {
+      const outcome = await pendingPreparation;
+      if (outcome.prepared) {
+        URL.revokeObjectURL(outcome.prepared.objectURL);
+        await removeTemporaryAudio(outcome.prepared.jobId);
+      }
+    }
     if (runId !== state.streamRunId) return;
     state.currentJob = "";
     state.playingBlock = null;
@@ -728,6 +840,18 @@ async function pollQualityGeneration() {
     if (state.book.state === "error") throw new Error(state.book.message || "生成失败");
     const stillRunning = state.book.state === "running" || state.book.state === "stopping";
     if (stillRunning) {
+      if (
+        state.book.state === "stopping"
+        && context.stopDeadline
+        && Date.now() > context.stopDeadline
+      ) {
+        state.qualityContext = null;
+        state.stopRequested = false;
+        state.playbackMode = "";
+        setActionsEnabled(true);
+        toast("服务端停止时间较长，已转为后台监控；已完成段落不会丢失", true);
+        return;
+      }
       state.pollTimer = window.setTimeout(pollQualityGeneration, 1200);
       return;
     }
@@ -736,8 +860,10 @@ async function pollQualityGeneration() {
     const playable = segments.filter((segment) => segment.status === "completed" && segment.audio_file);
     if (state.stopRequested || state.book.state === "paused" && completed < segments.length) {
       toast(`已停止生成；已保存 ${completed}/${segments.length} 个完整 AAC 文字块`);
-    } else {
+    } else if (state.book.final_audio) {
       toast(`《${context.title}》整本书已生成：${playable.length} 个 AAC 文字块，整书 M4A 已合并`);
+    } else {
+      toast(`《${context.title}》段落已完成，但整书文件尚未就绪`, true);
     }
     state.qualityContext = null;
     state.stopRequested = false;
@@ -862,7 +988,8 @@ async function playStreamingAudio(start) {
   if (!state.audioContext || state.audioContext.state === "closed") {
     state.audioContext = new AudioContextCtor({ sampleRate: start.sample_rate || 24000 });
   }
-  await state.audioContext.resume();
+  const audioContext = state.audioContext;
+  await audioContext.resume();
   $("play-toggle").textContent = "Ⅱ";
   state.streamAbort = new AbortController();
   const response = await fetch(`/api/generate-stream/${start.job_id}/audio`, { signal: state.streamAbort.signal });
@@ -870,10 +997,20 @@ async function playStreamingAudio(start) {
   const channels = Number(response.headers.get("X-Audio-Channels") || start.channels || 1);
   const sampleRate = Number(response.headers.get("X-Audio-Sample-Rate") || start.sample_rate || 24000);
   const reader = response.body.getReader();
-  let nextTime = state.audioContext.currentTime + 0.08;
+  let nextTime = audioContext.currentTime + 0.08;
   let remainder = new Uint8Array(0);
   while (true) {
-    const { value, done } = await reader.read();
+    let inactivityTimer;
+    const read = reader.read();
+    const timeout = new Promise((_, reject) => {
+      inactivityTimer = window.setTimeout(() => {
+        state.streamAbort?.abort();
+        reject(new Error("音频流超过 60 秒没有数据，已停止任务"));
+      }, 60_000);
+    });
+    const { value, done } = await Promise.race([read, timeout]).finally(() => {
+      window.clearTimeout(inactivityTimer);
+    });
     if (done || state.stopped) break;
     let bytes = value;
     if (remainder.length) {
@@ -889,21 +1026,35 @@ async function playStreamingAudio(start) {
     if (!usable) continue;
     const view = new DataView(bytes.buffer, bytes.byteOffset, usable);
     const frames = usable / frameBytes;
-    const buffer = state.audioContext.createBuffer(channels, frames, sampleRate);
+    while (
+      !state.stopped
+      && audioContext.state !== "closed"
+      && nextTime - audioContext.currentTime > 8
+    ) {
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    }
+    if (state.stopped || audioContext.state === "closed") break;
+    const buffer = audioContext.createBuffer(channels, frames, sampleRate);
     for (let channel = 0; channel < channels; channel += 1) {
       const output = buffer.getChannelData(channel);
       for (let frame = 0; frame < frames; frame += 1) {
         output[frame] = view.getInt16((frame * channels + channel) * 2, true) / 32768;
       }
     }
-    const source = state.audioContext.createBufferSource();
+    const source = audioContext.createBufferSource();
     source.buffer = buffer;
-    source.connect(state.audioContext.destination);
-    nextTime = Math.max(nextTime, state.audioContext.currentTime + 0.03);
+    const playbackRate = Number($("playback-rate").value || 1);
+    source.playbackRate.value = playbackRate;
+    source.connect(audioContext.destination);
+    nextTime = Math.max(nextTime, audioContext.currentTime + 0.03);
     source.start(nextTime);
-    nextTime += buffer.duration;
+    nextTime += buffer.duration / playbackRate;
   }
-  while (!state.stopped && state.audioContext.currentTime < nextTime - 0.04) {
+  while (
+    !state.stopped
+    && audioContext.state !== "closed"
+    && audioContext.currentTime < nextTime - 0.04
+  ) {
     await new Promise((resolve) => window.setTimeout(resolve, 80));
   }
 }
@@ -913,11 +1064,19 @@ async function stopPlayback(markStopped = true) {
   if (markStopped) state.stopped = true;
   window.clearTimeout(state.pollTimer);
   state.qualityQueue = [];
+  if (state.qualityPlaybackReject) {
+    state.qualityPlaybackReject(new DOMException("Stopped", "AbortError"));
+    state.qualityPlaybackReject = null;
+  }
   state.qualityAudio.pause();
   state.qualityAudio.removeAttribute("src");
+  state.qualityAudio.load();
   if (state.streamAbort) state.streamAbort.abort();
   state.streamAbort = null;
-  if (state.currentJob) {
+  if (state.qualityJobs.size) {
+    const jobIds = [...state.qualityJobs];
+    await Promise.all(jobIds.map((jobId) => removeTemporaryAudio(jobId)));
+  } else if (state.currentJob) {
     const cleanupPath = state.playbackMode === "quality-online"
       ? `/api/generate-stream/${state.currentJob}/ephemeral-audio`
       : `/api/generate-stream/${state.currentJob}/close`;
@@ -939,7 +1098,7 @@ async function stopCurrentGeneration() {
   const documentActive = Boolean(state.book && ["running", "stopping"].includes(state.book.state));
   state.stopRequested = true;
   try {
-    if (streamJobId) {
+    if (state.playbackMode !== "quality-online" && streamJobId) {
       const path = state.playbackMode === "quality-online"
         ? `/api/generate-stream/${encodeURIComponent(streamJobId)}/ephemeral-audio`
         : `/api/generate-stream/${encodeURIComponent(streamJobId)}/close`;
@@ -957,6 +1116,7 @@ async function stopCurrentGeneration() {
       renderBook();
       setActionsEnabled(true);
       if (state.qualityContext) {
+        state.qualityContext.stopDeadline = Date.now() + 120_000;
         state.pollTimer = window.setTimeout(pollQualityGeneration, 450);
       }
     } else {
@@ -1082,7 +1242,21 @@ function bindEvents() {
       $("toc-toggle").setAttribute("aria-expanded", "false");
     }
   });
-  window.addEventListener("beforeunload", () => stopPlayback());
+  window.addEventListener("pagehide", () => {
+    const ephemeralJobs = [...state.qualityJobs];
+    for (const jobId of ephemeralJobs) {
+      navigator.sendBeacon(
+        `/api/generate-stream/${encodeURIComponent(jobId)}/ephemeral-audio/close`,
+        new Blob([], { type: "application/octet-stream" })
+      );
+    }
+    if (state.currentJob && !state.qualityJobs.has(state.currentJob)) {
+      navigator.sendBeacon(
+        `/api/generate-stream/${encodeURIComponent(state.currentJob)}/close`,
+        new Blob([], { type: "application/octet-stream" })
+      );
+    }
+  });
 }
 
 async function init() {
@@ -1103,7 +1277,13 @@ async function init() {
       loadServiceSettings().catch(() => {});
     }, 5000);
     window.setInterval(() => {
-      if (state.book && ["running", "stopping"].includes(state.book.state)) refreshCurrentBook(true).catch(() => {});
+      if (
+        state.book
+        && ["running", "stopping"].includes(state.book.state)
+        && !state.qualityContext
+      ) {
+        refreshCurrentBook(true).catch(() => {});
+      }
     }, 1600);
   } catch (error) {
     toast(error.message, true);

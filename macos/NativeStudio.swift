@@ -1,6 +1,8 @@
 import AppKit
 import AVFoundation
+import CoreMedia
 import Foundation
+import ScreenCaptureKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -22,6 +24,30 @@ struct NativeVoice: Identifiable, Hashable {
         self.language = value["language"] as? String ?? "Chinese"
         self.transcript = value["transcript"] as? String ?? ""
         self.transcriptSource = value["transcript_source"] as? String ?? ""
+    }
+}
+
+struct NativeReferenceAudio: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let path: String
+    let kind: String
+    let hidden: Bool
+    let inUse: Bool
+    let usages: [String]
+
+    init?(_ value: [String: Any]) {
+        guard let id = value["id"] as? String,
+              let path = (value["path"] ?? value["audio_path"]) as? String,
+              !id.isEmpty, !path.isEmpty
+        else { return nil }
+        self.id = id
+        self.name = value["name"] as? String ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        self.path = path
+        self.kind = value["kind"] as? String ?? "custom"
+        self.hidden = value["hidden"] as? Bool ?? false
+        self.inUse = value["in_use"] as? Bool ?? false
+        self.usages = value["usages"] as? [String] ?? []
     }
 }
 
@@ -65,6 +91,334 @@ enum NativeStudioError: LocalizedError {
     }
 }
 
+final class NativePCMStreamPlayer: NSObject, URLSessionDataDelegate {
+    private let engine = AVAudioEngine()
+    private let node = AVAudioPlayerNode()
+    private let format: AVAudioFormat
+    private let request: URLRequest
+    private let lock = NSLock()
+    private var session: URLSession?
+    private var remainder = Data()
+    private var pendingBuffers = 0
+    private var networkFinished = false
+    private var stopped = false
+    private var receivedFirstAudio = false
+    private var responseError: Error?
+
+    var onFirstAudio: (() -> Void)?
+    var onComplete: (() -> Void)?
+    var onError: ((Error) -> Void)?
+
+    init(request: URLRequest, sampleRate: Double, channels: AVAudioChannelCount) throws {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: max(1, channels),
+            interleaved: false
+        ) else {
+            throw NativeStudioError.server("无法创建 PCM 播放格式。")
+        }
+        self.request = request
+        self.format = format
+        super.init()
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+        try engine.start()
+        node.play()
+    }
+
+    func start() {
+        let queue = OperationQueue()
+        queue.name = "qwen-native-pcm-stream"
+        queue.maxConcurrentOperationCount = 1
+        let session = URLSession(
+            configuration: .ephemeral,
+            delegate: self,
+            delegateQueue: queue
+        )
+        self.session = session
+        session.dataTask(with: request).resume()
+    }
+
+    func stop() {
+        lock.lock()
+        let shouldStop = !stopped
+        stopped = true
+        lock.unlock()
+        guard shouldStop else { return }
+        session?.invalidateAndCancel()
+        node.stop()
+        engine.stop()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            responseError = NativeStudioError.server("PCM 音频流连接失败。")
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        lock.lock()
+        let isStopped = stopped
+        lock.unlock()
+        guard !isStopped else { return }
+
+        var bytes = remainder
+        bytes.append(data)
+        let frameBytes = Int(format.channelCount) * 2
+        let usable = bytes.count - (bytes.count % frameBytes)
+        guard usable > 0 else {
+            remainder = bytes
+            return
+        }
+        remainder = bytes.subdata(in: usable ..< bytes.count)
+        let frameCount = usable / frameBytes
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(frameCount)
+        ), let channels = buffer.floatChannelData else {
+            return
+        }
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        bytes.withUnsafeBytes { raw in
+            let source = raw.bindMemory(to: UInt8.self)
+            for frame in 0 ..< frameCount {
+                for channel in 0 ..< Int(format.channelCount) {
+                    let offset = (frame * Int(format.channelCount) + channel) * 2
+                    let bits = UInt16(source[offset]) | (UInt16(source[offset + 1]) << 8)
+                    channels[channel][frame] = Float(Int16(bitPattern: bits)) / 32768.0
+                }
+            }
+        }
+
+        lock.lock()
+        pendingBuffers += 1
+        let announceFirstAudio = !receivedFirstAudio
+        receivedFirstAudio = true
+        lock.unlock()
+        if announceFirstAudio {
+            DispatchQueue.main.async { [weak self] in self?.onFirstAudio?() }
+        }
+        node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            self?.bufferDidFinish()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        lock.lock()
+        networkFinished = true
+        let isStopped = stopped
+        let failure = responseError ?? error
+        let pending = pendingBuffers
+        lock.unlock()
+        if let failure, !isStopped {
+            DispatchQueue.main.async { [weak self] in self?.onError?(failure) }
+            stop()
+        } else if !isStopped && pending == 0 {
+            finishPlayback()
+        }
+    }
+
+    private func bufferDidFinish() {
+        lock.lock()
+        pendingBuffers = max(0, pendingBuffers - 1)
+        let shouldFinish = networkFinished && pendingBuffers == 0 && !stopped
+        lock.unlock()
+        if shouldFinish { finishPlayback() }
+    }
+
+    private func finishPlayback() {
+        lock.lock()
+        guard !stopped else {
+            lock.unlock()
+            return
+        }
+        stopped = true
+        lock.unlock()
+        session?.finishTasksAndInvalidate()
+        node.stop()
+        engine.stop()
+        DispatchQueue.main.async { [weak self] in self?.onComplete?() }
+    }
+}
+
+final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
+    private let sampleQueue = DispatchQueue(label: "qwen-system-audio-capture")
+    private var stream: SCStream?
+    private var writer: AVAssetWriter?
+    private var writerInput: AVAssetWriterInput?
+    private var outputURL: URL?
+    private var startedWriting = false
+    private var intentionallyStopping = false
+    private var completion: ((Result<URL, Error>) -> Void)?
+    var onUnexpectedError: ((Error) -> Void)?
+
+    func start(completion: @escaping (Result<Void, Error>) -> Void) {
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false,
+                    onScreenWindowsOnly: true
+                )
+                guard let display = content.displays.first else {
+                    throw NativeStudioError.server("没有找到可捕获的显示器。")
+                }
+                let ownApplications = content.applications.filter {
+                    $0.bundleIdentifier == Bundle.main.bundleIdentifier
+                }
+                let filter = SCContentFilter(
+                    display: display,
+                    excludingApplications: ownApplications,
+                    exceptingWindows: []
+                )
+                let configuration = SCStreamConfiguration()
+                configuration.capturesAudio = true
+                configuration.excludesCurrentProcessAudio = true
+                configuration.sampleRate = 48_000
+                configuration.channelCount = 1
+                configuration.width = 2
+                configuration.height = 2
+                configuration.showsCursor = false
+
+                let outputURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("qwen-system-audio-\(UUID().uuidString).m4a")
+                let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
+                let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
+                self.outputURL = outputURL
+                self.writer = writer
+                self.stream = stream
+                self.intentionallyStopping = false
+                try await stream.startCapture()
+                DispatchQueue.main.async { completion(.success(())) }
+            } catch {
+                reset(removeOutput: true)
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+
+    func stop(completion: @escaping (Result<URL, Error>) -> Void) {
+        intentionallyStopping = true
+        self.completion = completion
+        guard let stream else {
+            finishWriting()
+            return
+        }
+        Task {
+            do {
+                try await stream.stopCapture()
+                sampleQueue.async { [weak self] in self?.finishWriting() }
+            } catch {
+                sampleQueue.async { [weak self] in self?.complete(.failure(error)) }
+            }
+        }
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of outputType: SCStreamOutputType
+    ) {
+        guard outputType == .audio, sampleBuffer.isValid,
+              CMSampleBufferDataIsReady(sampleBuffer),
+              let writer
+        else { return }
+        if writerInput == nil {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderBitRateKey: 128_000,
+            ]
+            let input = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: settings,
+                sourceFormatHint: CMSampleBufferGetFormatDescription(sampleBuffer)
+            )
+            input.expectsMediaDataInRealTime = true
+            guard writer.canAdd(input) else { return }
+            writer.add(input)
+            writerInput = input
+        }
+        if !startedWriting {
+            guard writer.startWriting() else { return }
+            writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            startedWriting = true
+        }
+        if writerInput?.isReadyForMoreMediaData == true {
+            writerInput?.append(sampleBuffer)
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard !intentionallyStopping else { return }
+        sampleQueue.async { [weak self] in
+            guard let self else { return }
+            let handler = self.onUnexpectedError
+            self.reset(removeOutput: true)
+            DispatchQueue.main.async { handler?(error) }
+        }
+    }
+
+    private func finishWriting() {
+        guard let writer, let outputURL else {
+            complete(.failure(NativeStudioError.server("没有捕获到系统声音。请先播放声音再停止录制。")))
+            return
+        }
+        guard startedWriting else {
+            complete(.failure(NativeStudioError.server("没有捕获到系统声音。请先播放声音再停止录制。")))
+            return
+        }
+        writerInput?.markAsFinished()
+        writer.finishWriting { [weak self] in
+            guard let self else { return }
+            if writer.status == .completed {
+                self.complete(.success(outputURL), removeOutput: false)
+            } else {
+                self.complete(
+                    .failure(writer.error ?? NativeStudioError.server("系统声音录制写入失败。"))
+                )
+            }
+        }
+    }
+
+    private func complete(_ result: Result<URL, Error>, removeOutput: Bool = true) {
+        let completion = completion
+        reset(removeOutput: removeOutput)
+        DispatchQueue.main.async { completion?(result) }
+    }
+
+    private func reset(removeOutput: Bool) {
+        if removeOutput, let outputURL {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+        stream = nil
+        writer = nil
+        writerInput = nil
+        outputURL = nil
+        startedWriting = false
+        intentionallyStopping = false
+        completion = nil
+    }
+}
+
 final class NativeStudioViewModel: ObservableObject {
     @Published var serviceSummary = "正在启动本地服务…"
     @Published var serviceReady = false
@@ -102,12 +456,27 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var outputAudioURL: URL?
     @Published var isImportingReference = false
     @Published var isRecordingReference = false
+    @Published var referenceLibrary: [NativeReferenceAudio] = []
+    @Published var referenceLibraryPresented = false
+    @Published var pendingReferenceDeletion: NativeReferenceAudio?
+    @Published var isRecordingSystemAudio = false
+    @Published var isPreparingSystemAudioCapture = false
+    @Published var systemAudioStatus = "可录制 Mac 正在播放的声音"
+    @Published var systemAudioElapsed: TimeInterval = 0
+    @Published var systemAudioTrimPresented = false
+    @Published var systemAudioDuration: TimeInterval = 0
+    @Published var systemAudioTrimStart: TimeInterval = 0
+    @Published var systemAudioTrimEnd: TimeInterval = 0
+    @Published var systemAudioWaveform: [Float] = []
+    @Published var systemAudioName = ""
+    @Published var isExportingSystemAudio = false
     @Published var isSavingPreset = false
     @Published var advancedSettingsPresented = false
     @Published var externalAPISettingsPresented = false
     @Published var externalAccessEnabled = false
     @Published var externalPort = 7861
     @Published var externalPassword = ""
+    @Published var externalCORSOrigins = ""
     @Published var externalSettingsStatus = ""
     @Published var isApplyingExternalSettings = false
 
@@ -115,19 +484,38 @@ final class NativeStudioViewModel: ObservableObject {
     var onPresetsChanged: (([NativePreset]) -> Void)?
     private var pollingTimer: Timer?
     private var currentJobID: String?
+    private var stoppedJobIDs: Set<String> = []
+    private var pcmStreamPlayer: NativePCMStreamPlayer?
+    private var generationFinished = false
+    private var streamPlaybackFinished = false
+    private var resultDownloaded = false
     private var player: AVPlayer?
     private var recorder: AVAudioRecorder?
     private var recordingURL: URL?
+    private var systemAudioRecorder: SystemAudioRecorder?
+    private var systemAudioRecordingURL: URL?
+    private var systemAudioTimer: Timer?
+    private var systemAudioStartedAt: Date?
 
     init(service: LocalService) {
         self.service = service
         self.externalAccessEnabled = service.configuration["HOST"] == "0.0.0.0"
         self.externalPort = service.port
         self.externalPassword = service.configuration["QWEN_TTS_ACCESS_PASSWORD"] ?? ""
+        self.externalCORSOrigins = service.configuration["QWEN_TTS_CORS_ORIGINS"] ?? ""
     }
 
     deinit {
         pollingTimer?.invalidate()
+        pcmStreamPlayer?.stop()
+        removeTemporaryOutput()
+        if let recordingURL {
+            try? FileManager.default.removeItem(at: recordingURL)
+        }
+        systemAudioTimer?.invalidate()
+        if let systemAudioRecordingURL {
+            try? FileManager.default.removeItem(at: systemAudioRecordingURL)
+        }
     }
 
     func updateHealth(_ health: [String: Any]) {
@@ -146,6 +534,7 @@ final class NativeStudioViewModel: ObservableObject {
 
     func loadInitialData() {
         loadVoices()
+        loadReferenceLibrary()
         refreshPresets()
         loadActiveServiceSettings()
     }
@@ -224,12 +613,22 @@ final class NativeStudioViewModel: ObservableObject {
             externalSettingsStatus = "访问密码不能包含换行符"
             return
         }
+        if externalAccessEnabled && (password.count < 4 || password == "change-me") {
+            externalSettingsStatus = "局域网模式需要至少 4 位且不是 change-me 的密码"
+            return
+        }
+        let corsOrigins = externalCORSOrigins.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !corsOrigins.contains("\n"), !corsOrigins.contains("\r") else {
+            externalSettingsStatus = "网页来源不能包含换行符"
+            return
+        }
         isApplyingExternalSettings = true
         externalSettingsStatus = "正在保存并重启语音服务…"
         service.applyExternalSettings(
             exposeToLAN: externalAccessEnabled,
             port: externalPort,
-            password: password
+            password: password,
+            corsOrigins: corsOrigins
         ) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -237,6 +636,7 @@ final class NativeStudioViewModel: ObservableObject {
                 switch result {
                 case .success(let health):
                     self.externalPassword = password
+                    self.externalCORSOrigins = corsOrigins
                     self.updateHealth(health)
                     self.loadInitialData()
                     self.externalSettingsStatus = "设置已生效，TTS/STT 服务已重新就绪"
@@ -262,6 +662,86 @@ final class NativeStudioViewModel: ObservableObject {
                     } else if voices.contains(where: { $0.audioPath == self.referenceAudioPath }) {
                         self.selectedVoicePath = self.referenceAudioPath
                     }
+                }
+            } catch {
+                self.show(error)
+            }
+        }
+    }
+
+    func loadReferenceLibrary() {
+        service.perform("api/reference-audio-library?include_hidden=true") { [weak self] data, response in
+            guard let self else { return }
+            do {
+                let payload = try self.jsonObject(data, response: response)
+                let references = (payload["references"] as? [[String: Any]] ?? [])
+                    .compactMap(NativeReferenceAudio.init)
+                DispatchQueue.main.async { self.referenceLibrary = references }
+            } catch {
+                self.show(error)
+            }
+        }
+    }
+
+    func useReference(_ reference: NativeReferenceAudio) {
+        referenceAudioPath = reference.path
+        referenceName = reference.name
+        selectedVoicePath = voices.contains(where: { $0.audioPath == reference.path })
+            ? reference.path
+            : ""
+        if cloneMode == "icl",
+           let voice = voices.first(where: { $0.audioPath == reference.path }) {
+            referenceText = voice.transcript
+        } else {
+            referenceText = ""
+        }
+        errorMessage = ""
+    }
+
+    func previewReference(_ reference: NativeReferenceAudio) {
+        play(URL(fileURLWithPath: reference.path))
+    }
+
+    func setReferenceHidden(_ reference: NativeReferenceAudio, hidden: Bool) {
+        let body = try? JSONSerialization.data(withJSONObject: ["hidden": hidden])
+        service.perform(
+            "api/reference-audio-library/\(reference.id)/visibility",
+            method: "PUT",
+            body: body,
+            contentType: "application/json"
+        ) { [weak self] data, response in
+            guard let self else { return }
+            do {
+                _ = try self.jsonObject(data, response: response)
+                DispatchQueue.main.async {
+                    self.loadReferenceLibrary()
+                    self.loadVoices()
+                }
+            } catch {
+                self.show(error)
+            }
+        }
+    }
+
+    func deleteReference(_ reference: NativeReferenceAudio) {
+        guard reference.kind == "custom" else {
+            show(NativeStudioError.server("内置参考音频只能隐藏，不能删除。"))
+            return
+        }
+        guard reference.path != referenceAudioPath else {
+            show(NativeStudioError.server("正在编辑的音色不能删除，请先选择其他参考音色。"))
+            return
+        }
+        service.perform(
+            "api/reference-audio-library/\(reference.id)",
+            method: "DELETE"
+        ) { [weak self] data, response in
+            guard let self else { return }
+            do {
+                _ = try self.jsonObject(data, response: response)
+                DispatchQueue.main.async {
+                    self.loadReferenceLibrary()
+                    self.loadVoices()
                 }
             } catch {
                 self.show(error)
@@ -322,7 +802,7 @@ final class NativeStudioViewModel: ObservableObject {
         importReference(url)
     }
 
-    func importReference(_ url: URL) {
+    func importReference(_ url: URL, displayName: String? = nil) {
         guard let fileData = try? Data(contentsOf: url) else {
             show(NativeStudioError.server("无法读取参考音频。"))
             return
@@ -330,8 +810,21 @@ final class NativeStudioViewModel: ObservableObject {
         isImportingReference = true
         let multipart = multipartBody(
             fields: [:],
-            file: ("audio", url.lastPathComponent, "application/octet-stream", fileData)
+            file: (
+                "audio",
+                "\(displayName ?? url.deletingPathExtension().lastPathComponent).\(url.pathExtension)",
+                "application/octet-stream",
+                fileData
+            )
         )
+        if url.deletingLastPathComponent() == FileManager.default.temporaryDirectory {
+            if url.lastPathComponent.hasPrefix("qwen-reference-") {
+                recordingURL = nil
+                try? FileManager.default.removeItem(at: url)
+            } else if url.lastPathComponent.hasPrefix("qwen-system-export-") {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
         service.perform(
             "api/presets/reference-audio",
             method: "POST",
@@ -347,10 +840,11 @@ final class NativeStudioViewModel: ObservableObject {
                 }
                 DispatchQueue.main.async {
                     self.isImportingReference = false
-                    self.selectedVoicePath = ""
                     self.referenceAudioPath = path
-                    self.referenceName = url.deletingPathExtension().lastPathComponent
+                    self.referenceName = displayName ?? url.deletingPathExtension().lastPathComponent
                     self.referenceText = ""
+                    self.loadReferenceLibrary()
+                    self.loadVoices()
                 }
             } catch {
                 DispatchQueue.main.async { self.isImportingReference = false }
@@ -414,6 +908,221 @@ final class NativeStudioViewModel: ObservableObject {
         }
     }
 
+    func toggleSystemAudioRecording() {
+        guard !isPreparingSystemAudioCapture else { return }
+        if isRecordingSystemAudio {
+            stopSystemAudioRecording()
+        } else {
+            startSystemAudioRecording()
+        }
+    }
+
+    private func startSystemAudioRecording() {
+        player?.pause()
+        let recorder = SystemAudioRecorder()
+        systemAudioRecorder = recorder
+        isPreparingSystemAudioCapture = true
+        recorder.onUnexpectedError = { [weak self] error in
+            guard let self else { return }
+            self.systemAudioTimer?.invalidate()
+            self.systemAudioTimer = nil
+            self.systemAudioStartedAt = nil
+            self.systemAudioRecorder = nil
+            self.isRecordingSystemAudio = false
+            self.systemAudioStatus = "系统声音录制意外停止"
+            self.show(error)
+        }
+        systemAudioStatus = "正在请求系统录音权限…"
+        errorMessage = ""
+        recorder.start { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.isPreparingSystemAudioCapture = false
+                self.isRecordingSystemAudio = true
+                self.systemAudioElapsed = 0
+                self.systemAudioStartedAt = Date()
+                self.systemAudioStatus = "正在录制系统播放声音，点击停止才会结束"
+                self.systemAudioTimer?.invalidate()
+                self.systemAudioTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) {
+                    [weak self] _ in
+                    guard let self, let startedAt = self.systemAudioStartedAt else { return }
+                    self.systemAudioElapsed = Date().timeIntervalSince(startedAt)
+                }
+            case .failure(let error):
+                self.isPreparingSystemAudioCapture = false
+                self.systemAudioRecorder = nil
+                self.systemAudioStatus = "系统声音录制未启动"
+                self.show(
+                    NativeStudioError.server(
+                        "\(error.localizedDescription)\n请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许 Qwen TTS。首次授权后可能需要重新打开应用。"
+                    )
+                )
+            }
+        }
+    }
+
+    private func stopSystemAudioRecording() {
+        guard let recorder = systemAudioRecorder else { return }
+        isRecordingSystemAudio = false
+        systemAudioTimer?.invalidate()
+        systemAudioTimer = nil
+        systemAudioStartedAt = nil
+        systemAudioStatus = "正在整理录音…"
+        recorder.stop { [weak self] result in
+            guard let self else { return }
+            self.systemAudioRecorder = nil
+            switch result {
+            case .success(let url):
+                self.prepareSystemAudioForTrimming(url)
+            case .failure(let error):
+                self.systemAudioStatus = "录制失败"
+                self.show(error)
+            }
+        }
+    }
+
+    private func prepareSystemAudioForTrimming(_ url: URL) {
+        systemAudioRecordingURL = url
+        let asset = AVURLAsset(url: url)
+        let duration = CMTimeGetSeconds(asset.duration)
+        guard duration.isFinite, duration > 0.1 else {
+            try? FileManager.default.removeItem(at: url)
+            systemAudioRecordingURL = nil
+            systemAudioStatus = "没有捕获到可用声音"
+            show(NativeStudioError.server("录音太短或没有捕获到系统声音。"))
+            return
+        }
+        systemAudioDuration = duration
+        systemAudioTrimStart = 0
+        systemAudioTrimEnd = duration
+        systemAudioName = "系统录音 \(Self.recordingDateFormatter.string(from: Date()))"
+        systemAudioWaveform = []
+        systemAudioStatus = "录制完成，可裁剪后加入参考音频"
+        systemAudioTrimPresented = true
+        analyzeWaveform(url)
+    }
+
+    private func analyzeWaveform(_ url: URL) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let file = try AVAudioFile(
+                    forReading: url,
+                    commonFormat: .pcmFormatFloat32,
+                    interleaved: false
+                )
+                let bucketCount = 180
+                let framesPerBucket = max(1, Int(file.length) / bucketCount)
+                var peaks: [Float] = []
+                while file.framePosition < file.length && peaks.count < bucketCount {
+                    let remaining = Int(file.length - file.framePosition)
+                    let count = min(framesPerBucket, remaining)
+                    guard let buffer = AVAudioPCMBuffer(
+                        pcmFormat: file.processingFormat,
+                        frameCapacity: AVAudioFrameCount(count)
+                    ) else { break }
+                    try file.read(into: buffer, frameCount: AVAudioFrameCount(count))
+                    guard let channels = buffer.floatChannelData else { break }
+                    var peak: Float = 0
+                    for channel in 0 ..< Int(buffer.format.channelCount) {
+                        for frame in 0 ..< Int(buffer.frameLength) {
+                            peak = max(peak, abs(channels[channel][frame]))
+                        }
+                    }
+                    peaks.append(min(1, peak))
+                }
+                DispatchQueue.main.async { self?.systemAudioWaveform = peaks }
+            } catch {
+                DispatchQueue.main.async { self?.systemAudioWaveform = [] }
+            }
+        }
+    }
+
+    func previewSystemAudioSelection() {
+        guard let url = systemAudioRecordingURL else { return }
+        let item = AVPlayerItem(url: url)
+        item.forwardPlaybackEndTime = CMTime(seconds: systemAudioTrimEnd, preferredTimescale: 600)
+        player = AVPlayer(playerItem: item)
+        player?.seek(to: CMTime(seconds: systemAudioTrimStart, preferredTimescale: 600))
+        player?.play()
+    }
+
+    func stopPreview() {
+        player?.pause()
+        player = nil
+    }
+
+    func discardSystemAudioRecording() {
+        stopPreview()
+        if let systemAudioRecordingURL {
+            try? FileManager.default.removeItem(at: systemAudioRecordingURL)
+        }
+        systemAudioRecordingURL = nil
+        systemAudioTrimPresented = false
+        systemAudioStatus = "可录制 Mac 正在播放的声音"
+        systemAudioWaveform = []
+    }
+
+    func exportSystemAudioSelection() {
+        guard let sourceURL = systemAudioRecordingURL else { return }
+        let start = max(0, systemAudioTrimStart)
+        let duration = max(0, systemAudioTrimEnd - start)
+        guard duration >= 0.25 else {
+            show(NativeStudioError.server("请至少保留 0.25 秒音频。"))
+            return
+        }
+        let safeName = systemAudioName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-system-export-\(UUID().uuidString).m4a")
+        let asset = AVURLAsset(url: sourceURL)
+        guard let exporter = AVAssetExportSession(
+            asset: asset,
+            presetName: AVAssetExportPresetAppleM4A
+        ) else {
+            show(NativeStudioError.server("无法创建音频裁剪任务。"))
+            return
+        }
+        exporter.outputURL = outputURL
+        exporter.outputFileType = .m4a
+        exporter.timeRange = CMTimeRange(
+            start: CMTime(seconds: start, preferredTimescale: 600),
+            duration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+        isExportingSystemAudio = true
+        exporter.exportAsynchronously { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isExportingSystemAudio = false
+                guard exporter.status == .completed else {
+                    try? FileManager.default.removeItem(at: outputURL)
+                    self.show(
+                        exporter.error ?? NativeStudioError.server("裁剪后的音频导出失败。")
+                    )
+                    return
+                }
+                self.stopPreview()
+                if let source = self.systemAudioRecordingURL {
+                    try? FileManager.default.removeItem(at: source)
+                }
+                self.systemAudioRecordingURL = nil
+                self.systemAudioTrimPresented = false
+                self.systemAudioStatus = "已导出并加入参考音频"
+                self.importReference(
+                    outputURL,
+                    displayName: safeName.isEmpty ? "系统录音" : safeName
+                )
+            }
+        }
+    }
+
+    private static let recordingDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        return formatter
+    }()
+
     func playReference() {
         guard !referenceAudioPath.isEmpty else {
             show(NativeStudioError.missingReference)
@@ -433,6 +1142,7 @@ final class NativeStudioViewModel: ObservableObject {
     }
 
     func generate() {
+        guard !isGenerating else { return }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             show(NativeStudioError.emptyText)
             return
@@ -446,6 +1156,9 @@ final class NativeStudioViewModel: ObservableObject {
             return
         }
         stopPolling()
+        pcmStreamPlayer?.stop()
+        pcmStreamPlayer = nil
+        removeTemporaryOutput()
         outputAudioURL = nil
         isGenerating = true
         generatedProgress = 0
@@ -454,6 +1167,9 @@ final class NativeStudioViewModel: ObservableObject {
         actualGenerationSeed = nil
         submittedSeedSetting = nil
         currentJobDisplayID = ""
+        generationFinished = false
+        streamPlaybackFinished = false
+        resultDownloaded = false
         let requestedSeed = seed
         let fields: [String: String] = [
             "mode": "voice_clone",
@@ -493,12 +1209,22 @@ final class NativeStudioViewModel: ObservableObject {
                     throw NativeStudioError.invalidResponse
                 }
                 let resolvedSeed = self.number(payload["seed"]).intValue
+                let sampleRate = self.number(payload["sample_rate"]).doubleValue
+                let channels = self.number(payload["channels"]).intValue
                 DispatchQueue.main.async {
                     self.currentJobID = jobID
+                    self.stoppedJobIDs.remove(jobID)
                     self.currentJobDisplayID = String(jobID.prefix(8))
                     self.submittedSeedSetting = requestedSeed
                     self.actualGenerationSeed = resolvedSeed
                     self.generationSummary = "任务已排队"
+                    if self.streamingGeneration {
+                        self.startPCMStream(
+                            jobID,
+                            sampleRate: max(8_000, sampleRate),
+                            channels: max(1, channels)
+                        )
+                    }
                     self.startPolling(jobID)
                 }
             } catch {
@@ -510,10 +1236,55 @@ final class NativeStudioViewModel: ObservableObject {
 
     func stopGeneration() {
         guard let currentJobID else { return }
+        stoppedJobIDs.insert(currentJobID)
         service.perform("api/generate-stream/\(currentJobID)/close", method: "POST") { _, _ in }
+        pcmStreamPlayer?.stop()
+        pcmStreamPlayer = nil
         stopPolling()
         isGenerating = false
+        self.currentJobID = nil
         generationSummary = "已停止当前生成"
+    }
+
+    private func startPCMStream(_ jobID: String, sampleRate: Double, channels: Int) {
+        do {
+            let request = service.authorizedRequest(
+                "api/generate-stream/\(jobID)/audio",
+                timeout: 600
+            )
+            let stream = try NativePCMStreamPlayer(
+                request: request,
+                sampleRate: sampleRate,
+                channels: AVAudioChannelCount(channels)
+            )
+            stream.onFirstAudio = { [weak self] in
+                guard let self, self.currentJobID == jobID else { return }
+                self.generationSummary = "正在边生成边播放 PCM 音频…"
+            }
+            stream.onComplete = { [weak self] in
+                guard let self, self.currentJobID == jobID else { return }
+                self.streamPlaybackFinished = true
+                self.finishStreamingGenerationIfReady()
+            }
+            stream.onError = { [weak self] error in
+                guard let self, self.currentJobID == jobID,
+                      !self.stoppedJobIDs.contains(jobID)
+                else { return }
+                self.service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
+                self.stopPolling()
+                self.isGenerating = false
+                self.currentJobID = nil
+                self.show(error)
+            }
+            pcmStreamPlayer = stream
+            stream.start()
+        } catch {
+            service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
+            stopPolling()
+            isGenerating = false
+            currentJobID = nil
+            show(error)
+        }
     }
 
     private func startPolling(_ jobID: String) {
@@ -534,6 +1305,7 @@ final class NativeStudioViewModel: ObservableObject {
                 let audioSeconds = self.number(payload["emitted_audio_seconds"]).doubleValue
                 let resolvedSeed = payload["seed"] == nil ? nil : self.number(payload["seed"]).intValue
                 DispatchQueue.main.async {
+                    guard self.currentJobID == jobID else { return }
                     if let resolvedSeed {
                         self.actualGenerationSeed = resolvedSeed
                     }
@@ -541,11 +1313,19 @@ final class NativeStudioViewModel: ObservableObject {
                     self.generationSummary = "\(self.nativeStateLabel(state)) · \(Int(generated))/\(Int(maximum)) 帧 · \(String(format: "%.1f", audioSeconds)) 秒音频"
                     if state == "finished" {
                         self.stopPolling()
-                        self.downloadResult(jobID)
+                        self.generationFinished = true
+                        self.downloadResult(jobID, autoPlay: !self.streamingGeneration)
                     } else if state == "error" || state == "closed" {
                         self.stopPolling()
                         self.isGenerating = false
-                        self.errorMessage = payload["error"] as? String ?? "生成任务失败。"
+                        self.pcmStreamPlayer?.stop()
+                        self.pcmStreamPlayer = nil
+                        if state == "closed" && self.stoppedJobIDs.contains(jobID) {
+                            self.generationSummary = "已停止当前生成"
+                        } else {
+                            self.errorMessage = payload["error"] as? String ?? "生成任务失败。"
+                        }
+                        self.currentJobID = nil
                     }
                 }
             } catch {
@@ -554,7 +1334,7 @@ final class NativeStudioViewModel: ObservableObject {
         }
     }
 
-    private func downloadResult(_ jobID: String) {
+    private func downloadResult(_ jobID: String, autoPlay: Bool) {
         generationSummary = "正在读取生成结果…"
         service.perform("api/generate-stream/\(jobID)/result-audio", timeout: 120) { [weak self] data, response in
             guard let self else { return }
@@ -569,16 +1349,42 @@ final class NativeStudioViewModel: ObservableObject {
                 try data.write(to: url, options: .atomic)
                 DispatchQueue.main.async {
                     self.outputAudioURL = url
-                    self.isGenerating = false
+                    self.resultDownloaded = true
                     self.generatedProgress = 1
-                    self.generationSummary = "生成完成，可以试听"
-                    self.playOutput()
+                    if autoPlay {
+                        self.isGenerating = false
+                        self.currentJobID = nil
+                        self.generationSummary = "生成完成，可以试听"
+                        self.playOutput()
+                    } else {
+                        self.generationSummary = self.streamPlaybackFinished
+                            ? "流式播放完成，可以再次试听"
+                            : "生成完成，正在播放剩余音频…"
+                        self.finishStreamingGenerationIfReady()
+                    }
                 }
             } catch {
                 self.show(error)
                 DispatchQueue.main.async { self.isGenerating = false }
             }
         }
+    }
+
+    private func finishStreamingGenerationIfReady() {
+        guard generationFinished, streamPlaybackFinished, resultDownloaded else { return }
+        isGenerating = false
+        currentJobID = nil
+        pcmStreamPlayer = nil
+        generatedProgress = 1
+        generationSummary = "流式播放完成，可以再次试听"
+    }
+
+    private func removeTemporaryOutput() {
+        guard let outputAudioURL,
+              outputAudioURL.deletingLastPathComponent() == FileManager.default.temporaryDirectory,
+              outputAudioURL.lastPathComponent.hasPrefix("qwen-tts-native-")
+        else { return }
+        try? FileManager.default.removeItem(at: outputAudioURL)
     }
 
     func applySelectedPreset() {
@@ -895,7 +1701,7 @@ private struct AdvancedSettingsView: View {
                     GroupBox("生成与流式") {
                         VStack(alignment: .leading, spacing: 13) {
                             Toggle("启用 PCM 流式输出", isOn: $model.streamingGeneration)
-                            Text("开启后，服务会在生成过程中持续提供音频块；关闭后只保留最终 WAV。")
+                            Text("开启后原生播放器会边生成边播放 PCM；关闭后等待最终 WAV 再试听。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             HStack(spacing: StudioTokens.space4) {
@@ -1021,11 +1827,27 @@ private struct ExternalAPISettingsView: View {
                             Text("客户端可使用 Authorization: Bearer 或 X-API-Key 请求头。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            if model.externalPassword.isEmpty {
-                                Label("密码为空会关闭 API 认证，不建议在局域网模式使用。", systemImage: "exclamationmark.triangle.fill")
+                            if model.externalPassword.isEmpty
+                                || (model.externalAccessEnabled && model.externalPassword.count < 4)
+                                || model.externalPassword == "change-me" {
+                                Label("局域网模式必须使用至少 4 位且不是 change-me 的密码。", systemImage: "exclamationmark.triangle.fill")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             }
+                        }
+                    }
+
+                    GroupBox("浏览器跨域") {
+                        VStack(alignment: .leading, spacing: StudioTokens.space2) {
+                            TextField(
+                                "例如 https://reader.example；多个来源用逗号分隔",
+                                text: $model.externalCORSOrigins
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .frame(height: StudioTokens.compactControlHeight)
+                            Text("留空仅允许同源网页；原生应用和命令行调用不受影响。输入 * 会允许任意网页来源。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
 
@@ -1104,6 +1926,246 @@ private struct ExternalAPISettingsView: View {
     }
 }
 
+struct SystemAudioWaveformView: View {
+    let samples: [Float]
+    let selectionStart: Double
+    let selectionEnd: Double
+
+    var body: some View {
+        Canvas { context, size in
+            let center = size.height / 2
+            let count = max(1, samples.count)
+            let width = size.width / CGFloat(count)
+            for (index, sample) in samples.enumerated() {
+                let height = max(2, CGFloat(sample) * size.height * 0.82)
+                let rect = CGRect(
+                    x: CGFloat(index) * width,
+                    y: center - height / 2,
+                    width: max(1, width * 0.58),
+                    height: height
+                )
+                context.fill(
+                    Path(roundedRect: rect, cornerRadius: 1),
+                    with: .color(.accentColor.opacity(0.82))
+                )
+            }
+            if selectionStart > 0 {
+                context.fill(
+                    Path(CGRect(x: 0, y: 0, width: size.width * selectionStart, height: size.height)),
+                    with: .color(.black.opacity(0.42))
+                )
+            }
+            if selectionEnd < 1 {
+                context.fill(
+                    Path(
+                        CGRect(
+                            x: size.width * selectionEnd,
+                            y: 0,
+                            width: size.width * (1 - selectionEnd),
+                            height: size.height
+                        )
+                    ),
+                    with: .color(.black.opacity(0.42))
+                )
+            }
+        }
+        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct SystemAudioTrimView: View {
+    @ObservedObject var model: NativeStudioViewModel
+
+    private func time(_ value: TimeInterval) -> String {
+        let total = max(0, Int(value.rounded()))
+        return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StudioTokens.space4) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("裁剪系统录音")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    Text("只保留声音稳定、背景干净的一段作为克隆参考。")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(time(model.systemAudioTrimStart)) – \(time(model.systemAudioTrimEnd))")
+                    .font(.system(.body, design: .monospaced).weight(.medium))
+            }
+
+            SystemAudioWaveformView(
+                samples: model.systemAudioWaveform,
+                selectionStart: model.systemAudioDuration > 0
+                    ? model.systemAudioTrimStart / model.systemAudioDuration : 0,
+                selectionEnd: model.systemAudioDuration > 0
+                    ? model.systemAudioTrimEnd / model.systemAudioDuration : 1
+            )
+            .frame(height: 150)
+            .overlay {
+                if model.systemAudioWaveform.isEmpty {
+                    ProgressView("正在分析波形…")
+                }
+            }
+
+            VStack(spacing: StudioTokens.space3) {
+                HStack {
+                    Text("起点")
+                        .frame(width: 44, alignment: .leading)
+                    Slider(
+                        value: $model.systemAudioTrimStart,
+                        in: 0 ... max(0.01, model.systemAudioTrimEnd - 0.25)
+                    )
+                    Text(time(model.systemAudioTrimStart))
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 48)
+                }
+                HStack {
+                    Text("终点")
+                        .frame(width: 44, alignment: .leading)
+                    Slider(
+                        value: $model.systemAudioTrimEnd,
+                        in: min(model.systemAudioDuration, model.systemAudioTrimStart + 0.25)
+                            ... max(model.systemAudioDuration, model.systemAudioTrimStart + 0.26)
+                    )
+                    Text(time(model.systemAudioTrimEnd))
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 48)
+                }
+            }
+
+            TextField("参考音频名称", text: $model.systemAudioName)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Button("试听选区") { model.previewSystemAudioSelection() }
+                    .buttonStyle(StudioSecondaryButtonStyle())
+                Button("停止试听") { model.stopPreview() }
+                    .buttonStyle(StudioSecondaryButtonStyle())
+                Spacer()
+                Button("丢弃", role: .destructive) { model.discardSystemAudioRecording() }
+                    .buttonStyle(StudioSecondaryButtonStyle(destructive: true))
+                    .disabled(model.isExportingSystemAudio)
+                Button {
+                    model.exportSystemAudioSelection()
+                } label: {
+                    Label(
+                        model.isExportingSystemAudio ? "正在导出…" : "导出并加入参考音频",
+                        systemImage: "square.and.arrow.down"
+                    )
+                }
+                .buttonStyle(StudioTintedButtonStyle())
+                .disabled(model.isExportingSystemAudio)
+            }
+        }
+        .padding(StudioTokens.space5)
+        .frame(width: 720, height: 500)
+        .background(StudioBackground())
+        .interactiveDismissDisabled(model.isExportingSystemAudio)
+    }
+}
+
+struct ReferenceAudioLibraryView: View {
+    @ObservedObject var model: NativeStudioViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StudioTokens.space4) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("参考音频管理")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    Text("隐藏的音频不会出现在音色选择菜单中，但不会影响已有预设。")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("完成") { model.referenceLibraryPresented = false }
+                    .buttonStyle(StudioTintedButtonStyle())
+            }
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: StudioTokens.space2) {
+                    ForEach(model.referenceLibrary) { reference in
+                        HStack(spacing: StudioTokens.space3) {
+                            Image(systemName: reference.kind == "builtin" ? "waveform.badge.plus" : "waveform")
+                                .foregroundStyle(reference.hidden ? Color.secondary : Color.accentColor)
+                                .frame(width: 24)
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(reference.name)
+                                        .font(.headline)
+                                    Text(reference.kind == "builtin" ? "内置" : "用户")
+                                        .font(.caption2.weight(.semibold))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.secondary.opacity(0.14), in: Capsule())
+                                    if reference.hidden {
+                                        Text("已隐藏")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                if reference.inUse {
+                                    Text("使用中 · \(reference.usages.joined(separator: "、"))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button {
+                                model.previewReference(reference)
+                            } label: {
+                                Image(systemName: "play.fill")
+                            }
+                            .buttonStyle(StudioToolbarButtonStyle())
+                            Button("使用") {
+                                model.useReference(reference)
+                                model.referenceLibraryPresented = false
+                            }
+                            .buttonStyle(StudioSecondaryButtonStyle())
+                            Button(reference.hidden ? "显示" : "隐藏") {
+                                model.setReferenceHidden(reference, hidden: !reference.hidden)
+                            }
+                            .buttonStyle(StudioSecondaryButtonStyle())
+                            if reference.kind == "custom" {
+                                Button(role: .destructive) {
+                                    model.pendingReferenceDeletion = reference
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(StudioSecondaryButtonStyle(destructive: true))
+                            }
+                        }
+                        .padding(StudioTokens.space3)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+            }
+        }
+        .padding(StudioTokens.space5)
+        .frame(width: 820, height: 600)
+        .background(StudioBackground())
+        .confirmationDialog(
+            "删除“\(model.pendingReferenceDeletion?.name ?? "")”？",
+            isPresented: Binding(
+                get: { model.pendingReferenceDeletion != nil },
+                set: { if !$0 { model.pendingReferenceDeletion = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("删除音频文件", role: .destructive) {
+                if let reference = model.pendingReferenceDeletion {
+                    model.deleteReference(reference)
+                }
+                model.pendingReferenceDeletion = nil
+            }
+            Button("取消", role: .cancel) { model.pendingReferenceDeletion = nil }
+        } message: {
+            Text("删除后无法恢复；被服务设置或预设引用的音频不会被删除。")
+        }
+    }
+}
+
 struct NativeStudioView: View {
     @ObservedObject var model: NativeStudioViewModel
 
@@ -1129,6 +2191,19 @@ struct NativeStudioView: View {
         }
         .sheet(isPresented: $model.externalAPISettingsPresented) {
             ExternalAPISettingsView(model: model)
+        }
+        .sheet(
+            isPresented: $model.systemAudioTrimPresented,
+            onDismiss: {
+                if !model.isExportingSystemAudio {
+                    model.discardSystemAudioRecording()
+                }
+            }
+        ) {
+            SystemAudioTrimView(model: model)
+        }
+        .sheet(isPresented: $model.referenceLibraryPresented) {
+            ReferenceAudioLibraryView(model: model)
         }
     }
 
@@ -1236,14 +2311,18 @@ struct NativeStudioView: View {
                                         .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(StudioSecondaryButtonStyle())
-                                Button {
-                                    model.chooseReferenceFile()
+                            Button {
+                                model.chooseReferenceFile()
                                 } label: {
                                     Label(model.isImportingReference ? "导入中…" : "导入音频", systemImage: "folder")
                                         .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(StudioSecondaryButtonStyle())
-                                .disabled(model.isImportingReference)
+                                .disabled(
+                                    model.isImportingReference
+                                        || model.isRecordingSystemAudio
+                                        || model.isPreparingSystemAudioCapture
+                                )
                             }
                             Button {
                                 model.toggleReferenceRecording()
@@ -1259,6 +2338,46 @@ struct NativeStudioView: View {
                                     destructive: model.isRecordingReference
                                 )
                             )
+                            .disabled(
+                                model.isRecordingSystemAudio
+                                    || model.isPreparingSystemAudioCapture
+                            )
+                            Button {
+                                model.toggleSystemAudioRecording()
+                            } label: {
+                                Label(
+                                    model.isPreparingSystemAudioCapture
+                                        ? "正在请求录音权限…"
+                                        : model.isRecordingSystemAudio
+                                        ? "停止系统声音录制 · \(Int(model.systemAudioElapsed)) 秒"
+                                        : "录制 Mac 播放声音",
+                                    systemImage: model.isRecordingSystemAudio
+                                        ? "stop.circle.fill"
+                                        : "macbook.and.iphone"
+                                )
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(
+                                StudioTintedButtonStyle(
+                                    destructive: model.isRecordingSystemAudio
+                                )
+                            )
+                            .disabled(
+                                model.isRecordingReference
+                                    || model.isImportingReference
+                                    || model.isPreparingSystemAudioCapture
+                            )
+                            Text(model.systemAudioStatus)
+                                .font(.caption)
+                                .foregroundStyle(model.isRecordingSystemAudio ? .red : .secondary)
+                            Button {
+                                model.loadReferenceLibrary()
+                                model.referenceLibraryPresented = true
+                            } label: {
+                                Label("管理参考音频", systemImage: "music.note.list")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(StudioSecondaryButtonStyle())
                         }
                     }
                 }

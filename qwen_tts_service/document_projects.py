@@ -658,6 +658,9 @@ class DocumentProjectManager:
                         except Exception as exc:
                             fatal_error = fatal_error or (index, exc)
                             continue
+                        if fatal_error is not None:
+                            self._discard_synthesis(project_id, index, synthesis)
+                            continue
                         with self._lock:
                             manifest = self._load(project_id)
                             segment = manifest["segments"][index]
@@ -694,6 +697,19 @@ class DocumentProjectManager:
 
                     if fatal_error is not None:
                         self._fail_segment(project_id, *fatal_error)
+                        with self._lock:
+                            manifest = self._load(project_id)
+                            failed_index = int(fatal_error[0])
+                            for segment in manifest["segments"]:
+                                if (
+                                    int(segment["index"]) != failed_index
+                                    and segment["status"] in {"generating", "encoding"}
+                                ):
+                                    segment["status"] = "pending"
+                                    segment["started_at"] = None
+                                    segment["error"] = None
+                            self._refresh_active_segments(manifest)
+                            self._save(manifest)
                         return
 
                     if stop_event.is_set():

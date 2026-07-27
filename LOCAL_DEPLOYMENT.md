@@ -43,8 +43,17 @@ settings in the native window.
 
 The native workspace includes model and clone-mode selection, the built-in
 voice catalog, reference-audio preview, local audio import, microphone
-recording, ICL transcript editing, seed and sampling controls, generation
-progress, stop control, and native playback of the generated WAV.
+recording, and ScreenCaptureKit system-audio recording. System audio continues
+until the user presses stop, then opens a native waveform editor for selection
+preview, trimming, naming, and M4A export into the persistent reference library.
+The library can preview, select, hide/restore, and delete user audio; built-in
+audio can be hidden but not deleted, and files still referenced by service
+settings or presets are protected from deletion. The first system-audio capture
+requires permission under **System Settings → Privacy & Security → Screen &
+System Audio Recording** and macOS may require reopening the app after approval.
+The workspace also includes ICL transcript editing, seed and sampling controls,
+generation progress, stop control, true PCM playback while generation is still
+running, and replay of the final generated WAV.
 
 For a headless/local-network service without the macOS window, keep using:
 
@@ -65,8 +74,10 @@ the 1.7B profile downloads its talker checkpoint. Stop with
 
 ## Unified TTS + STT background API
 
-The main service listens on `0.0.0.0:7861` by default, so any application on
-this Mac or the local network can use the API. The internal whisper.cpp server
+The main service listens on `127.0.0.1:7861` by default. Change `HOST` to
+`0.0.0.0` only when local-network access is required; the launcher refuses LAN
+exposure with an empty password, `change-me`, or a password shorter than four
+characters. The internal whisper.cpp server
 continues to listen only on `127.0.0.1:7890`; external clients always go
 through the authenticated main service.
 
@@ -77,10 +88,10 @@ Authorization: Bearer 1234
 X-API-Key: 1234
 ```
 
-Browser CORS preflight is enabled for all origins. This makes the service easy
-to call from local web apps, command-line programs, automation tools and native
-applications without removing authentication. Do not expose port 7861 directly
-to the public internet with the example password.
+Browser CORS is disabled by default because the reader is same-origin and
+native/command-line clients do not need it. To authorize specific browser apps,
+set `QWEN_TTS_CORS_ORIGINS=https://app.example,https://other.example`. Use `*`
+only on a trusted network and never expose the port directly to the internet.
 
 TTS uses the existing two-stage streaming protocol. Start a job, then consume
 the returned raw PCM endpoint while generation is still running:

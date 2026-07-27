@@ -11,6 +11,9 @@ final class LocalService {
     private(set) var port: Int
     private(set) var ownsProcess = false
     private var process: Process?
+    private var hasReachedReady = false
+    private var lastExitStatus: Int32?
+    var onUnexpectedTermination: ((Int32) -> Void)?
 
     var baseURL: URL {
         URL(string: "http://127.0.0.1:\(port)/")!
@@ -41,14 +44,13 @@ final class LocalService {
         perform(path, completion: completion)
     }
 
-    func perform(
+    func authorizedRequest(
         _ path: String,
         method: String = "GET",
         body: Data? = nil,
         contentType: String? = nil,
-        timeout: TimeInterval = 30,
-        completion: @escaping (Data?, HTTPURLResponse?) -> Void
-    ) {
+        timeout: TimeInterval = 30
+    ) -> URLRequest {
         let url = URL(string: path, relativeTo: baseURL)!
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -60,6 +62,24 @@ final class LocalService {
         if let cookieValue {
             request.setValue("\(serviceSessionCookie)=\(cookieValue)", forHTTPHeaderField: "Cookie")
         }
+        return request
+    }
+
+    func perform(
+        _ path: String,
+        method: String = "GET",
+        body: Data? = nil,
+        contentType: String? = nil,
+        timeout: TimeInterval = 30,
+        completion: @escaping (Data?, HTTPURLResponse?) -> Void
+    ) {
+        let request = authorizedRequest(
+            path,
+            method: method,
+            body: body,
+            contentType: contentType,
+            timeout: timeout
+        )
         URLSession.shared.dataTask(with: request) { data, response, _ in
             completion(data, response as? HTTPURLResponse)
         }.resume()
@@ -94,10 +114,15 @@ final class LocalService {
         exposeToLAN: Bool,
         port newPort: Int,
         password: String,
+        corsOrigins: String,
         completion: @escaping (Result<[String: Any], Error>) -> Void
     ) {
         guard (1024 ... 65_535).contains(newPort) else {
             completion(.failure(ServiceError.invalidPort))
+            return
+        }
+        if exposeToLAN && (password.count < 4 || password == "change-me") {
+            completion(.failure(ServiceError.insecureLANPassword))
             return
         }
         let environmentURL = repositoryRoot.appendingPathComponent(".env.macos")
@@ -108,6 +133,7 @@ final class LocalService {
                     "HOST": exposeToLAN ? "0.0.0.0" : "127.0.0.1",
                     "PORT": String(newPort),
                     "QWEN_TTS_ACCESS_PASSWORD": password,
+                    "QWEN_TTS_CORS_ORIGINS": corsOrigins,
                 ]
             )
             configuration = Self.readEnvironmentFile(environmentURL)
@@ -174,7 +200,22 @@ final class LocalService {
         logHandle?.seekToEndOfFile()
         process.standardOutput = logHandle
         process.standardError = logHandle
+        process.terminationHandler = { [weak self] terminated in
+            DispatchQueue.main.async {
+                guard let self, self.ownsProcess, self.process === terminated else { return }
+                let shouldRecover = self.hasReachedReady
+                self.lastExitStatus = terminated.terminationStatus
+                self.ownsProcess = false
+                self.process = nil
+                self.log("owned service exited unexpectedly with status \(terminated.terminationStatus)")
+                if shouldRecover {
+                    self.onUnexpectedTermination?(terminated.terminationStatus)
+                }
+            }
+        }
         do {
+            hasReachedReady = false
+            lastExitStatus = nil
             try process.run()
             log("started service process pid=\(process.processIdentifier)")
             self.process = process
@@ -192,7 +233,12 @@ final class LocalService {
     ) {
         health { [weak self] status in
             if let status, status["state"] as? String == "ready" {
+                self?.hasReachedReady = true
                 completion(.success(status))
+                return
+            }
+            if let status = self?.lastExitStatus {
+                completion(.failure(ServiceError.serviceExited(status)))
                 return
             }
             guard remainingAttempts > 0 else {
@@ -208,9 +254,10 @@ final class LocalService {
 
     func stopIfOwned() {
         guard ownsProcess, let process, process.isRunning else { return }
+        ownsProcess = false
+        self.process = nil
         process.terminate()
         log("stopped owned service process")
-        ownsProcess = false
     }
 
     private func log(_ message: String) {
@@ -280,7 +327,9 @@ private enum ServiceError: LocalizedError {
     case runtimeMissing(String)
     case startTimedOut
     case invalidPort
+    case insecureLANPassword
     case restartRequired
+    case serviceExited(Int32)
 
     var errorDescription: String? {
         switch self {
@@ -290,8 +339,12 @@ private enum ServiceError: LocalizedError {
             return "本地语音服务在 40 秒内没有就绪。请查看 logs/macos-app-service.log。"
         case .invalidPort:
             return "端口必须在 1024 到 65535 之间。"
+        case .insecureLANPassword:
+            return "允许局域网访问时，密码至少需要 4 个字符，且不能使用 change-me。"
         case .restartRequired:
             return "设置已经保存，但当前服务不是由本应用启动的。请手动重启后台服务后生效。"
+        case .serviceExited(let status):
+            return "本地语音服务启动后立即退出（状态 \(status)）。请检查端口是否被占用及 logs/macos-app-service.log。"
         }
     }
 }
@@ -304,6 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var presetsMenu: NSMenu!
     private var window: NSWindow!
     private var statusTimer: Timer?
+    private var isTerminating = false
 
     override init() {
         let service = LocalService(repositoryRoot: AppDelegate.findRepositoryRoot())
@@ -316,6 +370,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        service.onUnexpectedTermination = { [weak self] status in
+            guard let self, !self.isTerminating else { return }
+            self.updateMenuStatus("服务异常退出，正在恢复…")
+            self.viewModel.serviceReady = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, !self.isTerminating else { return }
+                self.service.startIfNeeded { [weak self] result in
+                    DispatchQueue.main.async {
+                        switch result {
+                        case .success(let health):
+                            self?.applyServiceHealth(health)
+                            self?.viewModel.updateHealth(health)
+                            self?.viewModel.loadInitialData()
+                        case .failure(let error):
+                            self?.updateMenuStatus("自动恢复失败（\(status)）")
+                            self?.presentError(error)
+                        }
+                    }
+                }
+            }
+        }
         buildWindow()
         buildStatusMenu()
         updateMenuStatus("正在启动本地 Metal 服务…")
@@ -339,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        isTerminating = true
         statusTimer?.invalidate()
         service.stopIfOwned()
     }
@@ -524,6 +600,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if isRepositoryRoot(url) { return url }
         }
         let bundle = Bundle.main.bundleURL
+        if let embeddedRoot = Bundle.main.url(
+            forResource: "repository-root",
+            withExtension: "txt"
+        ), let path = try? String(contentsOf: embeddedRoot, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines) {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            if isRepositoryRoot(url) { return url }
+        }
         let candidates = [
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
             bundle.deletingLastPathComponent().deletingLastPathComponent(),

@@ -204,23 +204,24 @@ class QwenWorkerRuntime:
         self.reference_audio_cache_hits = 0
         self.reference_audio_cache_misses = 0
         self.reference_audio_cache_lock = threading.RLock()
+        self._worker_lock = threading.RLock()
         self._workers: list[QwenWorkerClient] = []
         self._available: queue.Queue[QwenWorkerClient] = queue.Queue()
         self._closed = False
+        self._worker_config = {
+            "python_executable": python_executable,
+            "worker_script": worker_script,
+            "model_dir": self.model_dir,
+            "backend": self.backend,
+            "quant": self.quant,
+            "library_path": self.library_path or None,
+            "profile_id": profile_id,
+            "base_port": int(base_port),
+            "log_dir": log_dir,
+        }
         try:
             for index in range(max(1, int(lanes))):
-                worker = QwenWorkerClient(
-                    python_executable=python_executable,
-                    worker_script=worker_script,
-                    model_dir=self.model_dir,
-                    backend=self.backend,
-                    quant=self.quant,
-                    library_path=self.library_path or None,
-                    profile_id=profile_id,
-                    lane_index=index,
-                    port=int(base_port) + index,
-                    log_dir=log_dir,
-                )
+                worker = self._create_worker(index)
                 self._workers.append(worker)
                 self._available.put(worker)
         except Exception:
@@ -229,11 +230,77 @@ class QwenWorkerRuntime:
 
     @property
     def lanes(self) -> int:
-        return len(self._workers)
+        with self._worker_lock:
+            return len(self._workers)
+
+    def _create_worker(self, lane_index: int) -> QwenWorkerClient:
+        config = self._worker_config
+        return QwenWorkerClient(
+            python_executable=config["python_executable"],
+            worker_script=config["worker_script"],
+            model_dir=config["model_dir"],
+            backend=str(config["backend"]),
+            quant=str(config["quant"]),
+            library_path=config["library_path"],
+            profile_id=str(config["profile_id"]),
+            lane_index=lane_index,
+            port=int(config["base_port"]) + lane_index,
+            log_dir=config["log_dir"],
+        )
+
+    @staticmethod
+    def _worker_is_healthy(worker: QwenWorkerClient) -> bool:
+        if worker.process.poll() is not None:
+            return False
+        try:
+            return bool(worker.health().get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _restart_lane(self, lane_index: int) -> None:
+        for attempt in range(1, 4):
+            if self._closed:
+                return
+            try:
+                replacement = self._create_worker(lane_index)
+                with self._worker_lock:
+                    if self._closed:
+                        replacement.close()
+                        return
+                    self._workers.append(replacement)
+                    self._available.put(replacement)
+                LOG.info("restarted Qwen worker lane %s", lane_index)
+                return
+            except Exception:  # noqa: BLE001
+                LOG.exception(
+                    "failed to restart Qwen worker lane %s (attempt %s/3)",
+                    lane_index,
+                    attempt,
+                )
+                if attempt < 3:
+                    time.sleep(float(attempt))
+
+    def _retire_worker(self, worker: QwenWorkerClient) -> None:
+        with self._worker_lock:
+            if worker in self._workers:
+                self._workers.remove(worker)
+        try:
+            worker.close()
+        except Exception:  # noqa: BLE001
+            LOG.exception("failed to close unhealthy Qwen worker lane %s", worker.lane_index)
+        if not self._closed:
+            threading.Thread(
+                target=self._restart_lane,
+                args=(worker.lane_index,),
+                name=f"qwen-worker-restart-{self.profile_id}-{worker.lane_index}",
+                daemon=True,
+            ).start()
 
     def status(self) -> dict[str, Any]:
         workers = []
-        for worker in self._workers:
+        with self._worker_lock:
+            current_workers = list(self._workers)
+        for worker in current_workers:
             try:
                 workers.append(worker.health())
             except Exception as exc:  # noqa: BLE001
@@ -248,7 +315,14 @@ class QwenWorkerRuntime:
     ) -> Generator[StreamingEvent, None, None]:
         if self._closed:
             raise RuntimeError("Qwen runtime is closed")
-        worker = self._available.get()
+        while True:
+            if self._closed:
+                raise RuntimeError("Qwen runtime is closed")
+            try:
+                worker = self._available.get(timeout=1.0)
+                break
+            except queue.Empty:
+                continue
         reference_audio_path = str(Path(request.prompt_audio_path).resolve())
         reference_key = (
             f"{reference_audio_path}|{request.qwen_reference_text}|"
@@ -293,15 +367,26 @@ class QwenWorkerRuntime:
                             self.reference_audio_cache.popitem(last=False)
                 yield StreamingEvent(event_type, data)
         finally:
-            self._available.put(worker)
+            if self._closed:
+                worker.close()
+            elif self._worker_is_healthy(worker):
+                self._available.put(worker)
+            else:
+                LOG.error(
+                    "Qwen worker lane %s became unhealthy and will be restarted",
+                    worker.lane_index,
+                )
+                self._retire_worker(worker)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for worker in self._workers:
+        with self._worker_lock:
+            workers = list(self._workers)
+            self._workers.clear()
+        for worker in workers:
             try:
                 worker.close()
             except Exception:  # noqa: BLE001
                 LOG.exception("failed to close Qwen worker lane %s", worker.lane_index)
-        self._workers.clear()

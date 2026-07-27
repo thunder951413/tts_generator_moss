@@ -338,6 +338,10 @@ class RuntimeManager:
         self._error: str | None = None
         self._load_started_at: float | None = None
         self._ready_at: float | None = None
+        self._session_wait_timeout = max(
+            30.0,
+            float(os.environ.get("QWEN_TTS_SESSION_WAIT_TIMEOUT", "600")),
+        )
 
     def _set_status(self, *, state: str, error: str | None = None) -> None:
         with self._status_lock:
@@ -480,8 +484,14 @@ class RuntimeManager:
         profile_id = profile_id if profile_id in self.profiles else DEFAULT_MODEL_PROFILE
         needs_load = False
         with self._session_condition:
+            wait_deadline = time.monotonic() + self._session_wait_timeout
             while self._switching or (self._session_count > 0 and self._active_profile != profile_id):
-                self._session_condition.wait()
+                remaining = wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"等待切换到 {profile_id} 超过 {self._session_wait_timeout:.0f} 秒"
+                    )
+                self._session_condition.wait(timeout=min(1.0, remaining))
             if self._active_profile != profile_id or self._runtime is None:
                 self._switching = True
                 needs_load = True
@@ -510,14 +520,16 @@ class RuntimeManager:
 
 
 class GpuGenerationScheduler:
-    """Bound GPU inference concurrency and prioritize interactive requests."""
+    """Bound GPU inference concurrency with interactive priority and fairness."""
 
-    def __init__(self, max_parallel: int = 1) -> None:
+    def __init__(self, max_parallel: int = 1, interactive_burst_limit: int = 4) -> None:
         self.max_parallel = max(1, int(max_parallel))
+        self.interactive_burst_limit = max(1, int(interactive_burst_limit))
         self._condition = threading.Condition()
         self._active = 0
         self._waiting_interactive = 0
         self._waiting_document = 0
+        self._interactive_burst = 0
 
     def _acquire(self, priority: str) -> None:
         interactive = priority == "interactive"
@@ -527,11 +539,25 @@ class GpuGenerationScheduler:
             else:
                 self._waiting_document += 1
             try:
-                while self._active >= self.max_parallel or (
-                    not interactive and self._waiting_interactive > 0
+                while (
+                    self._active >= self.max_parallel
+                    or (
+                        interactive
+                        and self._waiting_document > 0
+                        and self._interactive_burst >= self.interactive_burst_limit
+                    )
+                    or (
+                        not interactive
+                        and self._waiting_interactive > 0
+                        and self._interactive_burst < self.interactive_burst_limit
+                    )
                 ):
                     self._condition.wait()
                 self._active += 1
+                if interactive and self._waiting_document > 0:
+                    self._interactive_burst += 1
+                elif not interactive:
+                    self._interactive_burst = 0
             finally:
                 if interactive:
                     self._waiting_interactive -= 1
@@ -565,6 +591,8 @@ class GpuGenerationScheduler:
                 "active": self._active,
                 "waiting_interactive": self._waiting_interactive,
                 "waiting_document": self._waiting_document,
+                "interactive_burst": self._interactive_burst,
+                "interactive_burst_limit": self.interactive_burst_limit,
             }
 
 
@@ -814,12 +842,20 @@ def create_app(
         StaticFiles(directory=str(NOVEL_READER_WEB_DIR)),
         name="novel-reader-assets",
     )
+    configured_cors = [
+        origin.strip()
+        for origin in os.environ.get("QWEN_TTS_CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        # The reader and native app are same-origin/local clients. Cross-origin
+        # browser access is opt-in so a random website cannot probe a LAN-bound
+        # service with a leaked API key.
+        allow_origins=configured_cors,
         allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
         expose_headers=[
             "X-Audio-Codec",
             "X-Audio-Sample-Rate",
@@ -1357,11 +1393,56 @@ def create_app(
         preset_store.clear_configuration()
         return JSONResponse(active_service_settings())
 
+    def builtin_reference_id(path: str) -> str:
+        return "builtin-" + hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:24]
+
+    def reference_audio_library(*, include_hidden: bool) -> list[dict[str, Any]]:
+        hidden_builtin = preset_store.hidden_builtin_references()
+        rows: list[dict[str, Any]] = []
+        for voice in BAILIAN_VOICE_ROWS:
+            path = str(Path(str(voice.get("audio_path") or "")).resolve())
+            hidden = path in hidden_builtin
+            if hidden and not include_hidden:
+                continue
+            rows.append(
+                {
+                    "id": builtin_reference_id(path),
+                    "kind": "builtin",
+                    "name": str(voice.get("name") or Path(path).stem),
+                    "description": str(voice.get("description") or ""),
+                    "path": path,
+                    "audio_path": path,
+                    "language": str(voice.get("language") or "Chinese"),
+                    "transcript": str(voice.get("transcript") or ""),
+                    "transcript_source": str(voice.get("transcript_source") or ""),
+                    "hidden": hidden,
+                    "in_use": bool(preset_store.reference_usage(path)),
+                    "usages": preset_store.reference_usage(path),
+                }
+            )
+        for item in preset_store.list_reference_audio(include_hidden=include_hidden):
+            path = str(item.get("path") or "")
+            rows.append(
+                {
+                    **item,
+                    "kind": "custom",
+                    "audio_path": path,
+                    "description": "用户参考音频",
+                    "language": "Chinese",
+                    "transcript": "",
+                    "transcript_source": "",
+                    "in_use": bool(preset_store.reference_usage(path)),
+                    "usages": preset_store.reference_usage(path),
+                }
+            )
+        return rows
+
     @app.get("/api/voices")
     async def list_native_voices() -> JSONResponse:
+        visible_references = reference_audio_library(include_hidden=False)
         return JSONResponse(
             {
-                "voices": BAILIAN_VOICE_ROWS,
+                "voices": visible_references,
                 "default_reference_audio_path": DEFAULT_CLONE_AUDIO_PATH,
                 "models": [
                     {
@@ -1372,6 +1453,50 @@ def create_app(
                 ],
             }
         )
+
+    @app.get("/api/reference-audio-library")
+    async def list_reference_audio_library(include_hidden: bool = False) -> JSONResponse:
+        return JSONResponse(
+            {"references": reference_audio_library(include_hidden=include_hidden)}
+        )
+
+    @app.put("/api/reference-audio-library/{reference_id}/visibility")
+    async def update_reference_audio_visibility(
+        reference_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        hidden = bool(payload.get("hidden"))
+        builtin = next(
+            (
+                voice
+                for voice in BAILIAN_VOICE_ROWS
+                if builtin_reference_id(str(voice.get("audio_path") or "")) == reference_id
+            ),
+            None,
+        )
+        if builtin is not None:
+            preset_store.set_builtin_hidden(str(builtin["audio_path"]), hidden)
+        else:
+            try:
+                preset_store.set_reference_hidden(reference_id, hidden)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="reference audio not found") from exc
+        return JSONResponse({"ok": True, "hidden": hidden})
+
+    @app.delete("/api/reference-audio-library/{reference_id}")
+    async def delete_reference_audio(reference_id: str) -> JSONResponse:
+        if any(
+            builtin_reference_id(str(voice.get("audio_path") or "")) == reference_id
+            for voice in BAILIAN_VOICE_ROWS
+        ):
+            raise HTTPException(status_code=400, detail="内置参考音频只能隐藏，不能删除")
+        try:
+            preset_store.delete_reference_audio(reference_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="reference audio not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse({"ok": True})
 
     @app.post("/api/presets")
     async def create_preset(payload: dict[str, Any] = Body(...)) -> JSONResponse:
@@ -1408,30 +1533,81 @@ def create_app(
         if len(data) > 100 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="参考音频不能超过 100 MB")
         temporary = upload_dir / f"preset-{uuid.uuid4().hex}{Path(filename).suffix or '.wav'}"
+        normalized = upload_dir / f"preset-normalized-{uuid.uuid4().hex}.wav"
         try:
             temporary.write_bytes(data)
-            imported = preset_store.import_reference_audio(filename=filename, temporary_path=temporary)
+            conversion = subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(temporary),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(normalized),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if conversion.returncode != 0 or not normalized.is_file() or normalized.stat().st_size <= 44:
+                detail = (conversion.stderr or "").strip().splitlines()
+                reason = detail[-1] if detail else "无法识别音频编码"
+                raise ValueError(f"参考音频无法解码：{reason[:240]}")
+            imported = preset_store.import_reference_audio(
+                filename=f"{Path(filename).stem}.wav",
+                temporary_path=normalized,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(status_code=400, detail="参考音频转码超时") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             temporary.unlink(missing_ok=True)
+            normalized.unlink(missing_ok=True)
         return JSONResponse(
             {
                 "reference_audio_path": str(imported),
                 "audio_url": f"/api/reference-audio?path={quote(str(imported), safe='')}",
+                "reference": next(
+                    (
+                        item
+                        for item in preset_store.list_reference_audio(include_hidden=True)
+                        if item.get("path") == str(imported)
+                    ),
+                    None,
+                ),
             }
         )
 
     @app.get("/api/generate-stream/{job_id}/audio")
-    async def generate_stream_audio(job_id: str) -> StreamingResponse:
+    async def generate_stream_audio(job_id: str, request: Request) -> StreamingResponse:
         job = jobs.get(job_id)
 
-        def iterator():
-            while True:
-                item = job.audio_queue.get()
-                if item is None:
-                    break
-                yield item
+        async def iterator():
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        item = await asyncio.to_thread(job.audio_queue.get, True, 0.25)
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        break
+                    yield item
+            finally:
+                snapshot = job.snapshot()
+                if snapshot.get("state") not in {"finished", "error", "closed"}:
+                    jobs.close(job_id)
 
         snapshot = job.snapshot()
         return StreamingResponse(
@@ -1461,7 +1637,10 @@ def create_app(
         job = jobs.get(job_id)
         if job.result is None:
             raise HTTPException(status_code=404, detail="result is not ready")
-        return FileResponse(job.result["audio_path"], media_type="audio/wav", filename="generated.wav")
+        audio_path = Path(str(job.result.get("audio_path") or ""))
+        if not audio_path.is_file():
+            raise HTTPException(status_code=404, detail="generated audio is missing")
+        return FileResponse(str(audio_path), media_type="audio/wav", filename="generated.wav")
 
     @app.get("/api/generate-stream/{job_id}/result-audio-aac")
     async def generate_stream_result_audio_aac(
@@ -1530,6 +1709,12 @@ def create_app(
 
     @app.delete("/api/generate-stream/{job_id}/ephemeral-audio")
     async def generate_stream_delete_ephemeral_audio(job_id: str) -> JSONResponse:
+        job = jobs.close(job_id)
+        _remove_ephemeral_job_audio(job)
+        return JSONResponse({"ok": True, "job_id": job_id})
+
+    @app.post("/api/generate-stream/{job_id}/ephemeral-audio/close")
+    async def generate_stream_close_ephemeral_audio(job_id: str) -> JSONResponse:
         job = jobs.close(job_id)
         _remove_ephemeral_job_audio(job)
         return JSONResponse({"ok": True, "job_id": job_id})

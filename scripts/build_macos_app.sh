@@ -13,6 +13,7 @@ fi
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$ROOT/macos/Info.plist" "$APP/Contents/Info.plist"
+printf '%s\n' "$ROOT" > "$RESOURCES_DIR/repository-root.txt"
 xcrun swiftc \
   "$ROOT/macos/QwenTTSApp.swift" \
   "$ROOT/macos/StudioDesignSystem.swift" \
@@ -21,7 +22,9 @@ xcrun swiftc \
   -parse-as-library \
   -framework AppKit \
   -framework AVFoundation \
-  -framework CryptoKit
+  -framework CoreMedia \
+  -framework CryptoKit \
+  -framework ScreenCaptureKit
 
 # A local ad-hoc signature prevents Gatekeeper from treating a rebuilt bundle
 # as an incomplete app while keeping distribution under the user's own account.

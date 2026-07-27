@@ -65,13 +65,18 @@ chmod +x setup-macos.sh start-macos.sh stop-macos.sh
 
 ```dotenv
 QWEN_TTS_ACCESS_PASSWORD=请改成强密码
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=7861
 QWEN_TTS_QUANT=Q4_K_M
 QWEN_TTS_0_6B_LANES=1
 QWEN_TTS_1_7B_LANES=1
 QWEN_TTS_MAX_PARALLEL_GENERATIONS=1
 ```
+
+默认仅允许本机访问。需要让局域网设备调用时，再把 `HOST` 改为
+`0.0.0.0`；启动脚本会拒绝“空密码 / change-me / 少于 4 位密码”的
+局域网暴露配置。浏览器跨域调用还需显式设置
+`QWEN_TTS_CORS_ORIGINS`（多个来源用逗号分隔）。
 
 量化选择：
 

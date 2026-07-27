@@ -37,7 +37,16 @@ class VoicePresetStore:
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         if not self.manifest_path.exists():
-            _atomic_write(self.manifest_path, {"version": 1, "presets": [], "active_preset_id": ""})
+            _atomic_write(
+                self.manifest_path,
+                {
+                    "version": 2,
+                    "presets": [],
+                    "active_preset_id": "",
+                    "reference_audio": [],
+                    "hidden_builtin_references": [],
+                },
+            )
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -52,7 +61,11 @@ class VoicePresetStore:
             value["active_preset_id"] = ""
         if not isinstance(value.get("active_service"), dict):
             value["active_service"] = {}
-        value["version"] = 1
+        if not isinstance(value.get("reference_audio"), list):
+            value["reference_audio"] = []
+        if not isinstance(value.get("hidden_builtin_references"), list):
+            value["hidden_builtin_references"] = []
+        value["version"] = 2
         return value
 
     @staticmethod
@@ -214,8 +227,172 @@ class VoicePresetStore:
             raise ValueError("不支持的参考音频格式")
         destination = self.audio_dir / f"{uuid.uuid4().hex}{suffix}"
         with self._lock:
+            manifest = self._load()
             shutil.copyfile(source, destination)
+            now = _now()
+            manifest["reference_audio"].append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": (Path(filename or source.name).stem.strip() or "参考音频")[:120],
+                    "filename": Path(filename or source.name).name[:255],
+                    "path": str(destination.resolve()),
+                    "hidden": False,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            _atomic_write(self.manifest_path, manifest)
         return destination.resolve()
+
+    def _discover_reference_audio(self, manifest: dict[str, Any]) -> bool:
+        known_paths = {
+            str(item.get("path") or "")
+            for item in manifest["reference_audio"]
+            if isinstance(item, dict)
+        }
+        changed = False
+        for path in sorted(self.audio_dir.iterdir()):
+            if not path.is_file() or str(path.resolve()) in known_paths:
+                continue
+            now = path.stat().st_mtime
+            manifest["reference_audio"].append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": path.stem[:120],
+                    "filename": path.name[:255],
+                    "path": str(path.resolve()),
+                    "hidden": False,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            changed = True
+        return changed
+
+    def list_reference_audio(self, *, include_hidden: bool = True) -> list[dict[str, Any]]:
+        with self._lock:
+            manifest = self._load()
+            changed = self._discover_reference_audio(manifest)
+            existing: list[dict[str, Any]] = []
+            for item in manifest["reference_audio"]:
+                if not isinstance(item, dict):
+                    changed = True
+                    continue
+                path = Path(str(item.get("path") or ""))
+                if not path.is_file() or not self.is_managed_reference(path):
+                    changed = True
+                    continue
+                if include_hidden or not bool(item.get("hidden")):
+                    existing.append(self._copy_preset(item))
+            if changed:
+                existing_paths = {
+                    str(Path(str(item.get("path") or "")).resolve())
+                    for item in manifest["reference_audio"]
+                    if isinstance(item, dict)
+                    and Path(str(item.get("path") or "")).is_file()
+                    and self.is_managed_reference(str(item.get("path") or ""))
+                }
+                manifest["reference_audio"] = [
+                    item
+                    for item in manifest["reference_audio"]
+                    if isinstance(item, dict)
+                    and str(Path(str(item.get("path") or "")).resolve()) in existing_paths
+                ]
+                _atomic_write(self.manifest_path, manifest)
+        return sorted(
+            existing,
+            key=lambda item: (-float(item.get("created_at", 0)), str(item.get("name", ""))),
+        )
+
+    def reference_audio_record(self, reference_id: str) -> dict[str, Any]:
+        with self._lock:
+            manifest = self._load()
+            self._discover_reference_audio(manifest)
+            for item in manifest["reference_audio"]:
+                if isinstance(item, dict) and item.get("id") == reference_id:
+                    return self._copy_preset(item)
+        raise KeyError(reference_id)
+
+    def set_reference_hidden(self, reference_id: str, hidden: bool) -> dict[str, Any]:
+        with self._lock:
+            manifest = self._load()
+            self._discover_reference_audio(manifest)
+            for item in manifest["reference_audio"]:
+                if isinstance(item, dict) and item.get("id") == reference_id:
+                    item["hidden"] = bool(hidden)
+                    item["updated_at"] = _now()
+                    _atomic_write(self.manifest_path, manifest)
+                    return self._copy_preset(item)
+        raise KeyError(reference_id)
+
+    def hidden_builtin_references(self) -> set[str]:
+        with self._lock:
+            manifest = self._load()
+            return {
+                str(path)
+                for path in manifest.get("hidden_builtin_references", [])
+                if isinstance(path, str)
+            }
+
+    def set_builtin_hidden(self, path: str | Path, hidden: bool) -> None:
+        normalized = str(Path(path).resolve())
+        with self._lock:
+            manifest = self._load()
+            hidden_paths = self.hidden_builtin_references()
+            if hidden:
+                hidden_paths.add(normalized)
+            else:
+                hidden_paths.discard(normalized)
+            manifest["hidden_builtin_references"] = sorted(hidden_paths)
+            _atomic_write(self.manifest_path, manifest)
+
+    def reference_usage(self, path: str | Path) -> list[str]:
+        normalized = str(Path(path).resolve())
+        with self._lock:
+            manifest = self._load()
+            usages: list[str] = []
+            for preset in manifest["presets"]:
+                if not isinstance(preset, dict):
+                    continue
+                settings = preset.get("settings")
+                if (
+                    isinstance(settings, dict)
+                    and str(Path(str(settings.get("reference_audio_path") or "")).resolve()) == normalized
+                ):
+                    usages.append(f"预设“{preset.get('name') or '未命名'}”")
+            active_service = manifest.get("active_service")
+            if isinstance(active_service, dict):
+                settings = active_service.get("settings")
+                if (
+                    isinstance(settings, dict)
+                    and str(Path(str(settings.get("reference_audio_path") or "")).resolve()) == normalized
+                ):
+                    usages.append("当前服务设置")
+            return list(dict.fromkeys(usages))
+
+    def delete_reference_audio(self, reference_id: str) -> None:
+        with self._lock:
+            manifest = self._load()
+            self._discover_reference_audio(manifest)
+            target = next(
+                (
+                    item
+                    for item in manifest["reference_audio"]
+                    if isinstance(item, dict) and item.get("id") == reference_id
+                ),
+                None,
+            )
+            if target is None:
+                raise KeyError(reference_id)
+            path = Path(str(target.get("path") or ""))
+            usages = self.reference_usage(path)
+            if usages:
+                raise ValueError("该参考音频仍被" + "、".join(usages) + "使用，请先更换音色")
+            if not self.is_managed_reference(path):
+                raise ValueError("只能删除导入到参考音频库的文件")
+            path.unlink(missing_ok=True)
+            manifest["reference_audio"].remove(target)
+            _atomic_write(self.manifest_path, manifest)
 
     def is_managed_reference(self, path: str | Path) -> bool:
         try:
