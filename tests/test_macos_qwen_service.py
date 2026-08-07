@@ -124,6 +124,9 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert 'voiceStatusItem?.title = "当前音色：' in app_source
         assert 'taskStatusItem?.title = active > 0' in app_source
         assert "WKWebView" in reader_app_source
+        assert "WKUIDelegate" in reader_app_source
+        assert "webView.uiDelegate = self" in reader_app_source
+        assert "runOpenPanelWith parameters: WKOpenPanelParameters" in reader_app_source
         assert 'Window("Qwen 声阅", id: "reader")' in reader_app_source
         assert "QwenReaderServiceURL" in reader_app_source
         assert 'configuration.arguments = ["--background"]' in reader_app_source

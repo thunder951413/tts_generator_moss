@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 
 private let readerServiceURLKey = "QwenReaderServiceURL"
@@ -11,7 +12,7 @@ private func openReaderSettings() {
 }
 
 @MainActor
-final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate {
+final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     @Published var serviceURLText: String
     @Published var statusText = "正在连接语音服务…"
     @Published var isLoading = true
@@ -34,6 +35,7 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate {
 
         super.init()
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.allowsMagnification = true
         webView.setValue(false, forKey: "drawsBackground")
     }
@@ -241,6 +243,30 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate {
         isLoading = false
         loadError = true
         statusText = error.localizedDescription
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping ([URL]?) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.title = "导入小说"
+        panel.prompt = "导入"
+        panel.message = "选择 TXT、Markdown 或 DOCX 小说文件"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.allowedContentTypes = [
+            .plainText,
+            UTType(filenameExtension: "md") ?? .plainText,
+            UTType(filenameExtension: "markdown") ?? .plainText,
+            UTType(filenameExtension: "docx") ?? .data,
+        ]
+        panel.begin { response in
+            completionHandler(response == .OK ? panel.urls : nil)
+        }
     }
 
     static func normalizedServiceURL(_ raw: String) -> URL? {
