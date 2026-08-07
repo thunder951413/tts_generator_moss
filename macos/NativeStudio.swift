@@ -459,6 +459,9 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var referenceLibrary: [NativeReferenceAudio] = []
     @Published var referenceLibraryPresented = false
     @Published var pendingReferenceDeletion: NativeReferenceAudio?
+    @Published var referenceLibraryStatus = ""
+    @Published var referenceLibraryTab = "visible"
+    @Published var isDeletingReference = false
     @Published var isRecordingSystemAudio = false
     @Published var isPreparingSystemAudioCapture = false
     @Published var systemAudioStatus = "可录制 Mac 正在播放的声音"
@@ -479,6 +482,11 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var externalCORSOrigins = ""
     @Published var externalSettingsStatus = ""
     @Published var isApplyingExternalSettings = false
+    @Published var isRunningPerformanceTest = false
+    @Published var performanceTestStatus = "尚未测试，将使用保守的单通道策略"
+    @Published var performanceStreamSummary = "流式：8 帧/块 · 1 路"
+    @Published var performanceBlockSummary = "整块：1 路"
+    @Published var performanceGainSummary = "并发收益：待测试"
 
     let service: LocalService
     var onPresetsChanged: (([NativePreset]) -> Void)?
@@ -486,12 +494,18 @@ final class NativeStudioViewModel: ObservableObject {
     private var currentJobID: String?
     private var stoppedJobIDs: Set<String> = []
     private var pcmStreamPlayer: NativePCMStreamPlayer?
+    private var generationEpoch = 0
+    private var isForceStopping = false
     private var generationFinished = false
     private var streamPlaybackFinished = false
     private var resultDownloaded = false
     private var player: AVPlayer?
+    private var playbackEndObserver: NSObjectProtocol?
+    private var playbackFailureObserver: NSObjectProtocol?
+    private var playbackJobID: String?
     private var recorder: AVAudioRecorder?
     private var recordingURL: URL?
+    private var defaultReferenceAudioPath = ""
     private var systemAudioRecorder: SystemAudioRecorder?
     private var systemAudioRecordingURL: URL?
     private var systemAudioTimer: Timer?
@@ -507,6 +521,12 @@ final class NativeStudioViewModel: ObservableObject {
 
     deinit {
         pollingTimer?.invalidate()
+        if let playbackEndObserver {
+            NotificationCenter.default.removeObserver(playbackEndObserver)
+        }
+        if let playbackFailureObserver {
+            NotificationCenter.default.removeObserver(playbackFailureObserver)
+        }
         pcmStreamPlayer?.stop()
         removeTemporaryOutput()
         if let recordingURL {
@@ -537,6 +557,87 @@ final class NativeStudioViewModel: ObservableObject {
         loadReferenceLibrary()
         refreshPresets()
         loadActiveServiceSettings()
+        loadPerformanceProfile()
+    }
+
+    func loadPerformanceProfile() {
+        service.perform("api/performance") { [weak self] data, response in
+            guard let self else { return }
+            do {
+                let payload = try self.jsonObject(data, response: response)
+                let activeProfile = self.string(payload["active_profile"], fallback: self.modelProfile)
+                let profiles = payload["profiles"] as? [String: Any] ?? [:]
+                guard let profile = profiles[activeProfile] as? [String: Any],
+                      let recommendation = profile["recommendation"] as? [String: Any]
+                else { return }
+                DispatchQueue.main.async {
+                    self.applyPerformanceResult(
+                        profile: profile,
+                        recommendation: recommendation,
+                        loaded: true
+                    )
+                }
+            } catch {
+                // A missing performance profile is expected before the first test.
+            }
+        }
+    }
+
+    func runPerformanceTest() {
+        guard serviceReady, !isGenerating, !isRunningPerformanceTest else { return }
+        isRunningPerformanceTest = true
+        performanceTestStatus = "正在预热模型并测试流式首包…"
+        errorMessage = ""
+        let body = try? JSONSerialization.data(
+            withJSONObject: ["model_profile": modelProfile]
+        )
+        service.perform(
+            "api/performance/benchmark",
+            method: "POST",
+            body: body,
+            contentType: "application/json",
+            timeout: 900
+        ) { [weak self] data, response in
+            guard let self else { return }
+            do {
+                let payload = try self.jsonObject(data, response: response)
+                guard let recommendation = payload["recommendation"] as? [String: Any] else {
+                    throw NativeStudioError.invalidResponse
+                }
+                DispatchQueue.main.async {
+                    self.isRunningPerformanceTest = false
+                    self.applyPerformanceResult(
+                        profile: payload,
+                        recommendation: recommendation,
+                        loaded: false
+                    )
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isRunningPerformanceTest = false
+                    self.performanceTestStatus = "测试失败：\(error.localizedDescription)"
+                    self.show(error)
+                }
+            }
+        }
+    }
+
+    private func applyPerformanceResult(
+        profile: [String: Any],
+        recommendation: [String: Any],
+        loaded: Bool
+    ) {
+        let chunk = integer(recommendation["stream_chunk_frames"], fallback: 8)
+        let streamParallel = integer(recommendation["stream_parallel"], fallback: 1)
+        let blockParallel = integer(recommendation["block_parallel"], fallback: 1)
+        let block = profile["block_measurements"] as? [String: Any]
+        let gain = double(block?["throughput_gain"], fallback: 1.0)
+        performanceStreamSummary = "流式：\(chunk) 帧/块 · \(streamParallel) 路"
+        performanceBlockSummary = "整块：\(blockParallel) 路并行"
+        performanceGainSummary = String(format: "双路吞吐：%.2f×", gain)
+        performanceTestStatus = loaded
+            ? "已载入本机优化策略，将自动用于阅读器和后台任务"
+            : "测试完成，推荐策略已保存并立即应用"
     }
 
     func loadActiveServiceSettings() {
@@ -654,10 +755,12 @@ final class NativeStudioViewModel: ObservableObject {
                 let payload = try self.jsonObject(data, response: response)
                 let rawVoices = payload["voices"] as? [[String: Any]] ?? []
                 let voices = rawVoices.compactMap(NativeVoice.init)
+                let defaultPath = payload["default_reference_audio_path"] as? String ?? ""
                 DispatchQueue.main.async {
                     self.voices = voices
+                    self.defaultReferenceAudioPath = defaultPath
                     if self.referenceAudioPath.isEmpty,
-                       let defaultPath = payload["default_reference_audio_path"] as? String {
+                       !defaultPath.isEmpty {
                         self.chooseVoice(defaultPath)
                     } else if voices.contains(where: { $0.audioPath == self.referenceAudioPath }) {
                         self.selectedVoicePath = self.referenceAudioPath
@@ -725,26 +828,52 @@ final class NativeStudioViewModel: ObservableObject {
 
     func deleteReference(_ reference: NativeReferenceAudio) {
         guard reference.kind == "custom" else {
-            show(NativeStudioError.server("内置参考音频只能隐藏，不能删除。"))
+            referenceLibraryStatus = "内置参考音频只能隐藏，不能删除。"
             return
         }
-        guard reference.path != referenceAudioPath else {
-            show(NativeStudioError.server("正在编辑的音色不能删除，请先选择其他参考音色。"))
-            return
-        }
+        isDeletingReference = true
+        referenceLibraryStatus = "正在删除“\(reference.name)”…"
+        let replaceUsages = reference.inUse ? "?replace_usages=true" : ""
         service.perform(
-            "api/reference-audio-library/\(reference.id)",
+            "api/reference-audio-library/\(reference.id)\(replaceUsages)",
             method: "DELETE"
         ) { [weak self] data, response in
             guard let self else { return }
             do {
-                _ = try self.jsonObject(data, response: response)
+                let payload = try self.jsonObject(data, response: response)
+                let replacement = payload["replacement"] as? [String: Any]
+                let replacementPath = self.string(
+                    replacement?["reference_audio_path"],
+                    fallback: self.defaultReferenceAudioPath
+                )
+                let replacementName = self.string(
+                    replacement?["name"],
+                    fallback: "龙嫱"
+                )
+                let replacedUsages = payload["replaced_usages"] as? [String] ?? []
                 DispatchQueue.main.async {
+                    self.isDeletingReference = false
+                    if self.referenceAudioPath == reference.path || !replacedUsages.isEmpty {
+                        self.referenceAudioPath = replacementPath
+                        self.referenceName = replacementName
+                        self.selectedVoicePath = replacementPath
+                        self.referenceText = ""
+                    }
+                    self.referenceLibraryStatus = replacedUsages.isEmpty
+                        ? "已删除“\(reference.name)”"
+                        : "已删除“\(reference.name)”，并将\(replacedUsages.joined(separator: "、"))切换为\(replacementName)"
                     self.loadReferenceLibrary()
                     self.loadVoices()
+                    self.refreshPresets()
+                    if !replacedUsages.isEmpty {
+                        self.loadActiveServiceSettings()
+                    }
                 }
             } catch {
-                self.show(error)
+                DispatchQueue.main.async {
+                    self.isDeletingReference = false
+                    self.referenceLibraryStatus = error.localizedDescription
+                }
             }
         }
     }
@@ -1048,8 +1177,21 @@ final class NativeStudioViewModel: ObservableObject {
     }
 
     func stopPreview() {
+        if let playbackEndObserver {
+            NotificationCenter.default.removeObserver(playbackEndObserver)
+            self.playbackEndObserver = nil
+        }
+        if let playbackFailureObserver {
+            NotificationCenter.default.removeObserver(playbackFailureObserver)
+            self.playbackFailureObserver = nil
+        }
         player?.pause()
+        player?.replaceCurrentItem(with: nil)
         player = nil
+        if let playbackJobID {
+            service.perform("api/generate-stream/\(playbackJobID)/close", method: "POST") { _, _ in }
+            self.playbackJobID = nil
+        }
     }
 
     func discardSystemAudioRecording() {
@@ -1136,13 +1278,41 @@ final class NativeStudioViewModel: ObservableObject {
         play(outputAudioURL)
     }
 
-    private func play(_ url: URL) {
-        player = AVPlayer(url: url)
+    private func play(_ url: URL, jobID: String? = nil) {
+        stopPreview()
+        let item = AVPlayerItem(url: url)
+        player = AVPlayer(playerItem: item)
+        playbackJobID = jobID
+        let finishPlayback: () -> Void = { [weak self] in
+            guard let self else { return }
+            if let jobID = self.playbackJobID {
+                self.service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
+            }
+            self.playbackJobID = nil
+            if let observer = self.playbackEndObserver {
+                NotificationCenter.default.removeObserver(observer)
+                self.playbackEndObserver = nil
+            }
+            if let observer = self.playbackFailureObserver {
+                NotificationCenter.default.removeObserver(observer)
+                self.playbackFailureObserver = nil
+            }
+        }
+        playbackEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { _ in finishPlayback() }
+        playbackFailureObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { _ in finishPlayback() }
         player?.play()
     }
 
     func generate() {
-        guard !isGenerating else { return }
+        guard !isGenerating, !isForceStopping else { return }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             show(NativeStudioError.emptyText)
             return
@@ -1170,6 +1340,7 @@ final class NativeStudioViewModel: ObservableObject {
         generationFinished = false
         streamPlaybackFinished = false
         resultDownloaded = false
+        let requestEpoch = generationEpoch
         let requestedSeed = seed
         let fields: [String: String] = [
             "mode": "voice_clone",
@@ -1212,6 +1383,7 @@ final class NativeStudioViewModel: ObservableObject {
                 let sampleRate = self.number(payload["sample_rate"]).doubleValue
                 let channels = self.number(payload["channels"]).intValue
                 DispatchQueue.main.async {
+                    guard self.generationEpoch == requestEpoch, !self.isForceStopping else { return }
                     self.currentJobID = jobID
                     self.stoppedJobIDs.remove(jobID)
                     self.currentJobDisplayID = String(jobID.prefix(8))
@@ -1228,8 +1400,11 @@ final class NativeStudioViewModel: ObservableObject {
                     self.startPolling(jobID)
                 }
             } catch {
-                DispatchQueue.main.async { self.isGenerating = false }
-                self.show(error)
+                DispatchQueue.main.async {
+                    guard self.generationEpoch == requestEpoch, !self.isForceStopping else { return }
+                    self.isGenerating = false
+                    self.show(error)
+                }
             }
         }
     }
@@ -1244,6 +1419,52 @@ final class NativeStudioViewModel: ObservableObject {
         isGenerating = false
         self.currentJobID = nil
         generationSummary = "已停止当前生成"
+    }
+
+    func forceStopAllAudioAndComputation(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard !isForceStopping else { return }
+        isForceStopping = true
+
+        // Stop native playback and invalidate every pending local generation callback first.
+        // The backend request is deliberately global, so no per-job close request is sent here.
+        generationEpoch &+= 1
+        if let currentJobID {
+            stoppedJobIDs.insert(currentJobID)
+        }
+        pcmStreamPlayer?.stop()
+        pcmStreamPlayer = nil
+        stopPreview()
+        stopPolling()
+        currentJobID = nil
+        currentJobDisplayID = ""
+        isGenerating = false
+        generatedProgress = 0
+        generationFinished = false
+        streamPlaybackFinished = false
+        resultDownloaded = false
+        errorMessage = ""
+        generationSummary = "已停止本地音频，正在停止所有运算…"
+
+        service.perform("api/service/stop-all", method: "POST") { [weak self] data, response in
+            guard let self else { return }
+            do {
+                _ = try self.jsonObject(data, response: response)
+                DispatchQueue.main.async {
+                    self.isForceStopping = false
+                    self.generationSummary = "已强制停止所有音频与运算"
+                    completion(.success(()))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isForceStopping = false
+                    self.generationSummary = "本地音频已停止，但后台停止请求失败"
+                    self.errorMessage = error.localizedDescription
+                    completion(.failure(error))
+                }
+            }
+        }
     }
 
     private func startPCMStream(_ jobID: String, sampleRate: Double, channels: Int) {
@@ -1336,11 +1557,15 @@ final class NativeStudioViewModel: ObservableObject {
 
     private func downloadResult(_ jobID: String, autoPlay: Bool) {
         generationSummary = "正在读取生成结果…"
-        service.perform("api/generate-stream/\(jobID)/result-audio", timeout: 120) { [weak self] data, response in
+        let resultPath = "api/generate-stream/\(jobID)/result-audio" + (autoPlay ? "?playback=1" : "")
+        service.perform(resultPath, timeout: 120) { [weak self] data, response in
             guard let self else { return }
             guard response?.statusCode == 200, let data else {
-                self.show(NativeStudioError.server("生成完成，但无法读取输出音频。"))
-                DispatchQueue.main.async { self.isGenerating = false }
+                DispatchQueue.main.async {
+                    guard self.currentJobID == jobID else { return }
+                    self.isGenerating = false
+                    self.show(NativeStudioError.server("生成完成，但无法读取输出音频。"))
+                }
                 return
             }
             let url = FileManager.default.temporaryDirectory
@@ -1348,14 +1573,18 @@ final class NativeStudioViewModel: ObservableObject {
             do {
                 try data.write(to: url, options: .atomic)
                 DispatchQueue.main.async {
+                    guard self.currentJobID == jobID else {
+                        try? FileManager.default.removeItem(at: url)
+                        return
+                    }
                     self.outputAudioURL = url
                     self.resultDownloaded = true
                     self.generatedProgress = 1
                     if autoPlay {
                         self.isGenerating = false
-                        self.currentJobID = nil
                         self.generationSummary = "生成完成，可以试听"
-                        self.playOutput()
+                        self.play(url, jobID: jobID)
+                        self.currentJobID = nil
                     } else {
                         self.generationSummary = self.streamPlaybackFinished
                             ? "流式播放完成，可以再次试听"
@@ -1364,19 +1593,26 @@ final class NativeStudioViewModel: ObservableObject {
                     }
                 }
             } catch {
-                self.show(error)
-                DispatchQueue.main.async { self.isGenerating = false }
+                DispatchQueue.main.async {
+                    guard self.currentJobID == jobID else { return }
+                    self.isGenerating = false
+                    self.show(error)
+                }
             }
         }
     }
 
     private func finishStreamingGenerationIfReady() {
         guard generationFinished, streamPlaybackFinished, resultDownloaded else { return }
+        let finishedJobID = currentJobID
         isGenerating = false
         currentJobID = nil
         pcmStreamPlayer = nil
         generatedProgress = 1
         generationSummary = "流式播放完成，可以再次试听"
+        if let finishedJobID {
+            service.perform("api/generate-stream/\(finishedJobID)/close", method: "POST") { _, _ in }
+        }
     }
 
     private func removeTemporaryOutput() {
@@ -2069,6 +2305,18 @@ struct SystemAudioTrimView: View {
 struct ReferenceAudioLibraryView: View {
     @ObservedObject var model: NativeStudioViewModel
 
+    private var visibleReferences: [NativeReferenceAudio] {
+        model.referenceLibrary.filter { !$0.hidden }
+    }
+
+    private var hiddenReferences: [NativeReferenceAudio] {
+        model.referenceLibrary.filter(\.hidden)
+    }
+
+    private var displayedReferences: [NativeReferenceAudio] {
+        model.referenceLibraryTab == "hidden" ? hiddenReferences : visibleReferences
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: StudioTokens.space4) {
             HStack {
@@ -2083,9 +2331,53 @@ struct ReferenceAudioLibraryView: View {
                     .buttonStyle(StudioTintedButtonStyle())
             }
             Divider()
+            Picker("参考音频分类", selection: $model.referenceLibraryTab) {
+                Text("可用音频 · \(visibleReferences.count)").tag("visible")
+                Text("已隐藏 · \(hiddenReferences.count)").tag("hidden")
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 360)
+            if !model.referenceLibraryStatus.isEmpty {
+                Text(model.referenceLibraryStatus)
+                    .font(.callout)
+                    .foregroundStyle(
+                        model.referenceLibraryStatus.contains("无法")
+                            || model.referenceLibraryStatus.contains("不能")
+                            ? Color.red
+                            : Color.secondary
+                    )
+                    .padding(.horizontal, StudioTokens.space2)
+            }
             ScrollView {
                 LazyVStack(spacing: StudioTokens.space2) {
-                    ForEach(model.referenceLibrary) { reference in
+                    if displayedReferences.isEmpty {
+                        VStack(spacing: StudioTokens.space3) {
+                            Image(
+                                systemName: model.referenceLibraryTab == "hidden"
+                                    ? "eye.slash"
+                                    : "waveform"
+                            )
+                            .font(.system(size: 30))
+                            .foregroundStyle(.secondary)
+                            Text(
+                                model.referenceLibraryTab == "hidden"
+                                    ? "没有隐藏的参考音频"
+                                    : "没有可用的参考音频"
+                            )
+                            .font(.headline)
+                            Text(
+                                model.referenceLibraryTab == "hidden"
+                                    ? "在“可用音频”中点击隐藏后，会集中显示在这里。"
+                                    : "可以从工作台导入、录制或恢复隐藏的参考音频。"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 80)
+                    }
+                    ForEach(displayedReferences) { reference in
                         HStack(spacing: StudioTokens.space3) {
                             Image(systemName: reference.kind == "builtin" ? "waveform.badge.plus" : "waveform")
                                 .foregroundStyle(reference.hidden ? Color.secondary : Color.accentColor)
@@ -2112,28 +2404,45 @@ struct ReferenceAudioLibraryView: View {
                                 }
                             }
                             Spacer()
-                            Button {
-                                model.previewReference(reference)
-                            } label: {
-                                Image(systemName: "play.fill")
-                            }
-                            .buttonStyle(StudioToolbarButtonStyle())
-                            Button("使用") {
-                                model.useReference(reference)
-                                model.referenceLibraryPresented = false
-                            }
-                            .buttonStyle(StudioSecondaryButtonStyle())
-                            Button(reference.hidden ? "显示" : "隐藏") {
-                                model.setReferenceHidden(reference, hidden: !reference.hidden)
-                            }
-                            .buttonStyle(StudioSecondaryButtonStyle())
-                            if reference.kind == "custom" {
-                                Button(role: .destructive) {
-                                    model.pendingReferenceDeletion = reference
+                            HStack(spacing: StudioTokens.space2) {
+                                Button {
+                                    model.previewReference(reference)
                                 } label: {
-                                    Image(systemName: "trash")
+                                    Label("试听", systemImage: "play.fill")
                                 }
-                                .buttonStyle(StudioSecondaryButtonStyle(destructive: true))
+                                .buttonStyle(StudioCompactActionButtonStyle())
+                                Button {
+                                    model.useReference(reference)
+                                    model.referenceLibraryPresented = false
+                                } label: {
+                                    Label("使用", systemImage: "checkmark.circle")
+                                }
+                                .buttonStyle(StudioCompactActionButtonStyle())
+                                Button {
+                                    model.setReferenceHidden(reference, hidden: !reference.hidden)
+                                } label: {
+                                    Label(
+                                        reference.hidden ? "显示" : "隐藏",
+                                        systemImage: reference.hidden ? "eye" : "eye.slash"
+                                    )
+                                }
+                                .buttonStyle(StudioCompactActionButtonStyle())
+                                if reference.kind == "custom" {
+                                    Button(role: .destructive) {
+                                        model.referenceLibraryStatus = ""
+                                        model.pendingReferenceDeletion = reference
+                                    } label: {
+                                        Label("删除", systemImage: "trash")
+                                    }
+                                    .buttonStyle(StudioCompactActionButtonStyle(destructive: true))
+                                    .disabled(model.isDeletingReference)
+                                } else {
+                                    Button { } label: {
+                                        Label("内置", systemImage: "lock.fill")
+                                    }
+                                    .buttonStyle(StudioCompactActionButtonStyle())
+                                    .disabled(true)
+                                }
                             }
                         }
                         .padding(StudioTokens.space3)
@@ -2143,7 +2452,7 @@ struct ReferenceAudioLibraryView: View {
             }
         }
         .padding(StudioTokens.space5)
-        .frame(width: 820, height: 600)
+        .frame(width: 920, height: 640)
         .background(StudioBackground())
         .confirmationDialog(
             "删除“\(model.pendingReferenceDeletion?.name ?? "")”？",
@@ -2153,7 +2462,12 @@ struct ReferenceAudioLibraryView: View {
             ),
             titleVisibility: .visible
         ) {
-            Button("删除音频文件", role: .destructive) {
+            Button(
+                model.pendingReferenceDeletion?.inUse == true
+                    ? "切换为龙嫱并删除"
+                    : "删除音频文件",
+                role: .destructive
+            ) {
                 if let reference = model.pendingReferenceDeletion {
                     model.deleteReference(reference)
                 }
@@ -2161,7 +2475,14 @@ struct ReferenceAudioLibraryView: View {
             }
             Button("取消", role: .cancel) { model.pendingReferenceDeletion = nil }
         } message: {
-            Text("删除后无法恢复；被服务设置或预设引用的音频不会被删除。")
+            if let reference = model.pendingReferenceDeletion, reference.inUse {
+                Text(
+                    "该音频仍被\(reference.usages.joined(separator: "、"))使用。"
+                        + "继续删除会把这些设置自动切换为默认音色“龙嫱”，音频文件删除后无法恢复。"
+                )
+            } else {
+                Text("音频文件删除后无法恢复。")
+            }
         }
     }
 }
@@ -2371,6 +2692,7 @@ struct NativeStudioView: View {
                                 .font(.caption)
                                 .foregroundStyle(model.isRecordingSystemAudio ? .red : .secondary)
                             Button {
+                                model.referenceLibraryStatus = ""
                                 model.loadReferenceLibrary()
                                 model.referenceLibraryPresented = true
                             } label: {
@@ -2499,6 +2821,66 @@ struct NativeStudioView: View {
                     }
                     .buttonStyle(StudioNavigationButtonStyle())
                     .accessibilityLabel("打开高级参数设置")
+                }
+
+                GroupBox("性能优化") {
+                    VStack(alignment: .leading, spacing: StudioTokens.space3) {
+                        HStack(spacing: StudioTokens.space4) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label("为这台 Mac 自动选择生成策略", systemImage: "gauge.with.dots.needle.67percent")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("分别测试流式首包、生成速度和双路吞吐；完成后自动应用到阅读器与整书任务。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button {
+                                model.runPerformanceTest()
+                            } label: {
+                                Label(
+                                    model.isRunningPerformanceTest ? "测试中…" : "测试性能",
+                                    systemImage: "speedometer"
+                                )
+                            }
+                            .buttonStyle(
+                                StudioTintedButtonStyle(
+                                    height: StudioTokens.compactControlHeight
+                                )
+                            )
+                            .frame(width: 132)
+                            .disabled(
+                                !model.serviceReady
+                                    || model.isGenerating
+                                    || model.isRunningPerformanceTest
+                            )
+                        }
+                        if model.isRunningPerformanceTest {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                                .tint(StudioTokens.accent)
+                        }
+                        HStack(spacing: StudioTokens.space2) {
+                            performanceTile(
+                                title: "实时流式",
+                                value: model.performanceStreamSummary
+                            )
+                            performanceTile(
+                                title: "整块与整书",
+                                value: model.performanceBlockSummary
+                            )
+                            performanceTile(
+                                title: "实测收益",
+                                value: model.performanceGainSummary
+                            )
+                        }
+                        Text(model.performanceTestStatus)
+                            .font(.caption)
+                            .foregroundStyle(
+                                model.performanceTestStatus.contains("失败")
+                                    ? Color.red
+                                    : Color.secondary
+                            )
+                    }
                 }
 
                 GroupBox("当前生成参数") {
@@ -2647,6 +3029,24 @@ struct NativeStudioView: View {
         .padding(.vertical, 7)
         .background(
             (emphasized ? StudioTokens.accent.opacity(0.09) : Color.primary.opacity(0.045)),
+            in: RoundedRectangle(cornerRadius: StudioTokens.innerRadius, style: .continuous)
+        )
+    }
+
+    private func performanceTile(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, StudioTokens.space3)
+        .frame(height: 52)
+        .background(
+            Color.primary.opacity(0.045),
             in: RoundedRectangle(cornerRadius: StudioTokens.innerRadius, style: .continuous)
         )
     }

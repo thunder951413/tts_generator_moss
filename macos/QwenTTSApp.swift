@@ -353,11 +353,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let service: LocalService
     private let viewModel: NativeStudioViewModel
     private var statusItem: NSStatusItem!
-    private var statusLabel: NSMenuItem!
+    private var serviceStatusItem: NSMenuItem!
+    private var modelStatusItem: NSMenuItem!
+    private var voiceStatusItem: NSMenuItem!
+    private var taskStatusItem: NSMenuItem!
+    private var sttStatusItem: NSMenuItem!
     private var presetsMenu: NSMenu!
     private var window: NSWindow!
     private var statusTimer: Timer?
     private var isTerminating = false
+    private var isForceStopping = false
+    private let launchInBackground = CommandLine.arguments.contains("--background")
 
     override init() {
         let service = LocalService(repositoryRoot: AppDelegate.findRepositoryRoot())
@@ -392,6 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
         }
         buildWindow()
+        buildApplicationMenu()
         buildStatusMenu()
         updateMenuStatus("正在启动本地 Metal 服务…")
         service.startIfNeeded { [weak self] result in
@@ -401,7 +408,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     self?.applyServiceHealth(health)
                     self?.viewModel.updateHealth(health)
                     self?.viewModel.loadInitialData()
-                    self?.showStudio()
+                    if self?.launchInBackground == false {
+                        self?.showStudio()
+                    }
                 case .failure(let error):
                     self?.updateMenuStatus("服务启动失败")
                     self?.presentError(error)
@@ -456,19 +465,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.center()
     }
 
+    private func buildApplicationMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Qwen TTS")
+        let quitItem = NSMenuItem(
+            title: "退出 Qwen TTS",
+            action: #selector(quit(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "窗口")
+        let closeItem = NSMenuItem(
+            title: "关闭音频控制台",
+            action: #selector(closeStudio(_:)),
+            keyEquivalent: "w"
+        )
+        closeItem.target = self
+        windowMenu.addItem(closeItem)
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
+    }
+
     private func buildStatusMenu() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "TTS …"
+        statusItem = NSStatusBar.system.statusItem(withLength: 31)
+        if let button = statusItem.button {
+            button.image = makeTTSStatusIcon()
+            button.imagePosition = .imageOnly
+            button.title = ""
+            button.toolTip = "Qwen TTS · 正在连接"
+            button.setAccessibilityLabel("Qwen TTS")
+        }
         let menu = NSMenu()
         menu.delegate = self
-        statusLabel = NSMenuItem(title: "正在连接本地服务…", action: nil, keyEquivalent: "")
-        statusLabel.isEnabled = false
-        menu.addItem(statusLabel)
+        serviceStatusItem = makeStatusMenuItem("服务：正在连接")
+        modelStatusItem = makeStatusMenuItem("当前模型：正在读取")
+        voiceStatusItem = makeStatusMenuItem("当前音色：正在读取")
+        taskStatusItem = makeStatusMenuItem("任务：等待服务")
+        sttStatusItem = makeStatusMenuItem("转写：正在读取")
+        menu.addItem(serviceStatusItem)
+        menu.addItem(modelStatusItem)
+        menu.addItem(voiceStatusItem)
+        menu.addItem(taskStatusItem)
+        menu.addItem(sttStatusItem)
         menu.addItem(.separator())
         let openItem = NSMenuItem(title: "打开音频工作台", action: #selector(openStudio(_:)), keyEquivalent: "o")
         openItem.target = self
         menu.addItem(openItem)
-        let browserItem = NSMenuItem(title: "打开小说阅读器", action: #selector(openNovelReader(_:)), keyEquivalent: "")
+        let browserItem = NSMenuItem(title: "打开 Qwen 声阅", action: #selector(openNovelReader(_:)), keyEquivalent: "")
         browserItem.target = self
         menu.addItem(browserItem)
         let apiSettingsItem = NSMenuItem(
@@ -486,15 +538,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         refreshItem.target = self
         menu.addItem(refreshItem)
         menu.addItem(.separator())
+        let forceStopItem = NSMenuItem(
+            title: "强制停止所有音频与运算",
+            action: #selector(forceStopAllAudioAndComputation(_:)),
+            keyEquivalent: ""
+        )
+        forceStopItem.target = self
+        menu.addItem(forceStopItem)
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出 Qwen TTS", action: #selector(quit(_:)), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
         statusItem.menu = menu
     }
 
+    private func makeStatusMenuItem(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func makeTTSStatusIcon() -> NSImage {
+        let size = NSSize(width: 27, height: 16)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 9.7, weight: .bold),
+                .foregroundColor: NSColor.labelColor,
+                .kern: -0.45,
+                .paragraphStyle: style,
+            ]
+            let text = NSAttributedString(string: "TTS", attributes: attributes)
+            let textSize = text.size()
+            let textRect = NSRect(
+                x: rect.midX - textSize.width / 2,
+                y: rect.midY - textSize.height / 2 + 0.5,
+                width: textSize.width,
+                height: textSize.height
+            )
+            text.draw(in: textRect)
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "TTS"
+        return image
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         refreshHealth()
         refreshPresets()
+        viewModel.loadActiveServiceSettings()
+        refreshVoiceStatus()
     }
 
     private func refreshHealth() {
@@ -518,17 +613,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let active = scheduler?["active"] as? Int ?? 0
         let maximum = scheduler?["max_parallel"] as? Int ?? 0
         if state == "ready" {
-            statusItem.button?.title = active > 0 ? "语音 ●" : "语音 ✓"
-            let sttLabel = sttReady ? "STT ✓" : "STT 未就绪"
-            updateMenuStatus("TTS Metal · \(sttLabel) · \(profile) · GPU \(active)/\(maximum)")
+            serviceStatusItem?.title = "服务：Metal 已连接"
+            modelStatusItem?.title = "当前模型：\(profile.isEmpty ? viewModel.modelDisplayName : profile)"
+            taskStatusItem?.title = active > 0
+                ? "任务：正在生成 · GPU \(active)/\(maximum)"
+                : "任务：空闲 · GPU \(active)/\(maximum)"
+            sttStatusItem?.title = sttReady ? "转写：STT 已就绪" : "转写：STT 未就绪"
+            statusItem.button?.toolTip = active > 0 ? "Qwen TTS · 正在生成" : "Qwen TTS · 服务就绪"
+            refreshVoiceStatus()
         } else {
-            statusItem.button?.title = "语音 …"
-            updateMenuStatus("服务状态：\(state)")
+            serviceStatusItem?.title = "服务：\(state)"
+            modelStatusItem?.title = "当前模型：\(viewModel.modelDisplayName)"
+            taskStatusItem?.title = "任务：等待服务"
+            sttStatusItem?.title = "转写：等待服务"
+            statusItem.button?.toolTip = "Qwen TTS · \(state)"
+            refreshVoiceStatus()
         }
     }
 
     private func updateMenuStatus(_ text: String) {
-        statusLabel?.title = text
+        serviceStatusItem?.title = "服务：\(text)"
+    }
+
+    private func refreshVoiceStatus() {
+        let voice = viewModel.referenceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        voiceStatusItem?.title = "当前音色：\(voice.isEmpty ? "尚未设置" : voice)"
     }
 
     private func refreshPresets() {
@@ -562,12 +671,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func openStudio(_ sender: Any?) { showStudio() }
 
+    @objc private func closeStudio(_ sender: Any?) {
+        guard window.isVisible else { return }
+        window.performClose(sender)
+    }
+
     private func showStudio() {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openNovelReader(_ sender: Any?) {
+        let candidates = [
+            URL(fileURLWithPath: "/Applications/QwenReader.app"),
+            Bundle.main.bundleURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("QwenReader.app"),
+            service.repositoryRoot
+                .appendingPathComponent("dist/QwenReader.app"),
+        ]
+        if let readerApp = candidates.first(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }) {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: readerApp, configuration: configuration)
+            return
+        }
         NSWorkspace.shared.open(service.baseURL.appendingPathComponent("reader"))
     }
 
@@ -580,6 +710,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func refreshFromMenu(_ sender: Any?) {
         refreshHealth()
         refreshPresets()
+    }
+
+    @objc private func forceStopAllAudioAndComputation(_ sender: Any?) {
+        guard !isForceStopping else { return }
+        isForceStopping = true
+        updateMenuStatus("正在强制停止所有音频与运算…")
+        viewModel.forceStopAllAudioAndComputation { [weak self] result in
+            DispatchQueue.main.async {
+                self?.isForceStopping = false
+                switch result {
+                case .success:
+                    self?.updateMenuStatus("已强制停止所有音频与运算")
+                    self?.statusItem.button?.toolTip = "Qwen TTS · 已停止所有任务"
+                case .failure:
+                    self?.updateMenuStatus("强制停止请求失败")
+                    self?.statusItem.button?.toolTip = "Qwen TTS · 强制停止请求失败"
+                }
+            }
+        }
     }
 
     @objc private func quit(_ sender: Any?) { NSApp.terminate(nil) }

@@ -10,6 +10,7 @@ import gc
 import hashlib
 import hmac
 import html as html_lib
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -23,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -42,6 +44,8 @@ if str(STREAMING_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(STREAMING_MODULE_DIR))
 
 from document_projects import DocumentProjectManager
+from activity_control import PlaybackCoordinator
+from performance_tuning import PerformanceTuningStore, choose_recommendation
 from presets import VoicePresetStore
 from qwen_protocol import StreamingRequest
 from qwen_runtime import QwenWorkerRuntime
@@ -52,6 +56,7 @@ DEFAULT_UPLOAD_DIR = REPO_ROOT / "outputs" / "qwen_tts_uploads"
 DEFAULT_DOCUMENT_PROJECT_DIR = REPO_ROOT / "outputs" / "qwen_tts_document_projects"
 DEFAULT_SERVICE_JOB_DIR = REPO_ROOT / "outputs" / "qwen_tts_service_jobs"
 DEFAULT_PRESET_DIR = REPO_ROOT / "outputs" / "qwen_tts_presets"
+DEFAULT_PERFORMANCE_TUNING_PATH = REPO_ROOT / "outputs" / "qwen_tts_performance.json"
 NOVEL_READER_WEB_DIR = REPO_ROOT / "web" / "novel_reader"
 SERVICE_AUTH_COOKIE = "qwen_tts_service_session"
 DEFAULT_QWEN_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -446,6 +451,14 @@ class RuntimeManager:
             self._active_profile = None
             self._set_status(state="not_loaded")
 
+    def interrupt_active(self) -> int:
+        """Hard-stop active Metal worker processes without unloading the model controller."""
+        with self._lock:
+            runtime = self._runtime
+            if runtime is None or not hasattr(runtime, "interrupt_all"):
+                return 0
+            return int(runtime.interrupt_all())
+
     def _load(self, profile_id: str) -> QwenWorkerRuntime:
         if profile_id not in self.profiles:
             raise ValueError(f"unknown model profile: {profile_id}")
@@ -522,7 +535,13 @@ class RuntimeManager:
 class GpuGenerationScheduler:
     """Bound GPU inference concurrency with interactive priority and fairness."""
 
-    def __init__(self, max_parallel: int = 1, interactive_burst_limit: int = 4) -> None:
+    def __init__(
+        self,
+        max_parallel: int = 1,
+        interactive_burst_limit: int = 4,
+        external_queue_limit: int = 64,
+        external_blocked: Callable[[], bool] | None = None,
+    ) -> None:
         self.max_parallel = max(1, int(max_parallel))
         self.interactive_burst_limit = max(1, int(interactive_burst_limit))
         self._condition = threading.Condition()
@@ -530,8 +549,21 @@ class GpuGenerationScheduler:
         self._waiting_interactive = 0
         self._waiting_document = 0
         self._interactive_burst = 0
+        self._exclusive = False
+        self._waiting_exclusive = 0
+        self._waiting_external = 0
+        self._active_external = 0
+        self._internal_api_burst = 0
+        self._external_queue_limit = max(1, int(external_queue_limit))
+        self._external_blocked = external_blocked
+        self._external_sequence = 0
+        self._external_tickets: list[int] = []
 
-    def _acquire(self, priority: str) -> None:
+    def _acquire(
+        self,
+        priority: str,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
         interactive = priority == "interactive"
         with self._condition:
             if interactive:
@@ -540,7 +572,14 @@ class GpuGenerationScheduler:
                 self._waiting_document += 1
             try:
                 while (
-                    self._active >= self.max_parallel
+                    self._exclusive
+                    or self._waiting_exclusive > 0
+                    or self._active_external > 0
+                    or self._active >= self.max_parallel
+                    or (
+                        self._waiting_external > 0
+                        and self._internal_api_burst >= self.interactive_burst_limit
+                    )
                     or (
                         interactive
                         and self._waiting_document > 0
@@ -552,8 +591,16 @@ class GpuGenerationScheduler:
                         and self._interactive_burst < self.interactive_burst_limit
                     )
                 ):
-                    self._condition.wait()
+                    if cancelled and cancelled():
+                        raise RuntimeError("generation cancelled while queued")
+                    self._condition.wait(timeout=0.25)
+                if cancelled and cancelled():
+                    raise RuntimeError("generation cancelled while queued")
                 self._active += 1
+                if self._waiting_external > 0:
+                    self._internal_api_burst += 1
+                else:
+                    self._internal_api_burst = 0
                 if interactive and self._waiting_document > 0:
                     self._interactive_burst += 1
                 elif not interactive:
@@ -564,9 +611,44 @@ class GpuGenerationScheduler:
                 else:
                     self._waiting_document -= 1
 
-    def _release(self) -> None:
+    def _acquire_external(self, cancelled: Callable[[], bool] | None = None) -> None:
+        with self._condition:
+            if self._waiting_external >= self._external_queue_limit:
+                raise RuntimeError("external generation queue is full")
+            self._external_sequence += 1
+            ticket = self._external_sequence
+            self._external_tickets.append(ticket)
+            self._waiting_external += 1
+            try:
+                while (
+                    self._exclusive
+                    or self._waiting_exclusive > 0
+                    or self._active > 0
+                    or (
+                        (self._waiting_interactive > 0 or self._waiting_document > 0)
+                        and self._internal_api_burst < self.interactive_burst_limit
+                    )
+                    or self._external_tickets[0] != ticket
+                    or bool(self._external_blocked and self._external_blocked())
+                ):
+                    if cancelled and cancelled():
+                        raise RuntimeError("generation cancelled while queued")
+                    self._condition.wait(timeout=0.25)
+                if cancelled and cancelled():
+                    raise RuntimeError("generation cancelled while queued")
+                self._active += 1
+                self._active_external += 1
+                self._internal_api_burst = 0
+            finally:
+                self._waiting_external -= 1
+                if ticket in self._external_tickets:
+                    self._external_tickets.remove(ticket)
+
+    def _release(self, priority: str = "document") -> None:
         with self._condition:
             self._active = max(0, self._active - 1)
+            if priority == "external":
+                self._active_external = max(0, self._active_external - 1)
             self._condition.notify_all()
 
     def __enter__(self) -> GpuGenerationScheduler:
@@ -584,6 +666,46 @@ class GpuGenerationScheduler:
         finally:
             self._release()
 
+    @contextmanager
+    def api_slot(
+        self,
+        caller_kind: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ):
+        priority = "external" if str(caller_kind).lower() == "external" else "interactive"
+        if priority == "external":
+            self._acquire_external(cancelled)
+        else:
+            self._acquire("interactive", cancelled)
+        try:
+            yield
+        finally:
+            self._release(priority)
+
+    @contextmanager
+    def exclusive_slot(self):
+        with self._condition:
+            self._waiting_exclusive += 1
+            try:
+                while self._active > 0 or self._exclusive:
+                    self._condition.wait()
+                self._exclusive = True
+            finally:
+                self._waiting_exclusive -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._exclusive = False
+                self._condition.notify_all()
+
+    def configure_max_parallel(self, value: int) -> int:
+        with self._condition:
+            self.max_parallel = max(1, min(2, int(value)))
+            self._condition.notify_all()
+            return self.max_parallel
+
     def status(self) -> dict[str, int]:
         with self._condition:
             return {
@@ -591,8 +713,12 @@ class GpuGenerationScheduler:
                 "active": self._active,
                 "waiting_interactive": self._waiting_interactive,
                 "waiting_document": self._waiting_document,
+                "waiting_external": self._waiting_external,
+                "active_external": self._active_external,
+                "internal_api_burst": self._internal_api_burst,
                 "interactive_burst": self._interactive_burst,
                 "interactive_burst_limit": self.interactive_burst_limit,
+                "performance_test_active": self._exclusive,
             }
 
 
@@ -669,9 +795,17 @@ class StreamingJob:
 
 
 class StreamingJobManager:
-    def __init__(self, root_dir: str | Path) -> None:
+    def __init__(
+        self,
+        root_dir: str | Path,
+        *,
+        max_active_jobs: int = 64,
+        close_callback: Callable[[str], None] | None = None,
+    ) -> None:
         self._jobs: dict[str, StreamingJob] = {}
         self._lock = threading.Lock()
+        self.max_active_jobs = max(1, int(max_active_jobs))
+        self._close_callback = close_callback
         self.root_dir = Path(root_dir).resolve()
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self._load_existing()
@@ -716,6 +850,13 @@ class StreamingJobManager:
         if summary:
             job.update(**summary)
         with self._lock:
+            active_count = sum(
+                item.snapshot().get("state")
+                in {"queued", "loading_runtime", "running"}
+                for item in self._jobs.values()
+            )
+            if active_count >= self.max_active_jobs:
+                raise HTTPException(status_code=429, detail="audio generation queue is full")
             self._jobs[job.job_id] = job
         job.persist()
         return job
@@ -746,7 +887,21 @@ class StreamingJobManager:
             except queue.Full:
                 pass
         job.persist()
+        if self._close_callback is not None:
+            self._close_callback(job.job_id)
         return job
+
+    def close_all(self) -> list[str]:
+        with self._lock:
+            job_ids = [
+                job.job_id
+                for job in self._jobs.values()
+                if job.snapshot().get("state")
+                in {"queued", "loading_runtime", "running"}
+            ]
+        for job_id in job_ids:
+            self.close(job_id)
+        return job_ids
 
 
 def create_app(
@@ -785,7 +940,16 @@ def create_app(
         qwen_quant=str(qwen_quant),
         qwentts_library=str(qwentts_library),
     )
-    jobs = StreamingJobManager(DEFAULT_SERVICE_JOB_DIR)
+    performance_tuning = PerformanceTuningStore(DEFAULT_PERFORMANCE_TUNING_PATH)
+    for profile_id, profile in runtime_manager.profiles.items():
+        if performance_tuning.profile(profile_id) is not None:
+            profile["lanes"] = performance_tuning.recommendation(profile_id)["block_parallel"]
+    playback_coordinator = PlaybackCoordinator(max_waiters=64, internal_burst_limit=4)
+    jobs = StreamingJobManager(
+        DEFAULT_SERVICE_JOB_DIR,
+        max_active_jobs=64,
+        close_callback=playback_coordinator.release,
+    )
     output_dir = Path(output_dir)
     upload_dir = Path(upload_dir)
     reader_temp_dir = output_dir / "reader-temporary-audio"
@@ -793,7 +957,16 @@ def create_app(
     upload_dir.mkdir(parents=True, exist_ok=True)
     reader_temp_dir.mkdir(parents=True, exist_ok=True)
     preset_store = VoicePresetStore(preset_dir)
-    generation_scheduler = GpuGenerationScheduler(max_parallel=max_parallel_generations)
+    initial_recommendation = performance_tuning.recommendation(DEFAULT_MODEL_PROFILE)
+    initial_parallel = (
+        initial_recommendation["block_parallel"]
+        if performance_tuning.profile(DEFAULT_MODEL_PROFILE) is not None
+        else max(1, int(max_parallel_generations))
+    )
+    generation_scheduler = GpuGenerationScheduler(
+        max_parallel=initial_parallel,
+        external_blocked=playback_coordinator.internal_playback_active,
+    )
     ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
     stt_runtime = WhisperCppRuntime(
         binary=whisper_server,
@@ -813,11 +986,24 @@ def create_app(
         request_cls=StreamingRequest,
         generation_lock=generation_scheduler,
         ffmpeg_path=ffmpeg_path,
-        synthesis_workers=min(
-            max(1, int(document_parallel_generations)),
-            max(1, int(max_parallel_generations)),
+        synthesis_workers=(
+            initial_recommendation["document_workers"]
+            if performance_tuning.profile(DEFAULT_MODEL_PROFILE) is not None
+            else min(
+                max(1, int(document_parallel_generations)),
+                max(1, int(max_parallel_generations)),
+            )
         ),
     )
+
+    def apply_performance_profile(profile_id: str) -> dict[str, int]:
+        recommendation = performance_tuning.recommendation(profile_id)
+        if performance_tuning.profile(profile_id) is None:
+            return recommendation
+        runtime_manager.profiles[profile_id]["lanes"] = recommendation["block_parallel"]
+        generation_scheduler.configure_max_parallel(recommendation["block_parallel"])
+        document_projects.configure_synthesis_workers(recommendation["document_workers"])
+        return recommendation
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -861,6 +1047,7 @@ def create_app(
             "X-Audio-Sample-Rate",
             "X-Audio-Channels",
             "X-Stream-Id",
+            "X-Playback-Epoch",
         ],
     )
     resolved_access_password = str(access_password or "")
@@ -870,6 +1057,9 @@ def create_app(
 
     @app.middleware("http")
     async def require_service_login(request: Request, call_next):
+        request.state.caller_kind = "internal" if request.client and request.client.host in {
+            "127.0.0.1", "::1", "localhost", "testclient"
+        } else "external"
         if (
             not resolved_access_password
             or request.method == "OPTIONS"
@@ -885,6 +1075,11 @@ def create_app(
             or hmac.compare_digest(bearer, resolved_access_password)
             or hmac.compare_digest(api_key, resolved_access_password)
         ):
+            request.state.caller_kind = (
+                "internal"
+                if hmac.compare_digest(supplied, expected_session)
+                else "external"
+            )
             return await call_next(request)
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": "authentication required"}, status_code=401)
@@ -985,9 +1180,11 @@ def create_app(
 
     def _run_job(
         job: StreamingJob, request: StreamingRequest, mode_name: str,
-        streaming_generation: bool, model_profile: str,
+        streaming_generation: bool, model_profile: str, caller_kind: str,
     ) -> None:
         try:
+            if job.is_closed:
+                return
             job.update(
                 state="loading_runtime",
                 started_at=time.time(),
@@ -996,7 +1193,12 @@ def create_app(
                 model_profile=model_profile,
                 streaming_generation=streaming_generation,
             )
-            with generation_scheduler.interactive_slot():
+            with generation_scheduler.api_slot(
+                caller_kind,
+                cancelled=lambda: job.is_closed,
+            ):
+              if job.is_closed:
+                return
               with runtime_manager.session(model_profile) as runtime:
                 channels = int(runtime_manager.profiles[model_profile]["channels"])
                 job.update(state="running", sample_rate=runtime.sample_rate, channels=channels, n_vq=runtime.n_vq)
@@ -1057,11 +1259,15 @@ def create_app(
                         )
             _finish_stream_audio(job)
         except Exception as exc:  # noqa: BLE001
-            job.update(state="error", error=str(exc))
+            if job.is_closed:
+                job.update(state="closed", error=None, closed=True)
+            else:
+                job.update(state="error", error=str(exc))
             _finish_stream_audio(job)
 
     @app.post("/api/generate-stream/start")
     async def generate_stream_start(
+        http_request: Request,
         mode: str = Form("voice_clone"),
         language: str = Form(""),
         text: str = Form(...),
@@ -1094,6 +1300,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="text must not be empty")
 
         mode = "voice_clone"
+        caller_kind = str(getattr(http_request.state, "caller_kind", "external"))
         language = "Chinese"
         mode_name = MODE_CLONE
         service_settings = dict(active_service_settings().get("settings") or {})
@@ -1188,6 +1395,13 @@ def create_app(
         resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
         if not runtime_manager.profiles[model_profile]["streaming"]:
             streaming_generation_enabled = False
+        performance_recommendation = apply_performance_profile(model_profile)
+        if (
+            streaming_generation_enabled
+            and use_applied_service_settings
+            and performance_tuning.profile(model_profile) is not None
+        ):
+            codec_chunk_frames = performance_recommendation["stream_chunk_frames"]
         request = StreamingRequest(
             text=text,
             mode="voice_clone",
@@ -1231,11 +1445,20 @@ def create_app(
                 "ephemeral_audio": bool(
                     _safe_int(ephemeral_audio, default=0, minimum=0, maximum=1)
                 ),
+                "caller_kind": caller_kind,
+                "playback_epoch": playback_coordinator.status()["playback_epoch"],
             }
         )
         thread = threading.Thread(
             target=_run_job,
-            args=(job, request, mode_name, streaming_generation_enabled, model_profile),
+            args=(
+                job,
+                request,
+                mode_name,
+                streaming_generation_enabled,
+                model_profile,
+                caller_kind,
+            ),
             daemon=True,
         )
         job.thread = thread
@@ -1250,9 +1473,13 @@ def create_app(
                 "channels": runtime_manager.profiles[model_profile]["channels"],
                 "model_profile": model_profile,
                 "streaming_generation": streaming_generation_enabled,
+                "performance_profile_applied": performance_tuning.profile(model_profile) is not None,
+                "performance_recommendation": performance_recommendation,
                 "seed": resolved_seed,
                 "configured_seed": configured_seed,
                 "seed_mode": seed_mode,
+                "caller_kind": caller_kind,
+                "playback_epoch": playback_coordinator.status()["playback_epoch"],
             }
         )
 
@@ -1355,6 +1582,198 @@ def create_app(
     @app.get("/api/service-settings")
     async def get_service_settings() -> JSONResponse:
         return JSONResponse(active_service_settings())
+
+    def run_performance_benchmark(profile_id: str) -> dict[str, Any]:
+        if profile_id not in runtime_manager.profiles:
+            raise ValueError("无效的模型")
+        service_settings = dict(active_service_settings().get("settings") or {})
+        reference_path = str(
+            service_settings.get("reference_audio_path") or DEFAULT_CLONE_AUDIO_PATH
+        )
+        reference_path = str(
+            _resolve_allowed_reference_audio_path(
+                reference_path,
+                REFERENCE_AUDIO_DIR,
+                preset_store.audio_dir,
+            )
+        )
+        clone_mode = str(service_settings.get("qwen_clone_mode") or "xvec")
+        reference_text = str(service_settings.get("qwen_reference_text") or "").strip()
+        benchmark_dir = output_dir / "performance-benchmark"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        benchmark_text = "这是一段性能测试语音，用于选择最适合这台 Mac 的生成策略。"
+
+        def run_case(*, chunk_frames: int, non_streaming: bool, seed: int) -> dict[str, Any]:
+            request = StreamingRequest(
+                text=benchmark_text,
+                mode="voice_clone",
+                prompt_audio_path=reference_path,
+                language="Chinese",
+                max_new_frames=72,
+                do_sample=True,
+                temperature=_safe_float(
+                    service_settings.get("qwen_temperature"),
+                    default=0.9,
+                    minimum=0.1,
+                    maximum=3.0,
+                ),
+                top_p=_safe_float(
+                    service_settings.get("qwen_top_p"),
+                    default=1.0,
+                    minimum=0.1,
+                    maximum=1.0,
+                ),
+                top_k=_safe_int(
+                    service_settings.get("qwen_top_k"),
+                    default=50,
+                    minimum=1,
+                    maximum=200,
+                ),
+                repetition_penalty=_safe_float(
+                    service_settings.get("qwen_repetition_penalty"),
+                    default=1.05,
+                    minimum=0.8,
+                    maximum=2.0,
+                ),
+                seed=seed,
+                codec_chunk_frames=chunk_frames,
+                qwen_xvec_only=clone_mode != "icl",
+                qwen_reference_text=reference_text,
+                qwen_non_streaming_mode=non_streaming,
+                qwen_append_silence=False,
+                qwen_min_new_tokens=2,
+            )
+            started = time.perf_counter()
+            first_audio_seconds: float | None = None
+            result: dict[str, Any] | None = None
+            with runtime_manager.session(profile_id) as runtime:
+                for event in synthesize_for_profile_runtime(
+                    runtime,
+                    request,
+                    output_dir=benchmark_dir,
+                ):
+                    if event.type == "audio" and first_audio_seconds is None:
+                        first_audio_seconds = time.perf_counter() - started
+                    elif event.type == "result":
+                        result = dict(event.data)
+            elapsed = time.perf_counter() - started
+            metadata = dict((result or {}).get("metadata") or {})
+            measurement = {
+                "chunk_frames": chunk_frames,
+                "elapsed_seconds": round(elapsed, 4),
+                "first_audio_seconds": round(
+                    float(first_audio_seconds or metadata.get("first_audio_latency_seconds") or elapsed),
+                    4,
+                ),
+                "audio_seconds": round(float(metadata.get("duration_seconds") or 0), 4),
+                "generation_realtime_factor": round(
+                    float(metadata.get("generation_realtime_factor") or 0),
+                    4,
+                ),
+            }
+            _remove_generated_result_files(result)
+            return measurement
+
+        with generation_scheduler.exclusive_slot():
+            with runtime_manager.session(profile_id) as runtime:
+                runtime.resize_lanes(1)
+            # Warm the selected reference and model before timed cases.
+            run_case(chunk_frames=8, non_streaming=False, seed=880001)
+            stream_measurements = [
+                run_case(chunk_frames=chunk, non_streaming=False, seed=880010 + chunk)
+                for chunk in (4, 8, 12)
+            ]
+            single_block = run_case(
+                chunk_frames=8,
+                non_streaming=True,
+                seed=880101,
+            )
+            parallel_block_seconds: float | None = None
+            parallel_error = ""
+            try:
+                with runtime_manager.session(profile_id) as runtime:
+                    runtime.resize_lanes(2)
+                parallel_started = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="qwen-benchmark") as pool:
+                    futures = [
+                        pool.submit(
+                            run_case,
+                            chunk_frames=8,
+                            non_streaming=True,
+                            seed=880201 + index,
+                        )
+                        for index in range(2)
+                    ]
+                    parallel_measurements = [future.result() for future in futures]
+                parallel_block_seconds = time.perf_counter() - parallel_started
+            except Exception as exc:
+                logging.exception("two-lane performance benchmark failed")
+                parallel_measurements = []
+                parallel_error = str(exc)
+
+            recommendation = choose_recommendation(
+                stream_measurements=stream_measurements,
+                single_block_seconds=float(single_block["elapsed_seconds"]),
+                parallel_block_seconds=parallel_block_seconds,
+            )
+            with runtime_manager.session(profile_id) as runtime:
+                runtime.resize_lanes(recommendation["block_parallel"])
+            runtime_manager.profiles[profile_id]["lanes"] = recommendation["block_parallel"]
+            generation_scheduler.configure_max_parallel(recommendation["block_parallel"])
+            document_projects.configure_synthesis_workers(
+                recommendation["document_workers"]
+            )
+
+        throughput_gain = (
+            (2.0 * float(single_block["elapsed_seconds"])) / parallel_block_seconds
+            if parallel_block_seconds
+            else 1.0
+        )
+        result = {
+            "model_profile": profile_id,
+            "model_label": MODEL_PROFILE_LABELS[profile_id],
+            "recommendation": recommendation,
+            "stream_measurements": stream_measurements,
+            "block_measurements": {
+                "single": single_block,
+                "parallel_elapsed_seconds": (
+                    round(parallel_block_seconds, 4) if parallel_block_seconds else None
+                ),
+                "parallel_cases": parallel_measurements,
+                "throughput_gain": round(throughput_gain, 3),
+                "parallel_error": parallel_error,
+            },
+            "applied": True,
+        }
+        return performance_tuning.save_profile(profile_id, result)
+
+    @app.get("/api/performance")
+    async def performance_profile() -> JSONResponse:
+        active_profile = (
+            runtime_manager.status().get("active_profile") or DEFAULT_MODEL_PROFILE
+        )
+        return JSONResponse(
+            {
+                **performance_tuning.public_payload(),
+                "active_profile": active_profile,
+                "active_recommendation": performance_tuning.recommendation(active_profile),
+            }
+        )
+
+    @app.post("/api/performance/benchmark")
+    async def performance_benchmark(
+        payload: dict[str, Any] = Body(default={}),
+    ) -> JSONResponse:
+        profile_id = str(
+            payload.get("model_profile")
+            or active_service_settings().get("settings", {}).get("model_profile")
+            or DEFAULT_MODEL_PROFILE
+        )
+        try:
+            result = await asyncio.to_thread(run_performance_benchmark, profile_id)
+            return JSONResponse(result)
+        except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.put("/api/service-settings/active-preset")
     async def activate_service_preset(payload: dict[str, Any] = Body(...)) -> JSONResponse:
@@ -1484,19 +1903,57 @@ def create_app(
         return JSONResponse({"ok": True, "hidden": hidden})
 
     @app.delete("/api/reference-audio-library/{reference_id}")
-    async def delete_reference_audio(reference_id: str) -> JSONResponse:
+    async def delete_reference_audio(
+        reference_id: str,
+        replace_usages: bool = False,
+    ) -> JSONResponse:
         if any(
             builtin_reference_id(str(voice.get("audio_path") or "")) == reference_id
             for voice in BAILIAN_VOICE_ROWS
         ):
             raise HTTPException(status_code=400, detail="内置参考音频只能隐藏，不能删除")
+        default_voice = next(
+            (
+                voice
+                for voice in BAILIAN_VOICE_ROWS
+                if voice.get("audio_path") == DEFAULT_CLONE_AUDIO_PATH
+            ),
+            BAILIAN_VOICE_ROWS[0] if BAILIAN_VOICE_ROWS else {},
+        )
         try:
-            preset_store.delete_reference_audio(reference_id)
+            replaced_usages = preset_store.delete_reference_audio(
+                reference_id,
+                replacement_audio_path=(
+                    str(default_voice.get("audio_path") or DEFAULT_CLONE_AUDIO_PATH)
+                    if replace_usages
+                    else ""
+                ),
+                replacement_voice_name=(
+                    str(default_voice.get("name") or "服务默认音色")
+                    if replace_usages
+                    else ""
+                ),
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="reference audio not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return JSONResponse({"ok": True})
+        return JSONResponse(
+            {
+                "ok": True,
+                "replaced_usages": replaced_usages,
+                "replacement": (
+                    {
+                        "name": str(default_voice.get("name") or "服务默认音色"),
+                        "reference_audio_path": str(
+                            default_voice.get("audio_path") or DEFAULT_CLONE_AUDIO_PATH
+                        ),
+                    }
+                    if replaced_usages
+                    else None
+                ),
+            }
+        )
 
     @app.post("/api/presets")
     async def create_preset(payload: dict[str, Any] = Body(...)) -> JSONResponse:
@@ -1588,9 +2045,29 @@ def create_app(
             }
         )
 
+    async def _acquire_playback(job: StreamingJob) -> dict[str, object]:
+        job.update(playback_state="waiting")
+        acquired = await asyncio.to_thread(
+            playback_coordinator.acquire,
+            job.job_id,
+            str(job.snapshot().get("caller_kind") or "external"),
+            cancelled=lambda: job.is_closed,
+            timeout=600.0,
+        )
+        if not acquired:
+            job.update(playback_state="cancelled")
+            raise HTTPException(status_code=409, detail="playback was cancelled or queue is full")
+        status = playback_coordinator.status()
+        job.update(
+            playback_state="active",
+            playback_epoch=status["playback_epoch"],
+        )
+        return status
+
     @app.get("/api/generate-stream/{job_id}/audio")
     async def generate_stream_audio(job_id: str, request: Request) -> StreamingResponse:
         job = jobs.get(job_id)
+        playback_status = await _acquire_playback(job)
 
         async def iterator():
             try:
@@ -1618,6 +2095,7 @@ def create_app(
                 "X-Audio-Sample-Rate": str(snapshot.get("sample_rate", 48000)),
                 "X-Audio-Channels": str(snapshot.get("channels", 2)),
                 "X-Stream-Id": job_id,
+                "X-Playback-Epoch": str(playback_status["playback_epoch"]),
             },
         )
 
@@ -1633,19 +2111,32 @@ def create_app(
         return JSONResponse(job.result)
 
     @app.get("/api/generate-stream/{job_id}/result-audio")
-    async def generate_stream_result_audio(job_id: str) -> FileResponse:
+    async def generate_stream_result_audio(
+        job_id: str,
+        playback: int = 0,
+    ) -> FileResponse:
         job = jobs.get(job_id)
         if job.result is None:
             raise HTTPException(status_code=404, detail="result is not ready")
         audio_path = Path(str(job.result.get("audio_path") or ""))
         if not audio_path.is_file():
             raise HTTPException(status_code=404, detail="generated audio is missing")
-        return FileResponse(str(audio_path), media_type="audio/wav", filename="generated.wav")
+        headers = None
+        if bool(_safe_int(playback, default=0, minimum=0, maximum=1)):
+            playback_status = await _acquire_playback(job)
+            headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
+        return FileResponse(
+            str(audio_path),
+            media_type="audio/wav",
+            filename="generated.wav",
+            headers=headers,
+        )
 
     @app.get("/api/generate-stream/{job_id}/result-audio-aac")
     async def generate_stream_result_audio_aac(
         job_id: str,
         bitrate: str = "80k",
+        playback: int = 0,
     ) -> FileResponse:
         job = jobs.get(job_id)
         if job.result is None:
@@ -1688,10 +2179,15 @@ def create_app(
                     status_code=500,
                     detail=(completed.stderr or "AAC encoding failed").strip(),
                 )
+        headers = None
+        if bool(_safe_int(playback, default=0, minimum=0, maximum=1)):
+            playback_status = await _acquire_playback(job)
+            headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
             str(target),
             media_type="audio/mp4",
             filename=f"reader-block-{job_id}.m4a",
+            headers=headers,
         )
 
     def _remove_ephemeral_job_audio(job: StreamingJob) -> None:
@@ -1724,6 +2220,32 @@ def create_app(
         jobs.close(job_id)
         return JSONResponse({"ok": True})
 
+    @app.get("/api/playback/status")
+    async def playback_status() -> JSONResponse:
+        return JSONResponse(playback_coordinator.status())
+
+    @app.post("/api/service/stop-all")
+    async def service_stop_all(request: Request) -> JSONResponse:
+        if str(getattr(request.state, "caller_kind", "external")) != "internal":
+            raise HTTPException(status_code=403, detail="global stop is restricted to internal clients")
+        playback = playback_coordinator.force_stop()
+        stopped_jobs = jobs.close_all()
+        stopped_projects = document_projects.stop_all()
+        interrupted_workers, stt_stopped = await asyncio.gather(
+            asyncio.to_thread(runtime_manager.interrupt_active),
+            asyncio.to_thread(stt_runtime.close),
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                **playback,
+                "stopped_jobs": stopped_jobs,
+                "stopped_projects": stopped_projects,
+                "interrupted_workers": interrupted_workers,
+                "stt_stopped": stt_stopped is None,
+            }
+        )
+
     @app.get("/api/runtime")
     async def runtime_info() -> JSONResponse:
         return JSONResponse(
@@ -1741,6 +2263,7 @@ def create_app(
                     **generation_scheduler.status(),
                     "document_parallel": document_projects.synthesis_workers,
                 },
+                "playback": playback_coordinator.status(),
                 "stt": stt_runtime.status() if stt_enabled else {
                     "state": "disabled",
                     "ready": False,
@@ -1795,6 +2318,7 @@ def create_app(
                     **generation_scheduler.status(),
                     "document_parallel": document_projects.synthesis_workers,
                 },
+                "playback": playback_coordinator.status(),
                 "stt": stt_runtime.status() if stt_enabled else {
                     "state": "disabled",
                     "ready": False,
@@ -2003,6 +2527,10 @@ def create_app(
     @app.post("/api/document-projects/{project_id}/start")
     async def start_document_project(project_id: str) -> JSONResponse:
         try:
+            project = document_projects.get_project(project_id)
+            apply_performance_profile(
+                str((project.get("settings") or {}).get("model_profile") or DEFAULT_MODEL_PROFILE)
+            )
             # A project is immutable with respect to voice/model parameters.
             # Resume always uses its saved settings, never the page's current controls.
             return JSONResponse(document_projects.start(project_id, settings=None))
@@ -2020,6 +2548,9 @@ def create_app(
     ) -> JSONResponse:
         try:
             project = document_projects.get_project(project_id)
+            apply_performance_profile(
+                str((project.get("settings") or {}).get("model_profile") or DEFAULT_MODEL_PROFILE)
+            )
             maximum = max(0, len(project.get("segments", [])) - 1)
             start_index = _safe_int(segment_start, default=0, minimum=0, maximum=maximum)
             end_index = _safe_int(
@@ -2055,6 +2586,20 @@ def create_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
         except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/document-projects/{project_id}")
+    async def rename_document_project(
+        project_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        try:
+            return JSONResponse(
+                document_projects.rename(project_id, name=str(payload.get("name") or ""))
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/document-projects/{project_id}/playback")
@@ -2834,6 +3379,8 @@ let currentStreamAbortController = null;
 let currentStreamingGenerationEnabled = true;
 let playbackPaused = false;
 let playbackCompletionTimer = null;
+let playbackEpoch = null;
+let playbackControlStopping = false;
 let currentInitialPlaybackDelaySeconds = 1.5;
 let adaptiveRealtimeBufferTargetSeconds = 1.5;
 let estimatedRealtimeAudioSeconds = 0;
@@ -4393,6 +4940,12 @@ function monitorPlaybackCompletion() {
     playbackPaused = false;
     nextPlaybackTime = 0;
     updatePauseButtonState();
+    if (currentJob) {
+      const completedJob = currentJob;
+      currentJob = null;
+      currentJobOwned = false;
+      fetch(apiUrl(`api/generate-stream/${completedJob}/close`), { method: "POST" }).catch(() => {});
+    }
   };
   playbackCompletionTimer = window.setTimeout(() => poll().catch(() => {}), 120);
 }
@@ -4402,6 +4955,8 @@ async function streamAudio(jobId, sampleRate, channels) {
   });
   if (!response.ok) throw new Error(await response.text());
   if (!response.body) throw new Error("ReadableStream is not available on this response.");
+  const responseEpoch = Number(response.headers.get("X-Playback-Epoch"));
+  if (Number.isFinite(responseEpoch)) playbackEpoch = responseEpoch;
   const reader = response.body.getReader();
   const resolvedChannels = Number(channels || response.headers.get("X-Audio-Channels") || 2);
   const resolvedSampleRate = Number(sampleRate || response.headers.get("X-Audio-Sample-Rate") || 48000);
@@ -4421,8 +4976,42 @@ async function streamAudio(jobId, sampleRate, channels) {
       remainder = merged.subarray(alignedLength);
     }
   }
+  const finalStatus = await fetchJson(apiUrl(`api/generate-stream/${jobId}/status`)).catch(() => null);
+  if (finalStatus && finalStatus.state === "closed") {
+    await closeRealtimeStream(false);
+    field("summary").textContent = "后台已强制停止全部音频与运算";
+    return;
+  }
   flushPendingRealtimePcmChunks();
   monitorPlaybackCompletion();
+}
+
+async function pollPlaybackControl() {
+  const outputAudio = field("audio-output");
+  const active = generationActive || audioContext || (outputAudio && !outputAudio.paused);
+  if (!active || playbackControlStopping) return;
+  try {
+    const status = await fetchJson(apiUrl("api/playback/status"));
+    const epoch = Number(status.playback_epoch);
+    if (!Number.isFinite(epoch)) return;
+    if (playbackEpoch == null) {
+      playbackEpoch = epoch;
+      return;
+    }
+    if (epoch !== playbackEpoch) {
+      playbackEpoch = epoch;
+      playbackControlStopping = true;
+      await closeRealtimeStream(false);
+      outputAudio.pause();
+      outputAudio.removeAttribute("src");
+      outputAudio.load();
+      field("summary").textContent = "后台已强制停止全部音频与运算";
+      setStatus("全部音频输出和计算任务已停止。");
+    }
+  } catch (err) {
+  } finally {
+    playbackControlStopping = false;
+  }
 }
 async function pollStatus(jobId) {
   const status = await fetchJson(apiUrl(`api/generate-stream/${jobId}/status`));
@@ -4439,13 +5028,20 @@ async function pollStatus(jobId) {
     field("download").href = apiUrl(`api/generate-stream/${jobId}/result-audio`);
     field("download").style.display = "inline";
     const outputAudio = field("audio-output");
-    outputAudio.src = apiUrl(`api/generate-stream/${jobId}/result-audio`);
+    const playbackQuery = currentStreamingGenerationEnabled ? "" : "?playback=1";
+    outputAudio.src = apiUrl(`api/generate-stream/${jobId}/result-audio${playbackQuery}`);
     outputAudio.removeAttribute("disabled");
     outputAudio.load();
     setStatus({ ...status, result });
     if (!currentStreamingGenerationEnabled) {
       outputAudio.play().catch(err => {
         setStatus({ ...status, result, autoplay_error: String(err) });
+        const failedJob = currentJob;
+        currentJob = null;
+        currentJobOwned = false;
+        if (failedJob) {
+          fetch(apiUrl(`api/generate-stream/${failedJob}/close`), { method: "POST" }).catch(() => {});
+        }
       });
     }
     setGenerationActive(false);
@@ -4511,6 +5107,9 @@ field("start").onclick = async () => {
     const response = await fetch(apiUrl("api/generate-stream/start"), { method: "POST", body: form });
     if (!response.ok) throw new Error(await response.text());
     const start = await response.json();
+    if (Number.isFinite(Number(start.playback_epoch))) {
+      playbackEpoch = Number(start.playback_epoch);
+    }
     setStatus({
       state: "queued",
       seed: start.seed,
@@ -4557,6 +5156,24 @@ field("pause").onclick = async () => {
   }
   updatePauseButtonState();
 };
+
+field("audio-output").addEventListener("ended", () => {
+  if (!currentJob) return;
+  const completedJob = currentJob;
+  currentJob = null;
+  currentJobOwned = false;
+  fetch(apiUrl(`api/generate-stream/${completedJob}/close`), { method: "POST" }).catch(() => {});
+});
+field("audio-output").addEventListener("error", () => {
+  if (!currentJob || currentStreamingGenerationEnabled) return;
+  const failedJob = currentJob;
+  currentJob = null;
+  currentJobOwned = false;
+  fetch(apiUrl(`api/generate-stream/${failedJob}/close`), { method: "POST" }).catch(() => {});
+});
+window.setInterval(() => {
+  pollPlaybackControl().catch(() => {});
+}, 400);
 
 field("text").value = DEFAULT_TEXT;
 setupLanguages();
@@ -4681,10 +5298,37 @@ pollRuntime();
 """
 
 
+def _is_loopback_bind_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower().strip("[]")
+    if normalized == "localhost" or normalized.startswith("127."):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_bind_security(host: str, password: str) -> None:
+    selected_password = str(password or "")
+    if (
+        not _is_loopback_bind_host(host)
+        and (len(selected_password) < 4 or selected_password == "change-me")
+    ):
+        raise ValueError(
+            "Refusing non-loopback exposure with an empty/weak password. "
+            "Set --access-password or QWEN_TTS_ACCESS_PASSWORD to at least 4 characters."
+        )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Qwen3-TTS Apple Silicon service.")
-    parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "7861")))
+    parser.add_argument(
+        "--access-password",
+        default=os.environ.get("QWEN_TTS_ACCESS_PASSWORD", ""),
+        help="Password accepted as a login, Bearer token, or X-API-Key.",
+    )
     parser.add_argument("--qwen-python", default=os.environ.get("QWEN_TTS_PYTHON", str(DEFAULT_QWEN_PYTHON)))
     parser.add_argument(
         "--qwen-worker-script",
@@ -4761,6 +5405,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    try:
+        _validate_bind_security(args.host, args.access_password)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     app = create_app(
         qwen_python=args.qwen_python,
         qwen_worker_script=args.qwen_worker_script,
@@ -4777,7 +5425,7 @@ def main() -> None:
         preload=not args.no_preload,
         max_parallel_generations=max(1, int(args.max_parallel_generations)),
         document_parallel_generations=max(1, int(args.document_parallel_generations)),
-        access_password=os.environ.get("QWEN_TTS_ACCESS_PASSWORD", ""),
+        access_password=args.access_password,
         stt_enabled=not args.no_stt,
         stt_preload=not args.no_stt_preload,
         whisper_server=args.whisper_server,

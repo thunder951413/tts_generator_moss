@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -40,6 +41,8 @@ def load_app_module():
 
 def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
     module = load_app_module()
+    module.DEFAULT_DOCUMENT_PROJECT_DIR = tmp_path / "documents"
+    module.DEFAULT_PERFORMANCE_TUNING_PATH = tmp_path / "performance.json"
     app = module.create_app(
         qwen_python=sys.executable,
         qwentts_library="",
@@ -58,7 +61,20 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert reader.status_code == 200
         assert "Qwen 声阅" in reader.text
         assert 'id="reader-settings-dialog"' in reader.text
-        assert 'id="listening-settings-card"' in reader.text
+        assert 'id="listening-settings-card"' not in reader.text
+        assert 'id="inspector"' not in reader.text
+        assert 'id="listening-controls-button"' in reader.text
+        assert 'id="listening-controls-dialog"' in reader.text
+        assert 'id="start-listening"' in reader.text
+        assert 'id="playback-rate"' in reader.text
+        assert 'id="library-manage-button"' in reader.text
+        assert 'id="library-manager-dialog"' in reader.text
+        assert 'id="book-manager-tab-all"' in reader.text
+        assert 'id="book-manager-tab-completed"' in reader.text
+        assert "reader.css?v=" in reader.text
+        assert 'rel="icon"' in reader.text
+        assert "/reader-assets/assets/favicon-64.png" in reader.text
+        assert 'rel="apple-touch-icon"' in reader.text
         assert 'id="preset-select"' not in reader.text
         assert 'id="voice-select"' not in reader.text
         assert 'id="stop-generation"' in reader.text
@@ -68,23 +84,60 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert 'id="book-progress-detail-button"' in reader.text
         reader_script = client.get("/reader-assets/reader.js")
         assert reader_script.status_code == 200
+        reader_icon = client.get("/reader-assets/assets/favicon-64.png")
+        assert reader_icon.status_code == 200
+        assert reader_icon.headers["content-type"] == "image/png"
         assert '"/api/service-settings"' in reader_script.text
         assert '"/api/presets"' not in reader_script.text
         assert 'form.set("qwen_non_streaming_mode", "1")' in reader_script.text
         assert 'ephemeral-audio' in reader_script.text
         assert "queueQualityBlock" in reader_script.text
+        assert "startSelectedListening" in reader_script.text
+        assert 'setListeningMode("quality")' in reader_script.text
+        assert "qwen-reader-playback-rate" in reader_script.text
         assert "qualityJobs: new Set()" in reader_script.text
         assert "renderWholeBookProgress" in reader_script.text
         assert 'window.addEventListener("pagehide"' in reader_script.text
+        assert 'document.addEventListener("visibilitychange"' in reader_script.text
+        assert "if (document.hidden) return;" in reader_script.text
         assert "超过 60 秒没有数据" in reader_script.text
+        assert "/api/playback/status" in reader_script.text
+        assert "playback=1" in reader_script.text
         assert 'stopCurrentGeneration' in reader_script.text
+        assert "renameManagedBook" in reader_script.text
+        assert "deleteManagedBook" in reader_script.text
+        assert 'method: "DELETE"' in reader_script.text
+        performance = client.get("/api/performance")
+        assert performance.status_code == 200
+        assert performance.json()["active_recommendation"]["block_parallel"] == 1
 
         native_source = (ROOT / "macos" / "NativeStudio.swift").read_text(encoding="utf-8")
+        app_source = (ROOT / "macos" / "QwenTTSApp.swift").read_text(encoding="utf-8")
+        reader_app_source = (ROOT / "macos" / "QwenReaderApp.swift").read_text(encoding="utf-8")
+        assert 'action: #selector(closeStudio(_:))' in app_source
+        assert 'keyEquivalent: "w"' in app_source
+        assert 'CommandLine.arguments.contains("--background")' in app_source
+        assert 'NSAttributedString(string: "TTS"' in app_source
+        assert 'title: "强制停止所有音频与运算"' in app_source
+        assert 'api/service/stop-all' in native_source
+        assert '?playback=1' in native_source
+        assert 'voiceStatusItem?.title = "当前音色：' in app_source
+        assert 'taskStatusItem?.title = active > 0' in app_source
+        assert "WKWebView" in reader_app_source
+        assert 'Window("Qwen 声阅", id: "reader")' in reader_app_source
+        assert "QwenReaderServiceURL" in reader_app_source
+        assert 'configuration.arguments = ["--background"]' in reader_app_source
         assert "final class NativePCMStreamPlayer" in native_source
         assert "final class SystemAudioRecorder" in native_source
         assert "SCStreamOutput" in native_source
         assert "struct SystemAudioTrimView" in native_source
         assert "struct ReferenceAudioLibraryView" in native_source
+        assert 'Text("可用音频 · \\(visibleReferences.count)")' in native_source
+        assert 'Text("已隐藏 · \\(hiddenReferences.count)")' in native_source
+        assert 'Label("试听", systemImage: "play.fill")' in native_source
+        assert 'Label("删除", systemImage: "trash")' in native_source
+        assert '"api/performance/benchmark"' in native_source
+        assert '"测试性能"' in native_source
         assert 'api/generate-stream/\\(jobID)/audio' in native_source
         service_source = (ROOT / "clis" / "qwen_tts_app.py").read_text(encoding="utf-8")
         assert "await request.is_disconnected()" in service_source
@@ -104,6 +157,23 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert service_settings.status_code == 200
         assert service_settings.json()["settings"]["reference_audio_path"]
 
+        created_book = client.post(
+            "/api/document-projects",
+            files={"document": ("测试小说.txt", "第一章 开始\n这是一段测试正文。", "text/plain")},
+            data={"name": "测试小说", "max_chars": "180", "settings_json": "{}"},
+        )
+        assert created_book.status_code == 200
+        book_id = created_book.json()["id"]
+        renamed_book = client.put(
+            f"/api/document-projects/{book_id}",
+            json={"name": "重命名后的小说"},
+        )
+        assert renamed_book.status_code == 200
+        assert renamed_book.json()["name"] == "重命名后的小说"
+        deleted_book = client.delete(f"/api/document-projects/{book_id}")
+        assert deleted_book.status_code == 200
+        assert client.get(f"/api/document-projects/{book_id}").status_code == 404
+
         runtime = client.get("/api/runtime").json()
         assert runtime["backend"] == "ggml"
         assert runtime["quant"] == "Q4_K_M"
@@ -116,9 +186,51 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert voices["default_reference_audio_path"]
 
 
+def test_performance_recommendation_selects_stream_chunk_and_parallelism() -> None:
+    module = load_app_module()
+    recommendation = module.choose_recommendation(
+        stream_measurements=[
+            {
+                "chunk_frames": 4,
+                "elapsed_seconds": 3.0,
+                "first_audio_seconds": 0.45,
+                "generation_realtime_factor": 1.4,
+            },
+            {
+                "chunk_frames": 8,
+                "elapsed_seconds": 2.7,
+                "first_audio_seconds": 0.65,
+                "generation_realtime_factor": 1.8,
+            },
+        ],
+        single_block_seconds=4.0,
+        parallel_block_seconds=5.8,
+    )
+    assert recommendation["stream_chunk_frames"] == 4
+    assert recommendation["block_parallel"] == 2
+    conservative = module.choose_recommendation(
+        stream_measurements=[],
+        single_block_seconds=4.0,
+        parallel_block_seconds=7.5,
+    )
+    assert conservative["stream_chunk_frames"] == 8
+    assert conservative["block_parallel"] == 1
+
+
 def test_random_seed_is_resolved_before_task_creation() -> None:
     module = load_app_module()
     assert module._safe_int(-1, default=1234, minimum=-1, maximum=999999) == -1
+
+
+def test_direct_service_bind_defaults_are_safe() -> None:
+    module = load_app_module()
+    module._validate_bind_security("127.0.0.1", "")
+    module._validate_bind_security("::1", "")
+    module._validate_bind_security("0.0.0.0", "1234")
+    with pytest.raises(ValueError, match="Refusing non-loopback exposure"):
+        module._validate_bind_security("0.0.0.0", "")
+    with pytest.raises(ValueError, match="Refusing non-loopback exposure"):
+        module._validate_bind_security("::", "change-me")
 
 
 def test_voice_presets_are_persistent_and_can_import_reference_audio(tmp_path: Path) -> None:
@@ -265,6 +377,18 @@ def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Pa
         )
         assert restored.status_code == 200
 
+        preset = client.post(
+            "/api/presets",
+            json={
+                "name": "引用预设",
+                "settings": {
+                    "model_profile": "qwen_0_6b",
+                    "voice_name": "narrator",
+                    "reference_audio_path": reference_path,
+                },
+            },
+        )
+        assert preset.status_code == 201
         applied = client.put(
             "/api/service-settings",
             json={
@@ -280,9 +404,19 @@ def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Pa
         assert blocked.status_code == 409
         assert Path(reference_path).is_file()
 
-        assert client.delete("/api/service-settings").status_code == 200
-        deleted = client.delete(f"/api/reference-audio-library/{custom['id']}")
+        deleted = client.delete(
+            f"/api/reference-audio-library/{custom['id']}",
+            params={"replace_usages": True},
+        )
         assert deleted.status_code == 200
+        assert deleted.json()["replaced_usages"] == ["预设“引用预设”", "当前服务设置"]
+        assert deleted.json()["replacement"]["name"] == "龙嫱"
+        service_settings = client.get("/api/service-settings").json()["settings"]
+        assert service_settings["reference_audio_path"] != reference_path
+        assert service_settings["voice_name"] == "龙嫱"
+        saved_preset = client.get("/api/presets").json()["presets"][0]
+        assert saved_preset["settings"]["reference_audio_path"] != reference_path
+        assert saved_preset["settings"]["voice_name"] == "龙嫱"
         assert not Path(reference_path).exists()
 
         builtin = next(
@@ -521,6 +655,73 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
         ).json()
         assert cleaned_status["ephemeral_cleaned"] is True
         assert cleaned_status["result_ready"] is False
+
+
+def test_global_stop_rejects_api_keys_and_accepts_internal_session(tmp_path: Path) -> None:
+    module = load_app_module()
+    module.DEFAULT_SERVICE_JOB_DIR = tmp_path / "jobs"
+    module.DEFAULT_DOCUMENT_PROJECT_DIR = tmp_path / "documents"
+    module.DEFAULT_PERFORMANCE_TUNING_PATH = tmp_path / "performance.json"
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        stt_preload=False,
+        access_password="1234",
+    )
+
+    with TestClient(app) as client:
+        external = client.post(
+            "/api/service/stop-all",
+            headers={"Authorization": "Bearer 1234"},
+        )
+        assert external.status_code == 403
+
+        login = client.post(
+            "/login",
+            data={"password": "1234", "next_path": "/reader"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+        stopped = client.post("/api/service/stop-all")
+        assert stopped.status_code == 200
+        assert stopped.json()["ok"] is True
+        assert stopped.json()["playback_epoch"] == 1
+
+
+def test_api_scheduler_prioritizes_internal_work_and_keeps_external_fifo() -> None:
+    module = load_app_module()
+    scheduler = module.GpuGenerationScheduler(max_parallel=1, interactive_burst_limit=2)
+    order: list[str] = []
+
+    def run(label: str, caller_kind: str) -> None:
+        with scheduler.api_slot(caller_kind):
+            order.append(label)
+            time.sleep(0.02)
+
+    with scheduler.api_slot("internal"):
+        threads = [
+            threading.Thread(target=run, args=("external-1", "external")),
+            threading.Thread(target=run, args=("external-2", "external")),
+            threading.Thread(target=run, args=("internal-1", "internal")),
+            threading.Thread(target=run, args=("internal-2", "internal")),
+            threading.Thread(target=run, args=("internal-3", "internal")),
+        ]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.01)
+
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    assert set(order[:2]).issubset({"internal-1", "internal-2", "internal-3"})
+    assert order[2] == "external-1"
+    assert order[3].startswith("internal-")
+    assert order[4] == "external-2"
 
 
 def test_dead_qwen_worker_is_retired_and_restarted(tmp_path: Path) -> None:

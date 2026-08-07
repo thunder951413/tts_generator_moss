@@ -123,6 +123,25 @@ logs/service.err.log
 logs/qwen-workers/
 ```
 
+## macOS 应用
+
+项目包含两个职责分离的原生应用：
+
+- `QwenTTS.app`：菜单栏音频服务、音色预设、性能测试与服务设置。
+- `QwenReader.app`：独立小说阅读器，使用 WebKit 加载本地阅读页面。
+
+构建：
+
+```bash
+./scripts/build_macos_app.sh
+./scripts/build_macos_reader.sh
+```
+
+阅读器默认连接 `.env.macos` 中的本地端口；本地服务尚未运行时，会在
+后台启动 `QwenTTS.app`。在“Qwen 声阅 → 设置”中也可以填写局域网或
+兼容网络服务地址。目标服务需要同时提供 `/reader` 页面和同源 `/api`
+接口。
+
 ## 模型与输出目录
 
 以下内容均被 `.gitignore` 排除：

@@ -177,6 +177,11 @@ class DocumentProjectManager:
         self._stop_events: dict[str, threading.Event] = {}
         self._repair_interrupted_projects()
 
+    def configure_synthesis_workers(self, workers: int) -> int:
+        with self._lock:
+            self.synthesis_workers = max(1, min(2, int(workers)))
+            return self.synthesis_workers
+
     def _project_dir(self, project_id: str) -> Path:
         if not PROJECT_ID_RE.fullmatch(project_id or ""):
             raise ValueError("invalid project id")
@@ -279,6 +284,18 @@ class DocumentProjectManager:
     def get_project(self, project_id: str) -> dict[str, Any]:
         with self._lock:
             return self._public_manifest(self._load(project_id))
+
+    def rename(self, project_id: str, *, name: str) -> dict[str, Any]:
+        revised = re.sub(r"\s+", " ", name or "").strip()
+        if not revised:
+            raise ValueError("书名不能为空")
+        if len(revised) > 120:
+            raise ValueError("书名不能超过 120 个字符")
+        with self._lock:
+            manifest = self._load(project_id)
+            manifest["name"] = revised
+            self._save(manifest)
+            return self._public_manifest(manifest)
 
     def create_project(
         self,
@@ -544,6 +561,22 @@ class DocumentProjectManager:
                 self._save(manifest)
             return self._public_manifest(manifest)
 
+    def stop_all(self) -> list[str]:
+        """Request an immediate pause for every active document project."""
+        with self._lock:
+            active_ids = list(self._stop_events)
+            for project_id in active_ids:
+                self._stop_events[project_id].set()
+                try:
+                    manifest = self._load(project_id)
+                except FileNotFoundError:
+                    continue
+                if manifest.get("state") == "running":
+                    manifest["state"] = "stopping"
+                    manifest["message"] = "正在强制停止全部生成任务"
+                    self._save(manifest)
+            return active_ids
+
     def delete(self, project_id: str) -> None:
         with self._lock:
             manifest = self._load(project_id)
@@ -656,7 +689,8 @@ class DocumentProjectManager:
                         try:
                             synthesis = future.result()
                         except Exception as exc:
-                            fatal_error = fatal_error or (index, exc)
+                            if not stop_event.is_set():
+                                fatal_error = fatal_error or (index, exc)
                             continue
                         if fatal_error is not None:
                             self._discard_synthesis(project_id, index, synthesis)
@@ -715,6 +749,11 @@ class DocumentProjectManager:
                     if stop_event.is_set():
                         with self._lock:
                             manifest = self._load(project_id)
+                            for segment in manifest["segments"]:
+                                if segment.get("status") in {"generating", "encoding"}:
+                                    segment["status"] = "pending"
+                                    segment["started_at"] = None
+                                    segment["error"] = None
                             self._stop_run_clock(manifest)
                             manifest["state"] = "paused"
                             manifest["message"] = "已暂停，可随时继续"

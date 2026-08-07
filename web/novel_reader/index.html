@@ -4,14 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#5f55f5">
   <title>Qwen 声阅 · 本地小说阅读器</title>
-  <link rel="stylesheet" href="/reader-assets/reader.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/reader-assets/assets/favicon-32.png?v=20260727-1">
+  <link rel="icon" type="image/png" sizes="64x64" href="/reader-assets/assets/favicon-64.png?v=20260727-1">
+  <link rel="apple-touch-icon" sizes="180x180" href="/reader-assets/assets/apple-touch-icon.png?v=20260727-1">
+  <link rel="stylesheet" href="/reader-assets/reader.css?v=20260727-5">
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
       <a class="brand" href="/reader" aria-label="Qwen 声阅首页">
-        <span class="brand-mark" aria-hidden="true">声</span>
+        <img class="brand-mark" src="/reader-assets/assets/favicon-64.png?v=20260727-1" alt="" aria-hidden="true">
         <span>
           <strong>Qwen 声阅</strong>
           <small>本地小说阅读器</small>
@@ -25,6 +29,10 @@
         <span id="service-pill" class="status-pill"><i></i>正在连接 Metal 服务</span>
         <button id="toc-toggle" class="toolbar-button" type="button" aria-expanded="false">☰ 目录</button>
         <button id="edit-mode-button" class="toolbar-button" type="button" aria-pressed="false">✎ 编辑正文</button>
+        <button id="listening-controls-button" class="toolbar-button listening-launch-button" type="button">
+          <span class="button-symbol" aria-hidden="true">▶</span>
+          <span>听书</span>
+        </button>
         <button id="reader-settings-button" class="icon-button" type="button" title="阅读设置" aria-label="阅读设置">Aa</button>
       </div>
     </header>
@@ -35,10 +43,16 @@
           <span class="eyebrow">LIBRARY</span>
           <h2>我的书架</h2>
         </div>
-        <label class="add-book-button" title="导入小说">
-          <span aria-hidden="true">＋</span>
-          <input id="book-file" type="file" accept=".txt,.md,.markdown,.docx,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
-        </label>
+        <div class="library-heading-actions">
+          <button id="library-manage-button" class="library-manage-button" type="button">
+            <span class="manage-button-icon" aria-hidden="true">▤</span>
+            <span>管理</span>
+          </button>
+          <label class="add-book-button" title="导入小说">
+            <span aria-hidden="true">＋</span>
+            <input id="book-file" type="file" accept=".txt,.md,.markdown,.docx,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+          </label>
+        </div>
       </div>
       <div id="book-list" class="book-list">
         <div class="skeleton-card"></div>
@@ -93,83 +107,6 @@
       </article>
     </main>
 
-    <aside id="inspector" class="inspector" aria-label="听书和阅读设置">
-      <div class="inspector-heading">
-        <div>
-          <span class="eyebrow">LISTENING</span>
-          <h2>听书控制</h2>
-        </div>
-      </div>
-
-      <button id="listening-settings-card" class="listening-settings-card" type="button">
-        <span class="voice-orb" aria-hidden="true">声</span>
-        <span class="listening-setting-copy">
-          <small id="active-preset-name">后台服务设置</small>
-          <strong id="active-voice-name">正在载入音色</strong>
-          <span id="active-generation-summary">0.6B · 随机 Seed · AAC 80k</span>
-        </span>
-        <i aria-hidden="true">›</i>
-      </button>
-      <p class="inspector-hint">音色由菜单栏音频工作台统一设置；阅读器只选择生成方式。</p>
-
-      <section class="scope-card">
-        <span class="eyebrow">SELECTED RANGE</span>
-        <strong id="selected-range">当前章节</strong>
-        <span id="range-detail">选择小说后显示范围</span>
-      </section>
-
-      <div class="listen-actions">
-        <button id="stream-listen" class="primary-button" type="button">
-          <span aria-hidden="true">◉</span>
-          实时听本章
-          <small>流式 · 边生成边播放</small>
-        </button>
-        <button id="quality-generate" class="secondary-button strong" type="button">
-          <span aria-hidden="true">✦</span>
-          高质量听本章
-          <small id="quality-bitrate-label">逐段非流式 · 双路预取 · AAC 80k</small>
-        </button>
-        <section class="book-production-card">
-          <div class="book-production-heading">
-            <span>
-              <strong>整书音频制作</strong>
-              <small>分段记录 · 可停止续做 · 完成后下载</small>
-            </span>
-            <label>AAC 质量
-              <select id="book-aac-bitrate">
-                <option value="48k">48 kbps · 极省空间</option>
-                <option value="64k">64 kbps · 人声推荐</option>
-                <option value="80k" selected>80 kbps · 均衡</option>
-                <option value="96k">96 kbps · 高质量</option>
-                <option value="128k">128 kbps · 高保真</option>
-              </select>
-            </label>
-          </div>
-          <button id="generate-whole-book" class="secondary-button book-generate-button" type="button">
-            <span aria-hidden="true">▦</span>
-            生成整本书
-            <small>全部文字块 · 后台并行 · 合并 M4A</small>
-          </button>
-          <div id="generation-progress" class="generation-progress hidden">
-            <div><span id="generation-label">正在处理</span><strong id="generation-percent">0%</strong></div>
-            <progress id="generation-bar" value="0" max="1"></progress>
-            <button id="book-progress-detail-button" class="progress-detail-button" type="button">查看详情 · 0/0 段</button>
-            <div id="book-progress-detail" class="book-progress-detail hidden"></div>
-          </div>
-        </section>
-        <a id="download-whole-book" class="secondary-button download-book-button hidden" href="#" download>
-          <span aria-hidden="true">↓</span>
-          下载整书 M4A
-          <small>使用后台已完成的整书音频</small>
-        </a>
-        <button id="stop-generation" class="stop-generation-button" type="button" disabled>
-          <span aria-hidden="true">■</span>
-          停止当前生成
-        </button>
-      </div>
-
-    </aside>
-
     <footer id="player-bar" class="player-bar">
       <div class="now-playing">
         <div class="mini-cover">声</div>
@@ -184,8 +121,23 @@
         <button id="next-block" class="transport-button" type="button" aria-label="下一个文字块">›</button>
       </div>
       <div class="playback-detail">
-        <span id="playback-mode">等待播放</span>
-        <span id="playback-seed">Seed —</span>
+        <div class="playback-status">
+          <span id="playback-mode">等待播放</span>
+          <span id="playback-seed">Seed —</span>
+        </div>
+        <label class="player-rate-control" for="playback-rate">
+          <span>倍速</span>
+          <select id="playback-rate" aria-label="播放速度">
+            <option value="0.75">0.75×</option>
+            <option value="0.85">0.85×</option>
+            <option value="1" selected>1.0×</option>
+            <option value="1.15">1.15×</option>
+            <option value="1.3">1.3×</option>
+            <option value="1.5">1.5×</option>
+            <option value="1.75">1.75×</option>
+            <option value="2">2.0×</option>
+          </select>
+        </label>
       </div>
     </footer>
   </div>
@@ -225,50 +177,144 @@
     </form>
   </dialog>
 
+  <dialog id="library-manager-dialog" class="import-dialog library-manager-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <h2>管理已导入的书</h2>
+          <p id="library-manager-summary">书籍与音频都仅保存在这台 Mac</p>
+        </div>
+        <div class="dialog-header-actions">
+          <button id="manager-import-book" class="dialog-import-button" type="button">
+            <span aria-hidden="true">＋</span>
+            导入新书
+          </button>
+          <button class="quiet-button" value="cancel" aria-label="关闭书架管理">×</button>
+        </div>
+      </div>
+      <div class="book-manager-tabs" role="tablist" aria-label="书籍分类">
+        <button id="book-manager-tab-all" class="active" type="button" role="tab" aria-selected="true">全部书籍 · 0</button>
+        <button id="book-manager-tab-completed" type="button" role="tab" aria-selected="false">音频已完成 · 0</button>
+      </div>
+      <div id="managed-book-list" class="managed-book-list"></div>
+      <div class="dialog-actions manager-dialog-actions">
+        <span>书籍和生成的音频都只保存在本机。删除书籍时会一并清理音频。</span>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="listening-controls-dialog" class="import-dialog listening-controls-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <span class="eyebrow">LISTENING</span>
+          <h2>听书</h2>
+          <p>选择播放方式，声音与生成参数沿用当前服务设置。</p>
+        </div>
+        <button class="quiet-button" value="cancel" aria-label="关闭听书设置">×</button>
+      </div>
+
+      <div class="listening-dashboard">
+        <section class="listening-service-card">
+          <span class="voice-orb" aria-hidden="true">声</span>
+          <span class="listening-setting-copy">
+            <small id="active-preset-name">当前服务音色</small>
+            <strong id="active-voice-name">正在载入音色</strong>
+            <span id="active-generation-summary">0.6B · 随机 Seed · AAC 80k</span>
+          </span>
+          <span class="service-lock">服务统一控制</span>
+        </section>
+        <section class="scope-card">
+          <span class="eyebrow">CURRENT RANGE</span>
+          <strong id="selected-range">当前章节</strong>
+          <span id="range-detail">选择小说后显示范围</span>
+        </section>
+      </div>
+
+      <div class="listen-actions">
+        <button id="stream-listen" class="listening-mode-button primary-button selected" type="button" aria-pressed="true">
+          <span class="listening-mode-icon live" aria-hidden="true">▶</span>
+          <span class="listening-mode-copy">
+            <strong>实时流式</strong>
+            <small>流式生成，几秒内开始播放</small>
+          </span>
+          <span class="listening-mode-check" aria-hidden="true">✓</span>
+        </button>
+        <button id="quality-generate" class="listening-mode-button secondary-button strong" type="button" aria-pressed="false">
+          <span class="listening-mode-icon quality" aria-hidden="true">✦</span>
+          <span class="listening-mode-copy">
+            <strong>高质量整块</strong>
+            <small id="quality-bitrate-label">逐段非流式 · 双路预取 · AAC 80k</small>
+          </span>
+          <span class="listening-mode-check" aria-hidden="true">✓</span>
+        </button>
+        <button id="start-listening" class="start-listening-button" type="button">
+          <span aria-hidden="true">▶</span>
+          <span>
+            <strong>起播</strong>
+            <small id="selected-listening-mode">当前：实时流式</small>
+          </span>
+        </button>
+        <section class="book-production-card">
+          <div class="book-production-heading">
+            <span>
+              <span class="eyebrow">AUDIO BOOK</span>
+              <strong>整书音频制作</strong>
+              <small>记录每段进度，可停止后续做，完成后下载</small>
+            </span>
+            <label>AAC 质量
+              <select id="book-aac-bitrate">
+                <option value="48k">48 kbps · 极省空间</option>
+                <option value="64k">64 kbps · 人声推荐</option>
+                <option value="80k" selected>80 kbps · 均衡</option>
+                <option value="96k">96 kbps · 高质量</option>
+                <option value="128k">128 kbps · 高保真</option>
+              </select>
+            </label>
+          </div>
+          <button id="generate-whole-book" class="secondary-button book-generate-button" type="button">
+            <span class="listening-mode-icon book" aria-hidden="true">▦</span>
+            <span class="listening-mode-copy">
+              <strong>生成整本书</strong>
+              <small>全部文字块 · 后台并行 · 合并 M4A</small>
+            </span>
+            <span class="listening-mode-arrow" aria-hidden="true">›</span>
+          </button>
+          <div id="generation-progress" class="generation-progress hidden">
+            <div><span id="generation-label">正在处理</span><strong id="generation-percent">0%</strong></div>
+            <progress id="generation-bar" value="0" max="1"></progress>
+            <button id="book-progress-detail-button" class="progress-detail-button" type="button">查看详情 · 0/0 段</button>
+            <div id="book-progress-detail" class="book-progress-detail hidden"></div>
+          </div>
+        </section>
+        <a id="download-whole-book" class="secondary-button download-book-button hidden" href="#" download>
+          <span aria-hidden="true">↓</span>
+          <span>下载整书 M4A</span>
+        </a>
+        <button id="stop-generation" class="stop-generation-button" type="button" disabled>
+          <span aria-hidden="true">■</span>
+          停止当前生成
+        </button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="reader-settings-dialog" class="import-dialog reader-settings-dialog">
     <form method="dialog">
       <div class="dialog-heading">
         <div>
           <span class="eyebrow">READING</span>
-          <h2>阅读方式与外观</h2>
+          <h2>阅读与外观</h2>
         </div>
         <button class="quiet-button" value="cancel" aria-label="关闭设置">×</button>
       </div>
       <div class="settings-page reader-only-settings">
-        <section class="settings-card service-setting-readonly">
-          <span class="voice-orb" aria-hidden="true">声</span>
-          <div>
-            <span class="eyebrow">SERVICE CONTROLLED</span>
-            <h3 id="service-setting-name">后台服务设置</h3>
-            <p id="service-setting-detail">正在读取音频工作台当前配置…</p>
-          </div>
-          <small>如需更换音色、模型、Seed 或生成参数，请在菜单栏打开音频工作台，试听后点击“应用为服务设置”。</small>
-        </section>
-
-        <section class="settings-card reading-mode-settings">
-          <div>
-            <span class="eyebrow">READING MODE</span>
-            <h3>阅读方式</h3>
-          </div>
-          <div class="mode-explanation">
-            <article><strong>实时流式</strong><span>边生成边播放，适合立即开始听。</span></article>
-            <article><strong>整块高质量</strong><span>每个文字块完整生成 AAC 后按顺序播放。</span></article>
-            <article><strong>整书制作</strong><span>后台生成全部文字块并合并为可下载 M4A。</span></article>
-          </div>
-        </section>
-
         <section class="settings-card appearance-settings">
           <div>
             <span class="eyebrow">READING</span>
             <h3>阅读外观</h3>
           </div>
           <label>字号<input id="font-size" type="range" min="17" max="30" value="21"></label>
-          <label>播放速度
-            <select id="playback-rate">
-              <option value="0.85">0.85×</option><option value="1" selected>1.0×</option>
-              <option value="1.15">1.15×</option><option value="1.3">1.3×</option>
-            </select>
-          </label>
           <label>页面主题
             <select id="theme-select">
               <option value="paper">纸张暖白</option><option value="porcelain">瓷白清透</option>
@@ -282,13 +328,13 @@
 
       </div>
       <div class="dialog-actions settings-dialog-actions">
-        <p>音色和生成参数始终继承音频工作台当前应用的服务设置。</p>
+        <p>阅读偏好只保存在当前浏览器。</p>
         <button id="confirm-settings" class="primary-button" value="default">完成</button>
       </div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/reader-assets/reader.js" defer></script>
+  <script src="/reader-assets/reader.js?v=20260807-1" defer></script>
 </body>
 </html>

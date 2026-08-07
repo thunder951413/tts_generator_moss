@@ -208,6 +208,8 @@ class QwenWorkerRuntime:
         self._workers: list[QwenWorkerClient] = []
         self._available: queue.Queue[QwenWorkerClient] = queue.Queue()
         self._closed = False
+        self._desired_lanes = max(1, int(lanes))
+        self._restart_epoch = 0
         self._worker_config = {
             "python_executable": python_executable,
             "worker_script": worker_script,
@@ -220,7 +222,7 @@ class QwenWorkerRuntime:
             "log_dir": log_dir,
         }
         try:
-            for index in range(max(1, int(lanes))):
+            for index in range(self._desired_lanes):
                 worker = self._create_worker(index)
                 self._workers.append(worker)
                 self._available.put(worker)
@@ -282,13 +284,14 @@ class QwenWorkerRuntime:
 
     def _retire_worker(self, worker: QwenWorkerClient) -> None:
         with self._worker_lock:
+            was_registered = worker in self._workers
             if worker in self._workers:
                 self._workers.remove(worker)
         try:
             worker.close()
         except Exception:  # noqa: BLE001
             LOG.exception("failed to close unhealthy Qwen worker lane %s", worker.lane_index)
-        if not self._closed:
+        if not self._closed and was_registered:
             threading.Thread(
                 target=self._restart_lane,
                 args=(worker.lane_index,),
@@ -306,6 +309,97 @@ class QwenWorkerRuntime:
             except Exception as exc:  # noqa: BLE001
                 workers.append({"ok": False, "lane": worker.lane_index, "error": str(exc)})
         return {"lanes": self.lanes, "workers": workers}
+
+    def resize_lanes(self, target: int) -> int:
+        target = max(1, min(2, int(target)))
+        with self._worker_lock:
+            current = len(self._workers)
+        if target > current:
+            created: list[QwenWorkerClient] = []
+            try:
+                for index in range(current, target):
+                    created.append(self._create_worker(index))
+            except Exception:
+                for worker in created:
+                    worker.close()
+                raise
+            with self._worker_lock:
+                if self._closed:
+                    for worker in created:
+                        worker.close()
+                    raise RuntimeError("Qwen runtime is closed")
+                self._workers.extend(created)
+                self._desired_lanes = target
+                for worker in created:
+                    self._available.put(worker)
+            return self.lanes
+        if target < current:
+            available: list[QwenWorkerClient] = []
+            while True:
+                try:
+                    available.append(self._available.get_nowait())
+                except queue.Empty:
+                    break
+            with self._worker_lock:
+                if len(available) != len(self._workers):
+                    for worker in available:
+                        self._available.put(worker)
+                    raise RuntimeError("有生成任务正在运行，暂时不能调整通道数")
+                keep = sorted(available, key=lambda worker: worker.lane_index)[:target]
+                retire = [worker for worker in available if worker not in keep]
+                self._workers = list(keep)
+                self._desired_lanes = target
+                for worker in keep:
+                    self._available.put(worker)
+            for worker in retire:
+                worker.close()
+        return self.lanes
+
+    def interrupt_all(self) -> int:
+        """Terminate every active lane and rebuild the configured pool."""
+        with self._worker_lock:
+            if self._closed:
+                return 0
+            self._restart_epoch += 1
+            restart_epoch = self._restart_epoch
+            workers = list(self._workers)
+            self._workers.clear()
+            target = self._desired_lanes
+            while True:
+                try:
+                    self._available.get_nowait()
+                except queue.Empty:
+                    break
+        for worker in workers:
+            try:
+                worker.close()
+            except Exception:  # noqa: BLE001
+                LOG.exception("failed to interrupt Qwen worker lane %s", worker.lane_index)
+
+        def rebuild() -> None:
+            created: list[QwenWorkerClient] = []
+            try:
+                for index in range(target):
+                    created.append(self._create_worker(index))
+                with self._worker_lock:
+                    if self._closed or restart_epoch != self._restart_epoch:
+                        for worker in created:
+                            worker.close()
+                        return
+                    self._workers.extend(created)
+                    for worker in created:
+                        self._available.put(worker)
+            except Exception:  # noqa: BLE001
+                for worker in created:
+                    worker.close()
+                LOG.exception("failed to rebuild Qwen workers after force stop")
+
+        threading.Thread(
+            target=rebuild,
+            name=f"qwen-worker-force-restart-{self.profile_id}",
+            daemon=True,
+        ).start()
+        return len(workers)
 
     def synthesize(
         self,
@@ -382,6 +476,7 @@ class QwenWorkerRuntime:
         if self._closed:
             return
         self._closed = True
+        self._restart_epoch += 1
         with self._worker_lock:
             workers = list(self._workers)
             self._workers.clear()

@@ -165,6 +165,32 @@ struct StudioToolbarButtonStyle: ButtonStyle {
     }
 }
 
+struct StudioCompactActionButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    var destructive = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(destructive ? Color.red : Color.primary)
+            .frame(width: 68, height: StudioTokens.compactControlHeight)
+            .background(
+                .thinMaterial,
+                in: RoundedRectangle(cornerRadius: StudioTokens.innerRadius, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: StudioTokens.innerRadius, style: .continuous)
+                    .strokeBorder(
+                        destructive ? Color.red.opacity(0.25) : Color.primary.opacity(0.10),
+                        lineWidth: 0.7
+                    )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: StudioTokens.innerRadius, style: .continuous))
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.42)
+    }
+}
+
 struct StudioIconButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label

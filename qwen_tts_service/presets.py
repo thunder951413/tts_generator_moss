@@ -370,7 +370,13 @@ class VoicePresetStore:
                     usages.append("当前服务设置")
             return list(dict.fromkeys(usages))
 
-    def delete_reference_audio(self, reference_id: str) -> None:
+    def delete_reference_audio(
+        self,
+        reference_id: str,
+        *,
+        replacement_audio_path: str = "",
+        replacement_voice_name: str = "",
+    ) -> list[str]:
         with self._lock:
             manifest = self._load()
             self._discover_reference_audio(manifest)
@@ -386,13 +392,39 @@ class VoicePresetStore:
                 raise KeyError(reference_id)
             path = Path(str(target.get("path") or ""))
             usages = self.reference_usage(path)
-            if usages:
+            if usages and not replacement_audio_path:
                 raise ValueError("该参考音频仍被" + "、".join(usages) + "使用，请先更换音色")
+            if usages:
+                normalized = str(path.resolve())
+                for preset in manifest["presets"]:
+                    if not isinstance(preset, dict):
+                        continue
+                    settings = preset.get("settings")
+                    if (
+                        isinstance(settings, dict)
+                        and str(Path(str(settings.get("reference_audio_path") or "")).resolve())
+                        == normalized
+                    ):
+                        settings["reference_audio_path"] = replacement_audio_path
+                        settings["voice_name"] = replacement_voice_name
+                        preset["updated_at"] = _now()
+                active_service = manifest.get("active_service")
+                if isinstance(active_service, dict):
+                    settings = active_service.get("settings")
+                    if (
+                        isinstance(settings, dict)
+                        and str(Path(str(settings.get("reference_audio_path") or "")).resolve())
+                        == normalized
+                    ):
+                        settings["reference_audio_path"] = replacement_audio_path
+                        settings["voice_name"] = replacement_voice_name
+                        active_service["updated_at"] = _now()
             if not self.is_managed_reference(path):
                 raise ValueError("只能删除导入到参考音频库的文件")
             path.unlink(missing_ok=True)
             manifest["reference_audio"].remove(target)
             _atomic_write(self.manifest_path, manifest)
+            return usages
 
     def is_managed_reference(self, path: str | Path) -> bool:
         try:
