@@ -102,7 +102,10 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert "if (document.hidden) return;" in reader_script.text
         assert "超过 60 秒没有数据" in reader_script.text
         assert "/api/playback/status" in reader_script.text
+        assert "/api/playback/" in reader_script.text
         assert "playback=1" in reader_script.text
+        assert "remainingListeningSegments" in reader_script.text
+        assert "activatePlaybackChapter" in reader_script.text
         assert 'stopCurrentGeneration' in reader_script.text
         assert "renameManagedBook" in reader_script.text
         assert "deleteManagedBook" in reader_script.text

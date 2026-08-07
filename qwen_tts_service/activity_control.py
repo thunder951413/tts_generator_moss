@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PlaybackWaiter:
     sequence: int
     job_id: str
     caller_kind: str
     stop_epoch: int
+    cancelled: bool = False
 
 
 class PlaybackCoordinator:
@@ -50,12 +51,13 @@ class PlaybackCoordinator:
         *,
         cancelled: Callable[[], bool] | None = None,
         timeout: float = 600.0,
+        allow_reentrant: bool = False,
     ) -> bool:
         caller_kind = self._kind(caller_kind)
         deadline = time.monotonic() + max(1.0, float(timeout))
         with self._condition:
             if self._active_job_id == job_id:
-                return True
+                return bool(allow_reentrant)
             if len(self._waiters) >= self.max_waiters:
                 return False
             self._sequence += 1
@@ -68,7 +70,11 @@ class PlaybackCoordinator:
             self._waiters.append(waiter)
             try:
                 while True:
-                    if waiter.stop_epoch != self._stop_epoch or (cancelled and cancelled()):
+                    if (
+                        waiter.cancelled
+                        or waiter.stop_epoch != self._stop_epoch
+                        or (cancelled and cancelled())
+                    ):
                         return False
                     selected = self._selected_waiter()
                     if not self._active_job_id and selected == waiter:
@@ -93,12 +99,20 @@ class PlaybackCoordinator:
 
     def release(self, job_id: str) -> bool:
         with self._condition:
-            if self._active_job_id != str(job_id):
-                return False
-            self._active_job_id = ""
-            self._active_caller_kind = ""
-            self._condition.notify_all()
-            return True
+            job_id = str(job_id)
+            released = False
+            for waiter in list(self._waiters):
+                if waiter.job_id == job_id:
+                    waiter.cancelled = True
+                    self._waiters.remove(waiter)
+                    released = True
+            if self._active_job_id == job_id:
+                self._active_job_id = ""
+                self._active_caller_kind = ""
+                released = True
+            if released:
+                self._condition.notify_all()
+            return released
 
     def force_stop(self) -> dict[str, object]:
         with self._condition:

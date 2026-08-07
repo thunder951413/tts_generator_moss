@@ -20,6 +20,8 @@ const state = {
   playbackMode: "",
   playbackEpoch: null,
   playbackControlStopping: false,
+  playbackSessionId: "",
+  playbackLeaseId: "",
   qualityQueue: [],
   qualityJobs: new Set(),
   qualityPlaybackReject: null,
@@ -78,6 +80,24 @@ function mediaUrl(bookId, path) {
   return `/api/document-projects/${encodeURIComponent(bookId)}/media?path=${encodeURIComponent(path)}`;
 }
 
+function newPlaybackSessionId() {
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID().replaceAll("-", "");
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+}
+
+function playbackMediaUrl(bookId, path) {
+  const base = mediaUrl(bookId, path);
+  return `${base}&playback=1&session_id=${encodeURIComponent(state.playbackSessionId)}`;
+}
+
+async function releaseMediaPlayback() {
+  const leaseId = state.playbackLeaseId;
+  state.playbackLeaseId = "";
+  state.playbackSessionId = "";
+  if (!leaseId) return;
+  await fetch(`/api/playback/${encodeURIComponent(leaseId)}/release`, { method: "POST" }).catch(() => {});
+}
+
 function currentChapter() {
   return state.book?.chapters?.[state.chapterIndex] || null;
 }
@@ -87,6 +107,38 @@ function chapterSegments(chapter = currentChapter()) {
   return state.book.segments.filter(
     (segment) => segment.index >= chapter.segment_start && segment.index <= chapter.segment_end
   );
+}
+
+function chapterIndexForSegment(segmentIndex) {
+  return state.book?.chapters?.findIndex(
+    (chapter) => segmentIndex >= chapter.segment_start && segmentIndex <= chapter.segment_end
+  ) ?? -1;
+}
+
+function activatePlaybackChapter(segmentIndex) {
+  const chapterIndex = chapterIndexForSegment(segmentIndex);
+  if (chapterIndex < 0 || chapterIndex === state.chapterIndex) return;
+  state.chapterIndex = chapterIndex;
+  localStorage.setItem(`qwen-reader-chapter-${state.book.id}`, state.chapterIndex);
+  renderChapters();
+  renderCurrentChapter();
+}
+
+function remainingListeningSegments() {
+  if (!state.book) return [];
+  const chapter = currentChapter();
+  const firstIndex = state.selectedBlock ?? chapter?.segment_start ?? 0;
+  return state.book.segments.filter((segment) => segment.index >= firstIndex);
+}
+
+function completedListeningSegments(firstIndex) {
+  if (!state.book) return [];
+  const playable = [];
+  for (const segment of state.book.segments.filter((item) => item.index >= firstIndex)) {
+    if (segment.status !== "completed" || !segment.audio_file) break;
+    playable.push(segment);
+  }
+  return playable;
 }
 
 async function loadHealth() {
@@ -582,7 +634,7 @@ function selectBlock(index) {
   }
   const segment = state.book?.segments?.find((item) => item.index === index);
   if (segment?.status === "completed" && segment.audio_file) {
-    playQualitySegments([segment]);
+    playQualitySegments(completedListeningSegments(segment.index));
   }
 }
 
@@ -943,9 +995,7 @@ function queueQualityBlock(segment, runId) {
 async function startQualityChapter() {
   const chapter = currentChapter();
   if (!state.book || !chapter) return;
-  const segments = chapterSegments(chapter).filter(
-    (segment) => segment.index >= (state.selectedBlock ?? chapter.segment_start)
-  );
+  const segments = remainingListeningSegments();
   if (!segments.length) return;
   await stopPlayback(false);
   const runId = ++state.streamRunId;
@@ -971,6 +1021,7 @@ async function startQualityChapter() {
         break;
       }
       const segment = prepared.segment;
+      activatePlaybackChapter(segment.index);
       state.playingBlock = segment.index;
       state.selectedBlock = segment.index;
       updatePlayer(segment, `高质量 AAC ${selectedBookBitrate()} · 双路预取`, prepared.seed);
@@ -1008,7 +1059,7 @@ async function startQualityChapter() {
     state.playingBlock = null;
     state.playbackMode = "";
     $("play-toggle").textContent = "▶";
-    $("playback-mode").textContent = state.stopped ? "生成已停止" : "本章播放完成";
+    $("playback-mode").textContent = state.stopped ? "生成已停止" : "本书播放完成";
     renderCurrentChapter();
     setActionsEnabled(Boolean(state.book));
   }
@@ -1095,6 +1146,8 @@ function playQualitySegments(segments) {
   if (!state.book || !segments.length) return;
   stopPlayback(false).then(() => {
     state.playbackMode = "quality";
+    state.playbackSessionId = newPlaybackSessionId();
+    state.playbackLeaseId = `media:${state.playbackSessionId}`;
     state.qualityQueue = [...segments];
     $("playback-mode").textContent = "高质量 AAC";
     playNextQuality();
@@ -1105,16 +1158,22 @@ function playNextQuality() {
   const segment = state.qualityQueue.shift();
   if (!segment || !state.book) {
     state.playingBlock = null;
+    state.playbackMode = "";
     $("play-toggle").textContent = "▶";
     renderCurrentChapter();
+    releaseMediaPlayback();
     return;
   }
+  activatePlaybackChapter(segment.index);
   state.playingBlock = segment.index;
   state.selectedBlock = segment.index;
-  state.qualityAudio.src = mediaUrl(state.book.id, segment.audio_file);
+  state.qualityAudio.src = playbackMediaUrl(state.book.id, segment.audio_file);
   state.qualityAudio.playbackRate = Number($("playback-rate").value || 1);
   state.qualityAudio.onended = playNextQuality;
-  state.qualityAudio.play().catch((error) => toast(error.message, true));
+  state.qualityAudio.play().catch((error) => {
+    releaseMediaPlayback();
+    toast(error.message, true);
+  });
   updatePlayer(segment, "高质量 AAC", segment.seed);
   $("play-toggle").textContent = "Ⅱ";
   renderCurrentChapter();
@@ -1154,7 +1213,7 @@ function streamForm(segment, seedOverride = null) {
 async function startStreamChapter() {
   const chapter = currentChapter();
   if (!state.book || !chapter) return;
-  const segments = chapterSegments(chapter).filter((segment) => segment.index >= (state.selectedBlock ?? chapter.segment_start));
+  const segments = remainingListeningSegments();
   if (!segments.length) return;
   await stopPlayback(false);
   const runId = ++state.streamRunId;
@@ -1177,12 +1236,16 @@ async function startStreamChapter() {
     $("stream-listen").disabled = false;
     state.currentJob = "";
     state.playingBlock = null;
+    state.playbackMode = "";
     $("play-toggle").textContent = "▶";
+    $("playback-mode").textContent = state.stopped ? "播放已停止" : "本书播放完成";
     renderCurrentChapter();
+    setActionsEnabled(Boolean(state.book));
   }
 }
 
 async function streamOneBlock(segment, seedOverride = null) {
+  activatePlaybackChapter(segment.index);
   state.playingBlock = segment.index;
   state.selectedBlock = segment.index;
   updatePlayer(segment, "实时流式", null);
@@ -1337,6 +1400,7 @@ async function stopPlayback(markStopped = true) {
   state.qualityAudio.pause();
   state.qualityAudio.removeAttribute("src");
   state.qualityAudio.load();
+  await releaseMediaPlayback();
   if (state.streamAbort) state.streamAbort.abort();
   state.streamAbort = null;
   if (state.qualityJobs.size) {

@@ -1048,6 +1048,7 @@ def create_app(
             "X-Audio-Channels",
             "X-Stream-Id",
             "X-Playback-Epoch",
+            "X-Playback-Lease",
         ],
     )
     resolved_access_password = str(access_password or "")
@@ -2064,6 +2065,30 @@ def create_app(
         )
         return status
 
+    def _playback_requested(value: int | None, request: Request) -> bool:
+        if value is not None:
+            return bool(_safe_int(value, default=0, minimum=0, maximum=1))
+        return str(getattr(request.state, "caller_kind", "external")) == "external"
+
+    async def _acquire_media_playback(
+        request: Request,
+        session_id: str,
+    ) -> tuple[str, dict[str, object]]:
+        session_id = str(session_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{12,128}", session_id):
+            raise HTTPException(status_code=400, detail="valid playback session_id is required")
+        lease_id = f"media:{session_id}"
+        acquired = await asyncio.to_thread(
+            playback_coordinator.acquire,
+            lease_id,
+            str(getattr(request.state, "caller_kind", "external")),
+            timeout=600.0,
+            allow_reentrant=True,
+        )
+        if not acquired:
+            raise HTTPException(status_code=409, detail="playback was cancelled or queue is full")
+        return lease_id, playback_coordinator.status()
+
     @app.get("/api/generate-stream/{job_id}/audio")
     async def generate_stream_audio(job_id: str, request: Request) -> StreamingResponse:
         job = jobs.get(job_id)
@@ -2112,8 +2137,9 @@ def create_app(
 
     @app.get("/api/generate-stream/{job_id}/result-audio")
     async def generate_stream_result_audio(
+        request: Request,
         job_id: str,
-        playback: int = 0,
+        playback: int | None = None,
     ) -> FileResponse:
         job = jobs.get(job_id)
         if job.result is None:
@@ -2122,7 +2148,7 @@ def create_app(
         if not audio_path.is_file():
             raise HTTPException(status_code=404, detail="generated audio is missing")
         headers = None
-        if bool(_safe_int(playback, default=0, minimum=0, maximum=1)):
+        if _playback_requested(playback, request):
             playback_status = await _acquire_playback(job)
             headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
@@ -2134,9 +2160,10 @@ def create_app(
 
     @app.get("/api/generate-stream/{job_id}/result-audio-aac")
     async def generate_stream_result_audio_aac(
+        request: Request,
         job_id: str,
         bitrate: str = "80k",
-        playback: int = 0,
+        playback: int | None = None,
     ) -> FileResponse:
         job = jobs.get(job_id)
         if job.result is None:
@@ -2180,7 +2207,7 @@ def create_app(
                     detail=(completed.stderr or "AAC encoding failed").strip(),
                 )
         headers = None
-        if bool(_safe_int(playback, default=0, minimum=0, maximum=1)):
+        if _playback_requested(playback, request):
             playback_status = await _acquire_playback(job)
             headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
@@ -2223,6 +2250,12 @@ def create_app(
     @app.get("/api/playback/status")
     async def playback_status() -> JSONResponse:
         return JSONResponse(playback_coordinator.status())
+
+    @app.post("/api/playback/{lease_id}/release")
+    async def release_playback(lease_id: str) -> JSONResponse:
+        return JSONResponse(
+            {"ok": True, "lease_id": lease_id, "released": playback_coordinator.release(lease_id)}
+        )
 
     @app.post("/api/service/stop-all")
     async def service_stop_all(request: Request) -> JSONResponse:
@@ -2637,13 +2670,31 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/document-projects/{project_id}/media")
-    async def document_project_media(project_id: str, path: str) -> FileResponse:
+    async def document_project_media(
+        request: Request,
+        project_id: str,
+        path: str,
+        playback: int = 0,
+        session_id: str = "",
+    ) -> FileResponse:
         try:
             media_path = document_projects.media_path(project_id, _decode_reference_path(path))
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="media not found") from exc
         media_type = "audio/mp4" if media_path.suffix.lower() == ".m4a" else "application/octet-stream"
-        return FileResponse(str(media_path), media_type=media_type, filename=media_path.name)
+        headers = None
+        if bool(_safe_int(playback, default=0, minimum=0, maximum=1)):
+            lease_id, playback_status = await _acquire_media_playback(request, session_id)
+            headers = {
+                "X-Playback-Epoch": str(playback_status["playback_epoch"]),
+                "X-Playback-Lease": lease_id,
+            }
+        return FileResponse(
+            str(media_path),
+            media_type=media_type,
+            filename=media_path.name,
+            headers=headers,
+        )
 
     return app
 

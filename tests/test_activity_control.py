@@ -58,3 +58,31 @@ def test_force_stop_revokes_active_and_waiting_playback() -> None:
     assert stopped["stopped_playback_job_id"] == "active"
     assert stopped["playback_epoch"] == 1
     assert coordinator.status()["active_job_id"] is None
+
+
+def test_duplicate_job_needs_explicit_reentrant_lease() -> None:
+    coordinator = PlaybackCoordinator()
+    assert coordinator.acquire("same-job", "external", timeout=1)
+    assert not coordinator.acquire("same-job", "external", timeout=1)
+    assert coordinator.acquire(
+        "same-job", "external", timeout=1, allow_reentrant=True
+    )
+    assert coordinator.release("same-job")
+
+
+def test_release_cancels_a_waiting_media_lease() -> None:
+    coordinator = PlaybackCoordinator()
+    assert coordinator.acquire("active", "internal", timeout=1)
+    acquired: list[bool] = []
+    waiter = threading.Thread(
+        target=lambda: acquired.append(coordinator.acquire("media:session", "external", timeout=3))
+    )
+    waiter.start()
+    time.sleep(0.05)
+
+    assert coordinator.release("media:session")
+    waiter.join(timeout=1)
+
+    assert acquired == [False]
+    assert not waiter.is_alive()
+    assert coordinator.release("active")
