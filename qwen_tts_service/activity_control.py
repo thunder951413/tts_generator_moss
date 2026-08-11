@@ -28,6 +28,7 @@ class PlaybackCoordinator:
         self._sequence = 0
         self._active_job_id = ""
         self._active_caller_kind = ""
+        self._active_deadline: float | None = None
         self._internal_burst = 0
         self._stop_epoch = 0
 
@@ -44,6 +45,19 @@ class PlaybackCoordinator:
             return external[0]
         return internal[0] if internal else None
 
+    def _expire_active_locked(self) -> bool:
+        if (
+            self._active_job_id
+            and self._active_deadline is not None
+            and time.monotonic() >= self._active_deadline
+        ):
+            self._active_job_id = ""
+            self._active_caller_kind = ""
+            self._active_deadline = None
+            self._condition.notify_all()
+            return True
+        return False
+
     def acquire(
         self,
         job_id: str,
@@ -52,10 +66,12 @@ class PlaybackCoordinator:
         cancelled: Callable[[], bool] | None = None,
         timeout: float = 600.0,
         allow_reentrant: bool = False,
+        lease_timeout: float | None = None,
     ) -> bool:
         caller_kind = self._kind(caller_kind)
         deadline = time.monotonic() + max(1.0, float(timeout))
         with self._condition:
+            self._expire_active_locked()
             if self._active_job_id == job_id:
                 return bool(allow_reentrant)
             if len(self._waiters) >= self.max_waiters:
@@ -70,6 +86,7 @@ class PlaybackCoordinator:
             self._waiters.append(waiter)
             try:
                 while True:
+                    self._expire_active_locked()
                     if (
                         waiter.cancelled
                         or waiter.stop_epoch != self._stop_epoch
@@ -81,6 +98,11 @@ class PlaybackCoordinator:
                         self._waiters.remove(waiter)
                         self._active_job_id = waiter.job_id
                         self._active_caller_kind = waiter.caller_kind
+                        self._active_deadline = (
+                            time.monotonic() + max(0.01, float(lease_timeout))
+                            if lease_timeout is not None
+                            else None
+                        )
                         if waiter.caller_kind == "internal" and any(
                             item.caller_kind == "external" for item in self._waiters
                         ):
@@ -109,6 +131,7 @@ class PlaybackCoordinator:
             if self._active_job_id == job_id:
                 self._active_job_id = ""
                 self._active_caller_kind = ""
+                self._active_deadline = None
                 released = True
             if released:
                 self._condition.notify_all()
@@ -120,6 +143,7 @@ class PlaybackCoordinator:
             self._stop_epoch += 1
             self._active_job_id = ""
             self._active_caller_kind = ""
+            self._active_deadline = None
             self._waiters.clear()
             self._internal_burst = 0
             self._condition.notify_all()
@@ -130,15 +154,22 @@ class PlaybackCoordinator:
 
     def internal_playback_active(self) -> bool:
         with self._condition:
+            self._expire_active_locked()
             return self._active_caller_kind == "internal" or any(
                 item.caller_kind == "internal" for item in self._waiters
             )
 
     def status(self) -> dict[str, object]:
         with self._condition:
+            self._expire_active_locked()
             return {
                 "active_job_id": self._active_job_id or None,
                 "active_caller_kind": self._active_caller_kind or None,
+                "lease_expires_in_seconds": (
+                    None
+                    if self._active_deadline is None
+                    else max(0.0, self._active_deadline - time.monotonic())
+                ),
                 "waiting_internal": sum(
                     item.caller_kind == "internal" for item in self._waiters
                 ),

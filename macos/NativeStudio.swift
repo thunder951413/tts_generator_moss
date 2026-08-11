@@ -422,6 +422,11 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 final class NativeStudioViewModel: ObservableObject {
     @Published var serviceSummary = "正在启动本地服务…"
     @Published var serviceReady = false
+    @Published var ttsEnabled = true
+    @Published var ttsReady = false
+    @Published var sttReady = false
+    @Published var isTogglingTTS = false
+    @Published var isTogglingSTT = false
     @Published var voices: [NativeVoice] = []
     @Published var presets: [NativePreset] = []
     @Published var selectedPresetID = ""
@@ -490,6 +495,8 @@ final class NativeStudioViewModel: ObservableObject {
 
     let service: LocalService
     var onPresetsChanged: (([NativePreset]) -> Void)?
+    var onTTSServiceToggleRequested: (() -> Void)?
+    var onSTTServiceToggleRequested: (() -> Void)?
     private var pollingTimer: Timer?
     private var currentJobID: String?
     private var stoppedJobIDs: Set<String> = []
@@ -546,10 +553,63 @@ final class NativeStudioViewModel: ObservableObject {
         let sttReady = stt?["ready"] as? Bool ?? false
         let active = number(scheduler?["active"]).intValue
         let maximum = number(scheduler?["max_parallel"]).intValue
-        serviceReady = state == "ready"
+        ttsEnabled = boolean(health["tts_enabled"], fallback: true)
+        ttsReady = state == "ready"
+        self.sttReady = sttReady
+        serviceReady = ttsEnabled && ttsReady
         serviceSummary = serviceReady
             ? "TTS Metal · STT \(sttReady ? "就绪" : "未就绪") · \(profile) · GPU \(active)/\(maximum)"
-            : "服务状态：\(state)"
+            : (ttsEnabled
+                ? "TTS 服务状态：\(state)"
+                : "HTTP 服务已连接 · TTS 已停止 · STT \(sttReady ? "就绪" : "未就绪")")
+    }
+
+    func setTTSService(enabled: Bool, completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard !isTogglingTTS else { return }
+        isTogglingTTS = true
+        service.perform("api/tts/\(enabled ? "start" : "stop")", method: "POST", timeout: 120) {
+            [weak self] data, response in
+            guard let self else { return }
+            do {
+                let payload = try self.jsonObject(data, response: response)
+                self.service.health { health in
+                    DispatchQueue.main.async {
+                        self.isTogglingTTS = false
+                        if let health { self.updateHealth(health) }
+                        completion(.success(payload))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isTogglingTTS = false
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func setSTTService(enabled: Bool, completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard !isTogglingSTT else { return }
+        isTogglingSTT = true
+        service.perform("api/stt/\(enabled ? "start" : "stop")", method: "POST", timeout: 60) {
+            [weak self] data, response in
+            guard let self else { return }
+            do {
+                let payload = try self.jsonObject(data, response: response)
+                self.service.health { health in
+                    DispatchQueue.main.async {
+                        self.isTogglingSTT = false
+                        if let health { self.updateHealth(health) }
+                        completion(.success(payload))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isTogglingSTT = false
+                    completion(.failure(error))
+                }
+            }
+        }
     }
 
     func loadInitialData() {
@@ -2538,11 +2598,26 @@ struct NativeStudioView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            StudioStatusPill(title: "TTS Metal 已就绪", ready: model.serviceReady)
-            StudioStatusPill(
-                title: model.serviceSummary.contains("STT 就绪") ? "STT Metal 已就绪" : "STT 未就绪",
-                ready: model.serviceSummary.contains("STT 就绪")
-            )
+            Button { model.onTTSServiceToggleRequested?() } label: {
+                StudioStatusPill(
+                    title: model.ttsEnabled
+                        ? (model.ttsReady ? "TTS Metal 已就绪" : "TTS Metal 正在启动")
+                        : "TTS Metal 已停止",
+                    ready: model.ttsEnabled && model.ttsReady
+                )
+            }
+            .buttonStyle(.plain)
+            .help(model.ttsEnabled ? "点击停止 TTS 服务" : "点击启动 TTS 服务")
+            .disabled(model.isTogglingTTS)
+            Button { model.onSTTServiceToggleRequested?() } label: {
+                StudioStatusPill(
+                    title: model.sttReady ? "STT Metal 已就绪" : "STT Metal 已停止",
+                    ready: model.sttReady
+                )
+            }
+            .buttonStyle(.plain)
+            .help(model.sttReady ? "点击停止 STT 服务" : "点击启动 STT 服务")
+            .disabled(model.isTogglingSTT)
             Button {
                 model.externalSettingsStatus = ""
                 model.externalAPISettingsPresented = true
@@ -2623,6 +2698,24 @@ struct NativeStudioView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        Button {
+                            model.applyCurrentAsServiceSettings()
+                        } label: {
+                            Label(
+                                model.isApplyingServiceSettings ? "正在应用…" : "应用当前设置",
+                                systemImage: "checkmark.seal.fill"
+                            )
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(StudioTintedButtonStyle())
+                        .disabled(model.referenceAudioPath.isEmpty || model.isApplyingServiceSettings)
+                        Text(model.serviceSettingsStatus)
+                            .font(.caption)
+                            .foregroundStyle(
+                                model.serviceSettingsStatus.contains("已应用")
+                                    ? Color.green
+                                    : Color.secondary
+                            )
                         VStack(spacing: StudioTokens.space2) {
                             HStack(spacing: StudioTokens.space2) {
                                 Button {
@@ -2972,30 +3065,12 @@ struct NativeStudioView: View {
                             )
                             .frame(width: 142)
                             .disabled(model.outputAudioURL == nil)
-                            Button {
-                                model.applyCurrentAsServiceSettings()
-                            } label: {
-                                Label(
-                                    model.isApplyingServiceSettings ? "正在应用…" : "应用为服务设置",
-                                    systemImage: "checkmark.seal.fill"
-                                )
-                            }
-                            .buttonStyle(StudioTintedButtonStyle())
-                            .frame(width: 178)
-                            .disabled(model.outputAudioURL == nil || model.isApplyingServiceSettings)
                         }
                         ProgressView(value: model.generatedProgress)
                             .tint(StudioTokens.accent)
                         Text(model.generationSummary)
                             .font(.callout)
                             .foregroundStyle(.secondary)
-                        Text(model.serviceSettingsStatus)
-                            .font(.caption)
-                            .foregroundStyle(
-                                model.serviceSettingsStatus.contains("已应用")
-                                    ? Color.green
-                                    : Color.secondary
-                            )
                         if !model.errorMessage.isEmpty {
                             Text(model.errorMessage)
                                 .font(.callout)

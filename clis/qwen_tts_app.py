@@ -223,6 +223,23 @@ def _safe_aac_bitrate(value: Any, *, default: str = "80k") -> str:
     return bitrate if bitrate in {"48k", "64k", "80k", "96k", "128k", "192k"} else default
 
 
+def _resolve_ffmpeg_path() -> str:
+    """Resolve ffmpeg even when a macOS app launches with a minimal PATH."""
+    candidates = [
+        os.environ.get("QWEN_TTS_FFMPEG", ""),
+        shutil.which("ffmpeg") or "",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+    return "ffmpeg"
+
+
 def _safe_float(value: Any, *, default: float, minimum: float, maximum: float | None = None) -> float:
     try:
         parsed = float(value)
@@ -967,7 +984,10 @@ def create_app(
         max_parallel=initial_parallel,
         external_blocked=playback_coordinator.internal_playback_active,
     )
-    ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+    # Keep the HTTP service available while allowing the two resident model
+    # runtimes to be controlled independently from the native workbench.
+    tts_enabled = True
+    ffmpeg_path = _resolve_ffmpeg_path()
     stt_runtime = WhisperCppRuntime(
         binary=whisper_server,
         model=whisper_model,
@@ -1296,6 +1316,8 @@ def create_app(
         use_service_settings: int = Form(1),
         ephemeral_audio: int = Form(0),
     ) -> JSONResponse:
+        if not tts_enabled:
+            raise HTTPException(status_code=503, detail="TTS service is stopped")
         text = (text or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail="text must not be empty")
@@ -2046,15 +2068,46 @@ def create_app(
             }
         )
 
-    async def _acquire_playback(job: StreamingJob) -> dict[str, object]:
-        job.update(playback_state="waiting")
-        acquired = await asyncio.to_thread(
-            playback_coordinator.acquire,
-            job.job_id,
-            str(job.snapshot().get("caller_kind") or "external"),
-            cancelled=lambda: job.is_closed,
-            timeout=600.0,
+    def _job_playback_lease_seconds(job: StreamingJob) -> float:
+        snapshot = job.snapshot()
+        metadata = (job.result or {}).get("metadata") if job.result else {}
+        duration = _safe_float(
+            (metadata or {}).get("duration_seconds", snapshot.get("emitted_audio_seconds", 0)),
+            default=0.0,
+            minimum=0.0,
         )
+        # Normal clients release immediately after playback. This deadline is
+        # only a crash/disconnect safety net and allows slower playback rates.
+        return min(3600.0, max(15.0, duration * 1.75 + 10.0))
+
+    async def _acquire_playback(
+        job: StreamingJob,
+        request: Request,
+        *,
+        lease_timeout: float | None = None,
+    ) -> dict[str, object]:
+        job.update(playback_state="waiting")
+        disconnected = threading.Event()
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(
+                playback_coordinator.acquire,
+                job.job_id,
+                str(job.snapshot().get("caller_kind") or "external"),
+                cancelled=lambda: job.is_closed or disconnected.is_set(),
+                timeout=600.0,
+                lease_timeout=lease_timeout,
+            )
+        )
+        while not acquire_task.done():
+            await asyncio.wait({acquire_task}, timeout=0.25)
+            if await request.is_disconnected():
+                disconnected.set()
+                playback_coordinator.release(job.job_id)
+                break
+        acquired = await acquire_task
+        if acquired and await request.is_disconnected():
+            playback_coordinator.release(job.job_id)
+            acquired = False
         if not acquired:
             job.update(playback_state="cancelled")
             raise HTTPException(status_code=409, detail="playback was cancelled or queue is full")
@@ -2078,13 +2131,28 @@ def create_app(
         if not re.fullmatch(r"[A-Za-z0-9_-]{12,128}", session_id):
             raise HTTPException(status_code=400, detail="valid playback session_id is required")
         lease_id = f"media:{session_id}"
-        acquired = await asyncio.to_thread(
-            playback_coordinator.acquire,
-            lease_id,
-            str(getattr(request.state, "caller_kind", "external")),
-            timeout=600.0,
-            allow_reentrant=True,
+        disconnected = threading.Event()
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(
+                playback_coordinator.acquire,
+                lease_id,
+                str(getattr(request.state, "caller_kind", "external")),
+                cancelled=disconnected.is_set,
+                timeout=600.0,
+                allow_reentrant=True,
+                lease_timeout=900.0,
+            )
         )
+        while not acquire_task.done():
+            await asyncio.wait({acquire_task}, timeout=0.25)
+            if await request.is_disconnected():
+                disconnected.set()
+                playback_coordinator.release(lease_id)
+                break
+        acquired = await acquire_task
+        if acquired and await request.is_disconnected():
+            playback_coordinator.release(lease_id)
+            acquired = False
         if not acquired:
             raise HTTPException(status_code=409, detail="playback was cancelled or queue is full")
         return lease_id, playback_coordinator.status()
@@ -2092,7 +2160,7 @@ def create_app(
     @app.get("/api/generate-stream/{job_id}/audio")
     async def generate_stream_audio(job_id: str, request: Request) -> StreamingResponse:
         job = jobs.get(job_id)
-        playback_status = await _acquire_playback(job)
+        playback_status = await _acquire_playback(job, request, lease_timeout=900.0)
 
         async def iterator():
             try:
@@ -2149,7 +2217,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="generated audio is missing")
         headers = None
         if _playback_requested(playback, request):
-            playback_status = await _acquire_playback(job)
+            playback_status = await _acquire_playback(
+                job,
+                request,
+                lease_timeout=_job_playback_lease_seconds(job),
+            )
             headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
             str(audio_path),
@@ -2174,32 +2246,38 @@ def create_app(
         selected_bitrate = _safe_aac_bitrate(bitrate)
         target = reader_temp_dir / f"{job_id}-{selected_bitrate}.m4a"
         if not target.is_file():
-            completed = subprocess.run(
-                [
-                    ffmpeg_path,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(source),
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "48000",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    selected_bitrate,
-                    "-movflags",
-                    "+faststart",
-                    str(target),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                completed = subprocess.run(
+                    [
+                        ffmpeg_path,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(source),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "48000",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        selected_bitrate,
+                        "-movflags",
+                        "+faststart",
+                        str(target),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="AAC 编码器 ffmpeg 未找到，请运行 brew install ffmpeg",
+                ) from exc
             if completed.returncode != 0 or not target.is_file():
                 target.unlink(missing_ok=True)
                 raise HTTPException(
@@ -2208,7 +2286,11 @@ def create_app(
                 )
         headers = None
         if _playback_requested(playback, request):
-            playback_status = await _acquire_playback(job)
+            playback_status = await _acquire_playback(
+                job,
+                request,
+                lease_timeout=_job_playback_lease_seconds(job),
+            )
             headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
             str(target),
@@ -2279,6 +2361,73 @@ def create_app(
             }
         )
 
+    def _internal_service_control(request: Request) -> None:
+        if str(getattr(request.state, "caller_kind", "external")) != "internal":
+            raise HTTPException(status_code=403, detail="service controls are restricted to internal clients")
+
+    @app.post("/api/tts/stop")
+    async def stop_tts_runtime(request: Request) -> JSONResponse:
+        nonlocal tts_enabled
+        _internal_service_control(request)
+        tts_enabled = False
+        playback = playback_coordinator.force_stop()
+        stopped_jobs = jobs.close_all()
+        stopped_projects = document_projects.stop_all()
+        interrupted = await asyncio.to_thread(runtime_manager.interrupt_active)
+        await asyncio.to_thread(runtime_manager.close)
+        return JSONResponse(
+            {
+                "ok": True,
+                "tts_enabled": False,
+                "stopped_jobs": stopped_jobs,
+                "stopped_projects": stopped_projects,
+                "interrupted_workers": interrupted,
+                **playback,
+            }
+        )
+
+    @app.post("/api/tts/start")
+    async def start_tts_runtime(request: Request) -> JSONResponse:
+        nonlocal tts_enabled
+        _internal_service_control(request)
+        tts_enabled = True
+        configured = str(
+            (active_service_settings().get("settings") or {}).get(
+                "model_profile", DEFAULT_MODEL_PROFILE
+            )
+        )
+        profile_id = configured if configured in runtime_manager.profiles else DEFAULT_MODEL_PROFILE
+
+        def warm_runtime() -> None:
+            with runtime_manager.session(profile_id):
+                pass
+
+        try:
+            await asyncio.to_thread(warm_runtime)
+        except Exception as exc:  # noqa: BLE001
+            tts_enabled = False
+            raise HTTPException(status_code=503, detail=f"TTS startup failed: {exc}") from exc
+        return JSONResponse({"ok": True, "tts_enabled": True, "runtime": runtime_manager.status()})
+
+    @app.post("/api/stt/stop")
+    async def stop_stt_runtime(request: Request) -> JSONResponse:
+        _internal_service_control(request)
+        if not stt_enabled:
+            raise HTTPException(status_code=503, detail="STT is disabled")
+        await asyncio.to_thread(stt_runtime.close)
+        return JSONResponse({"ok": True, "stt": stt_runtime.status()})
+
+    @app.post("/api/stt/start")
+    async def start_stt_runtime(request: Request) -> JSONResponse:
+        _internal_service_control(request)
+        if not stt_enabled:
+            raise HTTPException(status_code=503, detail="STT is disabled")
+        try:
+            await asyncio.to_thread(stt_runtime.start)
+        except STTUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "stt": stt_runtime.status()})
+
     @app.get("/api/runtime")
     async def runtime_info() -> JSONResponse:
         return JSONResponse(
@@ -2347,6 +2496,7 @@ def create_app(
         return JSONResponse(
             {
                 **runtime_manager.status(),
+                "tts_enabled": tts_enabled,
                 "generation_scheduler": {
                     **generation_scheduler.status(),
                     "document_parallel": document_projects.synthesis_workers,

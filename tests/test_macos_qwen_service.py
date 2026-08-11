@@ -39,6 +39,18 @@ def load_app_module():
     return module
 
 
+def test_ffmpeg_resolves_from_explicit_macos_app_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_app_module()
+    ffmpeg = tmp_path / "ffmpeg"
+    ffmpeg.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ffmpeg.chmod(0o755)
+    monkeypatch.setenv("QWEN_TTS_FFMPEG", str(ffmpeg))
+
+    assert module._resolve_ffmpeg_path() == str(ffmpeg.resolve())
+
+
 def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
     module = load_app_module()
     module.DEFAULT_DOCUMENT_PROJECT_DIR = tmp_path / "documents"
@@ -122,10 +134,23 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert 'CommandLine.arguments.contains("--background")' in app_source
         assert 'NSAttributedString(string: "TTS"' in app_source
         assert 'title: "强制停止所有音频与运算"' in app_source
+        assert 'title: "启动本地服务"' in app_source
+        assert 'title: "停止本地服务"' in app_source
+        assert 'keyEquivalentModifierMask = [.command, .option]' in app_source
+        assert 'keyEquivalentModifierMask = [.command, .shift]' in app_source
+        assert 'requestTTSRuntimeToggle' in app_source
+        assert 'requestSTTRuntimeToggle' in app_source
         assert 'api/service/stop-all' in native_source
+        assert 'api/tts/\\(enabled ? "start" : "stop")' in native_source
+        assert 'api/stt/\\(enabled ? "start" : "stop")' in native_source
+        assert 'onTTSServiceToggleRequested' in native_source
+        assert 'onSTTServiceToggleRequested' in native_source
+        assert '"应用当前设置"' in native_source
+        assert '.disabled(model.referenceAudioPath.isEmpty || model.isApplyingServiceSettings)' in native_source
+        assert '.disabled(model.outputAudioURL == nil || model.isApplyingServiceSettings)' not in native_source
         assert '?playback=1' in native_source
         assert 'voiceStatusItem?.title = "当前音色：' in app_source
-        assert 'taskStatusItem?.title = active > 0' in app_source
+        assert 'taskStatusItem?.title = ttsEnabled && active > 0' in app_source
         assert "WKWebView" in reader_app_source
         assert "WKUIDelegate" in reader_app_source
         assert "webView.uiDelegate = self" in reader_app_source
@@ -696,6 +721,13 @@ def test_global_stop_rejects_api_keys_and_accepts_internal_session(tmp_path: Pat
         assert stopped.status_code == 200
         assert stopped.json()["ok"] is True
         assert stopped.json()["playback_epoch"] == 1
+
+        tts_stopped = client.post("/api/tts/stop")
+        assert tts_stopped.status_code == 200
+        assert tts_stopped.json()["tts_enabled"] is False
+        assert client.get("/api/health").json()["tts_enabled"] is False
+        rejected_tts = client.post("/api/generate-stream/start", data={"text": "服务已停止"})
+        assert rejected_tts.status_code == 503
 
 
 def test_api_scheduler_prioritizes_internal_work_and_keeps_external_fifo() -> None:

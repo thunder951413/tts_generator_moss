@@ -19,6 +19,10 @@ final class LocalService {
         URL(string: "http://127.0.0.1:\(port)/")!
     }
 
+    var ownsRunningProcess: Bool {
+        ownsProcess && (process?.isRunning == true)
+    }
+
     init(repositoryRoot: URL) {
         self.repositoryRoot = repositoryRoot
         self.configuration = Self.readEnvironmentFile(repositoryRoot.appendingPathComponent(".env.macos"))
@@ -329,6 +333,7 @@ private enum ServiceError: LocalizedError {
     case invalidPort
     case insecureLANPassword
     case restartRequired
+    case serviceNotOwned
     case serviceExited(Int32)
 
     var errorDescription: String? {
@@ -343,6 +348,8 @@ private enum ServiceError: LocalizedError {
             return "允许局域网访问时，密码至少需要 4 个字符，且不能使用 change-me。"
         case .restartRequired:
             return "设置已经保存，但当前服务不是由本应用启动的。请手动重启后台服务后生效。"
+        case .serviceNotOwned:
+            return "当前服务不是由本应用启动，不能从菜单栏停止。"
         case .serviceExited(let status):
             return "本地语音服务启动后立即退出（状态 \(status)）。请检查端口是否被占用及 logs/macos-app-service.log。"
         }
@@ -358,6 +365,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var voiceStatusItem: NSMenuItem!
     private var taskStatusItem: NSMenuItem!
     private var sttStatusItem: NSMenuItem!
+    private var startServiceMenuItem: NSMenuItem!
+    private var stopServiceMenuItem: NSMenuItem!
     private var presetsMenu: NSMenu!
     private var window: NSWindow!
     private var statusTimer: Timer?
@@ -370,6 +379,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         self.service = service
         self.viewModel = NativeStudioViewModel(service: service)
         super.init()
+        viewModel.onTTSServiceToggleRequested = { [weak self] in
+            self?.requestTTSRuntimeToggle()
+        }
+        viewModel.onSTTServiceToggleRequested = { [weak self] in
+            self?.requestSTTRuntimeToggle()
+        }
         viewModel.onPresetsChanged = { [weak self] presets in
             self?.renderPresets(presets)
         }
@@ -538,6 +553,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         refreshItem.target = self
         menu.addItem(refreshItem)
         menu.addItem(.separator())
+        startServiceMenuItem = NSMenuItem(
+            title: "启动本地服务",
+            action: #selector(startLocalService(_:)),
+            keyEquivalent: "s"
+        )
+        startServiceMenuItem.keyEquivalentModifierMask = [.command, .option]
+        startServiceMenuItem.target = self
+        menu.addItem(startServiceMenuItem)
+        stopServiceMenuItem = NSMenuItem(
+            title: "停止本地服务",
+            action: #selector(stopLocalService(_:)),
+            keyEquivalent: "s"
+        )
+        stopServiceMenuItem.keyEquivalentModifierMask = [.command, .shift]
+        stopServiceMenuItem.target = self
+        menu.addItem(stopServiceMenuItem)
+        menu.addItem(.separator())
         let forceStopItem = NSMenuItem(
             title: "强制停止所有音频与运算",
             action: #selector(forceStopAllAudioAndComputation(_:)),
@@ -550,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         quitItem.target = self
         menu.addItem(quitItem)
         statusItem.menu = menu
+        updateServiceMenuActions(isReachable: false)
     }
 
     private func makeStatusMenuItem(_ title: String) -> NSMenuItem {
@@ -599,7 +632,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     self?.applyServiceHealth(health)
                     self?.viewModel.updateHealth(health)
                 }
-                else { self?.updateMenuStatus("服务未连接") }
+                else {
+                    self?.viewModel.serviceReady = false
+                    self?.viewModel.ttsReady = false
+                    self?.viewModel.sttReady = false
+                    self?.updateMenuStatus("服务未连接")
+                    self?.updateServiceMenuActions(isReachable: false)
+                }
             }
         }
     }
@@ -609,17 +648,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let profile = health["active_profile_label"] as? String ?? "等待模型"
         let scheduler = health["generation_scheduler"] as? [String: Any]
         let stt = health["stt"] as? [String: Any]
+        let ttsEnabled = health["tts_enabled"] as? Bool ?? true
         let sttReady = stt?["ready"] as? Bool ?? false
         let active = scheduler?["active"] as? Int ?? 0
         let maximum = scheduler?["max_parallel"] as? Int ?? 0
-        if state == "ready" {
-            serviceStatusItem?.title = "服务：Metal 已连接"
+        if state == "ready" || !ttsEnabled {
+            serviceStatusItem?.title = ttsEnabled ? "服务：Metal 已连接" : "服务：HTTP 已连接 · TTS 已停止"
             modelStatusItem?.title = "当前模型：\(profile.isEmpty ? viewModel.modelDisplayName : profile)"
-            taskStatusItem?.title = active > 0
+            taskStatusItem?.title = ttsEnabled && active > 0
                 ? "任务：正在生成 · GPU \(active)/\(maximum)"
-                : "任务：空闲 · GPU \(active)/\(maximum)"
+                : (ttsEnabled ? "任务：空闲 · GPU \(active)/\(maximum)" : "任务：TTS 已停止")
             sttStatusItem?.title = sttReady ? "转写：STT 已就绪" : "转写：STT 未就绪"
-            statusItem.button?.toolTip = active > 0 ? "Qwen TTS · 正在生成" : "Qwen TTS · 服务就绪"
+            statusItem.button?.toolTip = ttsEnabled
+                ? (active > 0 ? "Qwen TTS · 正在生成" : "Qwen TTS · 服务就绪")
+                : "Qwen TTS · TTS 已停止"
             refreshVoiceStatus()
         } else {
             serviceStatusItem?.title = "服务：\(state)"
@@ -629,10 +671,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             statusItem.button?.toolTip = "Qwen TTS · \(state)"
             refreshVoiceStatus()
         }
+        updateServiceMenuActions(isReachable: true)
+    }
+
+    private func updateServiceMenuActions(isReachable: Bool) {
+        startServiceMenuItem?.isEnabled = !isReachable
+        stopServiceMenuItem?.isEnabled = isReachable && service.ownsRunningProcess
     }
 
     private func updateMenuStatus(_ text: String) {
         serviceStatusItem?.title = "服务：\(text)"
+    }
+
+    private func presentConfirmation(
+        title: String,
+        message: String,
+        confirmTitle: String,
+        destructive: Bool = false,
+        action: @escaping () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let confirm = alert.addButton(withTitle: confirmTitle)
+        if destructive { confirm.hasDestructiveAction = true }
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        action()
+    }
+
+    private func requestTTSRuntimeToggle() {
+        let shouldStart = !viewModel.ttsEnabled
+        presentConfirmation(
+            title: shouldStart ? "启动 TTS 服务？" : "停止 TTS 服务？",
+            message: shouldStart
+                ? "将预热当前模型，之后可以继续生成语音。"
+                : "会停止当前语音生成与播放，并释放 TTS 模型占用的内存。STT 仍可继续使用。",
+            confirmTitle: shouldStart ? "启动 TTS" : "停止 TTS",
+            destructive: !shouldStart
+        ) { [weak self] in
+            guard let self else { return }
+            self.updateMenuStatus(shouldStart ? "正在启动 TTS…" : "正在停止 TTS…")
+            self.viewModel.setTTSService(enabled: shouldStart) { [weak self] result in
+                switch result {
+                case .success:
+                    self?.updateMenuStatus(shouldStart ? "TTS 已启动" : "TTS 已停止")
+                case .failure(let error):
+                    self?.updateMenuStatus("TTS 操作失败")
+                    self?.presentError(error)
+                }
+            }
+        }
+    }
+
+    private func requestSTTRuntimeToggle() {
+        let shouldStart = !viewModel.sttReady
+        presentConfirmation(
+            title: shouldStart ? "启动 STT 服务？" : "停止 STT 服务？",
+            message: shouldStart
+                ? "将加载本地转写模型。"
+                : "会中断正在进行的音频转文字任务，并释放 STT 模型占用的内存。TTS 不会停止。",
+            confirmTitle: shouldStart ? "启动 STT" : "停止 STT",
+            destructive: !shouldStart
+        ) { [weak self] in
+            guard let self else { return }
+            self.updateMenuStatus(shouldStart ? "正在启动 STT…" : "正在停止 STT…")
+            self.viewModel.setSTTService(enabled: shouldStart) { [weak self] result in
+                switch result {
+                case .success:
+                    self?.updateMenuStatus(shouldStart ? "STT 已启动" : "STT 已停止")
+                case .failure(let error):
+                    self?.updateMenuStatus("STT 操作失败")
+                    self?.presentError(error)
+                }
+            }
+        }
     }
 
     private func refreshVoiceStatus() {
@@ -710,6 +823,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func refreshFromMenu(_ sender: Any?) {
         refreshHealth()
         refreshPresets()
+    }
+
+    @objc private func startLocalService(_ sender: Any?) {
+        presentConfirmation(
+            title: "启动本地服务？",
+            message: "将启动本机的 TTS 与 STT 服务，并恢复菜单栏状态监控。",
+            confirmTitle: "启动服务"
+        ) { [weak self] in
+            guard let self else { return }
+            self.updateMenuStatus("正在启动本地服务…")
+            self.updateServiceMenuActions(isReachable: false)
+            self.service.startIfNeeded { [weak self] result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let health):
+                        self?.applyServiceHealth(health)
+                        self?.viewModel.updateHealth(health)
+                        self?.viewModel.loadInitialData()
+                    case .failure(let error):
+                        self?.updateMenuStatus("服务启动失败")
+                        self?.updateServiceMenuActions(isReachable: false)
+                        self?.presentError(error)
+                    }
+                }
+            }
+        }
+    }
+
+    @objc private func stopLocalService(_ sender: Any?) {
+        guard service.ownsRunningProcess else {
+            presentError(ServiceError.serviceNotOwned)
+            return
+        }
+        presentConfirmation(
+            title: "停止本地服务？",
+            message: "会中断所有 TTS / STT 请求、音频播放和后台生成。之后可用菜单栏“启动本地服务”恢复。",
+            confirmTitle: "停止服务",
+            destructive: true
+        ) { [weak self] in
+            guard let self else { return }
+            self.updateMenuStatus("正在停止本地服务…")
+            self.viewModel.forceStopAllAudioAndComputation { [weak self] _ in
+                guard let self else { return }
+                self.service.stopIfOwned()
+                self.viewModel.serviceReady = false
+                self.viewModel.ttsReady = false
+                self.viewModel.sttReady = false
+                self.updateMenuStatus("本地服务已停止")
+                self.updateServiceMenuActions(isReachable: false)
+            }
+        }
     }
 
     @objc private func forceStopAllAudioAndComputation(_ sender: Any?) {

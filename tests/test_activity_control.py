@@ -86,3 +86,18 @@ def test_release_cancels_a_waiting_media_lease() -> None:
     assert acquired == [False]
     assert not waiter.is_alive()
     assert coordinator.release("active")
+
+
+def test_expired_playback_lease_unblocks_the_next_client() -> None:
+    coordinator = PlaybackCoordinator()
+    assert coordinator.acquire("abandoned", "internal", timeout=1, lease_timeout=0.05)
+    acquired: list[bool] = []
+    waiter = threading.Thread(
+        target=lambda: acquired.append(coordinator.acquire("next", "external", timeout=1))
+    )
+    waiter.start()
+    waiter.join(timeout=1)
+
+    assert acquired == [True]
+    assert coordinator.status()["active_job_id"] == "next"
+    assert coordinator.release("next")
