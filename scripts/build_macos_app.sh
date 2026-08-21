@@ -18,6 +18,7 @@ xcrun swiftc \
   "$ROOT/macos/QwenTTSApp.swift" \
   "$ROOT/macos/StudioDesignSystem.swift" \
   "$ROOT/macos/NativeStudio.swift" \
+  "$ROOT/macos/STTWorkbench.swift" \
   -o "$MACOS_DIR/QwenTTS" \
   -parse-as-library \
   -framework AppKit \

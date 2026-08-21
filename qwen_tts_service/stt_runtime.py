@@ -60,6 +60,19 @@ class WhisperCppRuntime:
             f"whisper-server not found: {self.binary}. Install it with: brew install whisper-cpp"
         )
 
+    def _subprocess_environment(self) -> dict[str, str]:
+        """Keep whisper.cpp media conversion working from a sandboxed macOS app."""
+        environment = os.environ.copy()
+        existing = environment.get("PATH", "")
+        candidates = [
+            str(self.binary.expanduser().parent),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            *existing.split(os.pathsep),
+        ]
+        environment["PATH"] = os.pathsep.join(dict.fromkeys(path for path in candidates if path))
+        return environment
+
     def available(self) -> tuple[bool, str | None]:
         try:
             self._resolve_binary()
@@ -112,6 +125,7 @@ class WhisperCppRuntime:
                 stdout=self._log_handle or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT,
                 cwd=str(self.model.resolve().parent),
+                env=self._subprocess_environment(),
             )
 
         deadline = time.monotonic() + max(1.0, float(timeout))

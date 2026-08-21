@@ -51,6 +51,17 @@ def test_ffmpeg_resolves_from_explicit_macos_app_path(
     assert module._resolve_ffmpeg_path() == str(ffmpeg.resolve())
 
 
+def test_stt_runtime_adds_homebrew_tools_to_app_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    from qwen_tts_service.stt_runtime import WhisperCppRuntime
+
+    runtime = WhisperCppRuntime(binary="/opt/homebrew/bin/whisper-server", model="model.bin")
+    paths = runtime._subprocess_environment()["PATH"].split(os.pathsep)
+
+    assert paths[0] == "/opt/homebrew/bin"
+    assert "/usr/bin" in paths
+
+
 def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
     module = load_app_module()
     module.DEFAULT_DOCUMENT_PROJECT_DIR = tmp_path / "documents"
@@ -128,9 +139,17 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
 
         native_source = (ROOT / "macos" / "NativeStudio.swift").read_text(encoding="utf-8")
         app_source = (ROOT / "macos" / "QwenTTSApp.swift").read_text(encoding="utf-8")
+        stt_source = (ROOT / "macos" / "STTWorkbench.swift").read_text(encoding="utf-8")
         reader_app_source = (ROOT / "macos" / "QwenReaderApp.swift").read_text(encoding="utf-8")
         assert 'action: #selector(closeStudio(_:))' in app_source
         assert 'keyEquivalent: "w"' in app_source
+        assert 'title: "打开语音转文字工作台"' in app_source
+        assert 'action: #selector(openSTTWorkbench(_:))' in app_source
+        assert 'struct STTWorkbenchView: View' in stt_source
+        assert 'Toggle("生成带时间戳的字幕"' in stt_source
+        assert 'case srt' in stt_source and 'case vtt' in stt_source
+        assert '"v1/audio/transcriptions"' in stt_source
+        assert 'Label("保存", systemImage: "square.and.arrow.down")' in stt_source
         assert 'CommandLine.arguments.contains("--background")' in app_source
         assert 'NSAttributedString(string: "TTS"' in app_source
         assert 'title: "强制停止所有音频与运算"' in app_source
@@ -162,6 +181,12 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert "final class SystemAudioRecorder" in native_source
         assert "SCStreamOutput" in native_source
         assert "struct SystemAudioTrimView" in native_source
+        assert "prepareReferenceAudioForTrimming" in native_source
+        assert "func trimReference(_ reference: NativeReferenceAudio)" in native_source
+        assert 'Label("裁剪", systemImage: "scissors")' in native_source
+        assert 'Text(model.audioTrimTitle)' in native_source
+        assert '"裁剪并加入参考音频"' in native_source
+        assert "if trimSourceIsTemporary, let systemAudioRecordingURL" in native_source
         assert "struct ReferenceAudioLibraryView" in native_source
         assert 'Text("可用音频 · \\(visibleReferences.count)")' in native_source
         assert 'Text("已隐藏 · \\(hiddenReferences.count)")' in native_source

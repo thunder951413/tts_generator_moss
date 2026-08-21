@@ -477,6 +477,9 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var systemAudioTrimEnd: TimeInterval = 0
     @Published var systemAudioWaveform: [Float] = []
     @Published var systemAudioName = ""
+    @Published var audioTrimTitle = "裁剪参考音频"
+    @Published var audioTrimSubtitle = "只保留声音稳定、背景干净的一段作为克隆参考。"
+    @Published var audioTrimProgress = ""
     @Published var isExportingSystemAudio = false
     @Published var isSavingPreset = false
     @Published var advancedSettingsPresented = false
@@ -515,6 +518,8 @@ final class NativeStudioViewModel: ObservableObject {
     private var defaultReferenceAudioPath = ""
     private var systemAudioRecorder: SystemAudioRecorder?
     private var systemAudioRecordingURL: URL?
+    private var trimSourceIsTemporary = false
+    private var reopenReferenceLibraryAfterTrim = false
     private var systemAudioTimer: Timer?
     private var systemAudioStartedAt: Date?
 
@@ -540,7 +545,7 @@ final class NativeStudioViewModel: ObservableObject {
             try? FileManager.default.removeItem(at: recordingURL)
         }
         systemAudioTimer?.invalidate()
-        if let systemAudioRecordingURL {
+        if trimSourceIsTemporary, let systemAudioRecordingURL {
             try? FileManager.default.removeItem(at: systemAudioRecordingURL)
         }
     }
@@ -865,6 +870,22 @@ final class NativeStudioViewModel: ObservableObject {
         play(URL(fileURLWithPath: reference.path))
     }
 
+    func trimReference(_ reference: NativeReferenceAudio) {
+        stopPreview()
+        referenceLibraryStatus = "正在打开“\(reference.name)”的裁剪工具…"
+        referenceLibraryPresented = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.prepareReferenceAudioForTrimming(
+                URL(fileURLWithPath: reference.path),
+                name: "\(reference.name) · 裁剪",
+                title: "裁剪已有参考音频",
+                subtitle: "原音频会保留；确认后创建一个新的裁剪副本。",
+                sourceIsTemporary: false,
+                reopenLibrary: true
+            )
+        }
+    }
+
     func setReferenceHidden(_ reference: NativeReferenceAudio, hidden: Bool) {
         let body = try? JSONSerialization.data(withJSONObject: ["hidden": hidden])
         service.perform(
@@ -988,56 +1009,78 @@ final class NativeStudioViewModel: ObservableObject {
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audio]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        importReference(url)
+        prepareReferenceAudioForTrimming(
+            url,
+            name: url.deletingPathExtension().lastPathComponent,
+            title: "裁剪导入音频",
+            subtitle: "先选择需要的声音片段，再压缩并加入参考音频。",
+            sourceIsTemporary: false
+        )
     }
 
-    func importReference(_ url: URL, displayName: String? = nil) {
-        guard let fileData = try? Data(contentsOf: url) else {
-            show(NativeStudioError.server("无法读取参考音频。"))
-            return
-        }
+    func importReference(
+        _ url: URL,
+        displayName: String? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         isImportingReference = true
-        let multipart = multipartBody(
-            fields: [:],
-            file: (
-                "audio",
-                "\(displayName ?? url.deletingPathExtension().lastPathComponent).\(url.pathExtension)",
-                "application/octet-stream",
-                fileData
-            )
-        )
-        if url.deletingLastPathComponent() == FileManager.default.temporaryDirectory {
-            if url.lastPathComponent.hasPrefix("qwen-reference-") {
-                recordingURL = nil
-                try? FileManager.default.removeItem(at: url)
-            } else if url.lastPathComponent.hasPrefix("qwen-system-export-") {
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-        service.perform(
-            "api/presets/reference-audio",
-            method: "POST",
-            body: multipart.data,
-            contentType: multipart.contentType,
-            timeout: 120
-        ) { [weak self] data, response in
+        audioTrimProgress = "正在读取并准备上传…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            do {
-                let payload = try self.jsonObject(data, response: response)
-                guard let path = payload["reference_audio_path"] as? String else {
-                    throw NativeStudioError.invalidResponse
-                }
+            guard let fileData = try? Data(contentsOf: url) else {
                 DispatchQueue.main.async {
                     self.isImportingReference = false
-                    self.referenceAudioPath = path
-                    self.referenceName = displayName ?? url.deletingPathExtension().lastPathComponent
-                    self.referenceText = ""
-                    self.loadReferenceLibrary()
-                    self.loadVoices()
+                    self.audioTrimProgress = "无法读取参考音频"
+                    completion?(false)
                 }
-            } catch {
-                DispatchQueue.main.async { self.isImportingReference = false }
-                self.show(error)
+                self.show(NativeStudioError.server("无法读取参考音频。"))
+                return
+            }
+            let multipart = self.multipartBody(
+                fields: [:],
+                file: (
+                    "audio",
+                    "\(displayName ?? url.deletingPathExtension().lastPathComponent).\(url.pathExtension)",
+                    "application/octet-stream",
+                    fileData
+                )
+            )
+            DispatchQueue.main.async { self.audioTrimProgress = "正在上传并标准化音频…" }
+            self.service.perform(
+                "api/presets/reference-audio",
+                method: "POST",
+                body: multipart.data,
+                contentType: multipart.contentType,
+                timeout: 180
+            ) { [weak self] data, response in
+                guard let self else { return }
+                if url.deletingLastPathComponent() == FileManager.default.temporaryDirectory,
+                   url.lastPathComponent.hasPrefix("qwen-system-export-") {
+                    try? FileManager.default.removeItem(at: url)
+                }
+                do {
+                    let payload = try self.jsonObject(data, response: response)
+                    guard let path = payload["reference_audio_path"] as? String else {
+                        throw NativeStudioError.invalidResponse
+                    }
+                    DispatchQueue.main.async {
+                        self.isImportingReference = false
+                        self.audioTrimProgress = "导入完成"
+                        self.referenceAudioPath = path
+                        self.referenceName = displayName ?? url.deletingPathExtension().lastPathComponent
+                        self.referenceText = ""
+                        self.loadReferenceLibrary()
+                        self.loadVoices()
+                        completion?(true)
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.isImportingReference = false
+                        self.audioTrimProgress = "导入失败：\(error.localizedDescription)"
+                        completion?(false)
+                    }
+                    self.show(error)
+                }
             }
         }
     }
@@ -1048,7 +1091,14 @@ final class NativeStudioViewModel: ObservableObject {
             recorder = nil
             isRecordingReference = false
             if let recordingURL {
-                importReference(recordingURL)
+                self.recordingURL = nil
+                prepareReferenceAudioForTrimming(
+                    recordingURL,
+                    name: "麦克风录音 \(Self.recordingDateFormatter.string(from: Date()))",
+                    title: "裁剪麦克风录音",
+                    subtitle: "选择发音稳定、没有停顿和杂音的一段作为参考。",
+                    sourceIsTemporary: true
+                )
             }
             return
         }
@@ -1163,7 +1213,13 @@ final class NativeStudioViewModel: ObservableObject {
             self.systemAudioRecorder = nil
             switch result {
             case .success(let url):
-                self.prepareSystemAudioForTrimming(url)
+                self.prepareReferenceAudioForTrimming(
+                    url,
+                    name: "系统录音 \(Self.recordingDateFormatter.string(from: Date()))",
+                    title: "裁剪系统录音",
+                    subtitle: "只保留声音稳定、背景干净的一段作为克隆参考。",
+                    sourceIsTemporary: true
+                )
             case .failure(let error):
                 self.systemAudioStatus = "录制失败"
                 self.show(error)
@@ -1171,23 +1227,39 @@ final class NativeStudioViewModel: ObservableObject {
         }
     }
 
-    private func prepareSystemAudioForTrimming(_ url: URL) {
+    private func prepareReferenceAudioForTrimming(
+        _ url: URL,
+        name: String,
+        title: String,
+        subtitle: String,
+        sourceIsTemporary: Bool,
+        reopenLibrary: Bool = false
+    ) {
+        if trimSourceIsTemporary, let previous = systemAudioRecordingURL, previous != url {
+            try? FileManager.default.removeItem(at: previous)
+        }
         systemAudioRecordingURL = url
+        trimSourceIsTemporary = sourceIsTemporary
+        reopenReferenceLibraryAfterTrim = reopenLibrary
+        audioTrimTitle = title
+        audioTrimSubtitle = subtitle
+        audioTrimProgress = "正在分析音频…"
         let asset = AVURLAsset(url: url)
         let duration = CMTimeGetSeconds(asset.duration)
         guard duration.isFinite, duration > 0.1 else {
-            try? FileManager.default.removeItem(at: url)
+            if sourceIsTemporary { try? FileManager.default.removeItem(at: url) }
             systemAudioRecordingURL = nil
+            trimSourceIsTemporary = false
             systemAudioStatus = "没有捕获到可用声音"
-            show(NativeStudioError.server("录音太短或没有捕获到系统声音。"))
+            show(NativeStudioError.server("音频太短、无法读取或没有可用声音。"))
             return
         }
         systemAudioDuration = duration
         systemAudioTrimStart = 0
         systemAudioTrimEnd = duration
-        systemAudioName = "系统录音 \(Self.recordingDateFormatter.string(from: Date()))"
+        systemAudioName = name
         systemAudioWaveform = []
-        systemAudioStatus = "录制完成，可裁剪后加入参考音频"
+        systemAudioStatus = "音频已准备，可裁剪后加入参考音频"
         systemAudioTrimPresented = true
         analyzeWaveform(url)
     }
@@ -1220,9 +1292,15 @@ final class NativeStudioViewModel: ObservableObject {
                     }
                     peaks.append(min(1, peak))
                 }
-                DispatchQueue.main.async { self?.systemAudioWaveform = peaks }
+                DispatchQueue.main.async {
+                    self?.systemAudioWaveform = peaks
+                    self?.audioTrimProgress = "拖动起点和终点选择需要保留的片段"
+                }
             } catch {
-                DispatchQueue.main.async { self?.systemAudioWaveform = [] }
+                DispatchQueue.main.async {
+                    self?.systemAudioWaveform = []
+                    self?.audioTrimProgress = "无法生成波形，但仍可按时间裁剪"
+                }
             }
         }
     }
@@ -1255,14 +1333,25 @@ final class NativeStudioViewModel: ObservableObject {
     }
 
     func discardSystemAudioRecording() {
+        guard systemAudioRecordingURL != nil || systemAudioTrimPresented else { return }
         stopPreview()
-        if let systemAudioRecordingURL {
+        let shouldReopenLibrary = reopenReferenceLibraryAfterTrim
+        if trimSourceIsTemporary, let systemAudioRecordingURL {
             try? FileManager.default.removeItem(at: systemAudioRecordingURL)
         }
         systemAudioRecordingURL = nil
+        trimSourceIsTemporary = false
+        reopenReferenceLibraryAfterTrim = false
         systemAudioTrimPresented = false
         systemAudioStatus = "可录制 Mac 正在播放的声音"
+        audioTrimProgress = ""
         systemAudioWaveform = []
+        if shouldReopenLibrary {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.loadReferenceLibrary()
+                self?.referenceLibraryPresented = true
+            }
+        }
     }
 
     func exportSystemAudioSelection() {
@@ -1293,28 +1382,43 @@ final class NativeStudioViewModel: ObservableObject {
             duration: CMTime(seconds: duration, preferredTimescale: 600)
         )
         isExportingSystemAudio = true
+        audioTrimProgress = "正在导出并压缩选区…"
         exporter.exportAsynchronously { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.isExportingSystemAudio = false
                 guard exporter.status == .completed else {
+                    self.isExportingSystemAudio = false
                     try? FileManager.default.removeItem(at: outputURL)
+                    self.audioTrimProgress = "导出失败，可调整选区后重试"
                     self.show(
                         exporter.error ?? NativeStudioError.server("裁剪后的音频导出失败。")
                     )
                     return
                 }
                 self.stopPreview()
-                if let source = self.systemAudioRecordingURL {
-                    try? FileManager.default.removeItem(at: source)
-                }
-                self.systemAudioRecordingURL = nil
-                self.systemAudioTrimPresented = false
-                self.systemAudioStatus = "已导出并加入参考音频"
                 self.importReference(
                     outputURL,
                     displayName: safeName.isEmpty ? "系统录音" : safeName
-                )
+                ) { [weak self] success in
+                    guard let self else { return }
+                    self.isExportingSystemAudio = false
+                    guard success else { return }
+                    let shouldReopenLibrary = self.reopenReferenceLibraryAfterTrim
+                    if self.trimSourceIsTemporary, let source = self.systemAudioRecordingURL {
+                        try? FileManager.default.removeItem(at: source)
+                    }
+                    self.systemAudioRecordingURL = nil
+                    self.trimSourceIsTemporary = false
+                    self.reopenReferenceLibraryAfterTrim = false
+                    self.systemAudioTrimPresented = false
+                    self.systemAudioStatus = "已裁剪并加入参考音频"
+                    if shouldReopenLibrary {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                            self?.loadReferenceLibrary()
+                            self?.referenceLibraryPresented = true
+                        }
+                    }
+                }
             }
         }
     }
@@ -2281,9 +2385,9 @@ struct SystemAudioTrimView: View {
         VStack(alignment: .leading, spacing: StudioTokens.space4) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("裁剪系统录音")
+                    Text(model.audioTrimTitle)
                         .font(.system(size: 22, weight: .semibold, design: .rounded))
-                    Text("只保留声音稳定、背景干净的一段作为克隆参考。")
+                    Text(model.audioTrimSubtitle)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -2334,31 +2438,51 @@ struct SystemAudioTrimView: View {
             TextField("参考音频名称", text: $model.systemAudioName)
                 .textFieldStyle(.roundedBorder)
 
+            HStack(spacing: StudioTokens.space2) {
+                if model.isExportingSystemAudio || model.isImportingReference {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Text(model.audioTrimProgress)
+                    .font(.caption)
+                    .foregroundStyle(
+                        model.audioTrimProgress.contains("失败")
+                            || model.audioTrimProgress.contains("无法")
+                            ? Color.red
+                            : Color.secondary
+                    )
+                Spacer()
+            }
+
             HStack {
                 Button("试听选区") { model.previewSystemAudioSelection() }
                     .buttonStyle(StudioSecondaryButtonStyle())
                 Button("停止试听") { model.stopPreview() }
                     .buttonStyle(StudioSecondaryButtonStyle())
                 Spacer()
-                Button("丢弃", role: .destructive) { model.discardSystemAudioRecording() }
-                    .buttonStyle(StudioSecondaryButtonStyle(destructive: true))
-                    .disabled(model.isExportingSystemAudio)
+                Button("取消") { model.discardSystemAudioRecording() }
+                    .buttonStyle(StudioSecondaryButtonStyle())
+                    .disabled(model.isExportingSystemAudio || model.isImportingReference)
                 Button {
                     model.exportSystemAudioSelection()
                 } label: {
                     Label(
-                        model.isExportingSystemAudio ? "正在导出…" : "导出并加入参考音频",
-                        systemImage: "square.and.arrow.down"
+                        model.isImportingReference
+                            ? "正在导入…"
+                            : model.isExportingSystemAudio
+                            ? "正在压缩…"
+                            : "裁剪并加入参考音频",
+                        systemImage: "scissors"
                     )
                 }
                 .buttonStyle(StudioTintedButtonStyle())
-                .disabled(model.isExportingSystemAudio)
+                .disabled(model.isExportingSystemAudio || model.isImportingReference)
             }
         }
         .padding(StudioTokens.space5)
         .frame(width: 720, height: 500)
         .background(StudioBackground())
-        .interactiveDismissDisabled(model.isExportingSystemAudio)
+        .interactiveDismissDisabled(model.isExportingSystemAudio || model.isImportingReference)
     }
 }
 
@@ -2476,6 +2600,12 @@ struct ReferenceAudioLibraryView: View {
                                     model.referenceLibraryPresented = false
                                 } label: {
                                     Label("使用", systemImage: "checkmark.circle")
+                                }
+                                .buttonStyle(StudioCompactActionButtonStyle())
+                                Button {
+                                    model.trimReference(reference)
+                                } label: {
+                                    Label("裁剪", systemImage: "scissors")
                                 }
                                 .buttonStyle(StudioCompactActionButtonStyle())
                                 Button {

@@ -359,6 +359,7 @@ private enum ServiceError: LocalizedError {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let service: LocalService
     private let viewModel: NativeStudioViewModel
+    private let sttViewModel: STTWorkbenchViewModel
     private var statusItem: NSStatusItem!
     private var serviceStatusItem: NSMenuItem!
     private var modelStatusItem: NSMenuItem!
@@ -369,6 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var stopServiceMenuItem: NSMenuItem!
     private var presetsMenu: NSMenu!
     private var window: NSWindow!
+    private var sttWindow: NSWindow!
     private var statusTimer: Timer?
     private var isTerminating = false
     private var isForceStopping = false
@@ -378,6 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let service = LocalService(repositoryRoot: AppDelegate.findRepositoryRoot())
         self.service = service
         self.viewModel = NativeStudioViewModel(service: service)
+        self.sttViewModel = STTWorkbenchViewModel(service: service)
         super.init()
         viewModel.onTTSServiceToggleRequested = { [weak self] in
             self?.requestTTSRuntimeToggle()
@@ -413,6 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
         }
         buildWindow()
+        buildSTTWindow()
         buildApplicationMenu()
         buildStatusMenu()
         updateMenuStatus("正在启动本地 Metal 服务…")
@@ -444,7 +448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        window.orderOut(nil)
+        sender.orderOut(nil)
         return false
     }
 
@@ -480,6 +484,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.center()
     }
 
+    private func buildSTTWindow() {
+        let content = STTWorkbenchView(model: sttViewModel)
+        let hostingView = NSHostingView(rootView: content)
+        sttWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        sttWindow.title = "Qwen STT 语音转文字"
+        sttWindow.contentView = hostingView
+        sttWindow.contentMinSize = NSSize(width: 980, height: 680)
+        sttWindow.delegate = self
+        sttWindow.setFrameAutosaveName("QwenSTTWorkbenchWindow")
+        sttWindow.center()
+    }
+
     private func buildApplicationMenu() {
         let mainMenu = NSMenu()
 
@@ -495,10 +516,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
+        let workspaceMenuItem = NSMenuItem()
+        let workspaceMenu = NSMenu(title: "工作台")
+        let openAudioItem = NSMenuItem(
+            title: "打开音频工作台",
+            action: #selector(openStudio(_:)),
+            keyEquivalent: "o"
+        )
+        openAudioItem.target = self
+        workspaceMenu.addItem(openAudioItem)
+        let openSTTItem = NSMenuItem(
+            title: "打开语音转文字工作台",
+            action: #selector(openSTTWorkbench(_:)),
+            keyEquivalent: "t"
+        )
+        openSTTItem.keyEquivalentModifierMask = [.command, .shift]
+        openSTTItem.target = self
+        workspaceMenu.addItem(openSTTItem)
+        workspaceMenuItem.submenu = workspaceMenu
+        mainMenu.addItem(workspaceMenuItem)
+
         let windowMenuItem = NSMenuItem()
         let windowMenu = NSMenu(title: "窗口")
         let closeItem = NSMenuItem(
-            title: "关闭音频控制台",
+            title: "关闭当前窗口",
             action: #selector(closeStudio(_:)),
             keyEquivalent: "w"
         )
@@ -535,6 +576,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let openItem = NSMenuItem(title: "打开音频工作台", action: #selector(openStudio(_:)), keyEquivalent: "o")
         openItem.target = self
         menu.addItem(openItem)
+        let sttItem = NSMenuItem(
+            title: "打开语音转文字工作台",
+            action: #selector(openSTTWorkbench(_:)),
+            keyEquivalent: "t"
+        )
+        sttItem.keyEquivalentModifierMask = [.command, .shift]
+        sttItem.target = self
+        menu.addItem(sttItem)
         let browserItem = NSMenuItem(title: "打开 Qwen 声阅", action: #selector(openNovelReader(_:)), keyEquivalent: "")
         browserItem.target = self
         menu.addItem(browserItem)
@@ -784,14 +833,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func openStudio(_ sender: Any?) { showStudio() }
 
+    @objc private func openSTTWorkbench(_ sender: Any?) { showSTTWorkbench() }
+
     @objc private func closeStudio(_ sender: Any?) {
-        guard window.isVisible else { return }
-        window.performClose(sender)
+        if let keyWindow = NSApp.keyWindow, keyWindow.isVisible {
+            keyWindow.performClose(sender)
+        } else if window.isVisible {
+            window.performClose(sender)
+        }
     }
 
     private func showStudio() {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func showSTTWorkbench() {
+        sttViewModel.refreshHealth()
+        NSApp.activate(ignoringOtherApps: true)
+        sttWindow.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openNovelReader(_ sender: Any?) {
