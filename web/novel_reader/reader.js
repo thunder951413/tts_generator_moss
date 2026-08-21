@@ -1284,8 +1284,11 @@ async function playStreamingAudio(start) {
   if (!response.ok || !response.body) throw new Error(await response.text());
   const playbackEpoch = Number(response.headers.get("X-Playback-Epoch"));
   if (Number.isFinite(playbackEpoch)) state.playbackEpoch = playbackEpoch;
-  const channels = Number(response.headers.get("X-Audio-Channels") || start.channels || 1);
-  const sampleRate = Number(response.headers.get("X-Audio-Sample-Rate") || start.sample_rate || 24000);
+  // The /start response carries the profile's real PCM format and is race-free;
+  // stream headers are only a fallback (a queued job used to leak placeholder
+  // 48000/stereo headers and garble playback under concurrent generation).
+  const channels = Number(start.channels || response.headers.get("X-Audio-Channels") || 1);
+  const sampleRate = Number(start.sample_rate || response.headers.get("X-Audio-Sample-Rate") || 24000);
   const reader = response.body.getReader();
   let nextTime = audioContext.currentTime + 0.08;
   let remainder = new Uint8Array(0);

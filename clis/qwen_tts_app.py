@@ -758,8 +758,8 @@ class StreamingJob:
             "updated_at": time.time(),
             "started_at": None,
             "first_audio_at": None,
-            "sample_rate": 48000,
-            "channels": 2,
+            "sample_rate": 24000,
+            "channels": 1,
             "generated_frames": 0,
             "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
             "generated_audio_seconds": 0.0,
@@ -1264,6 +1264,11 @@ def create_app(
                         metadata = dict(event.data["metadata"])
                         task_seed_status = job.snapshot()
                         metadata["seed"] = int(request.seed) if request.seed is not None else None
+                        # After a runaway-retry the worker regenerated with a
+                        # different seed; report the seed that made the audio.
+                        effective_seed = metadata.get("effective_seed")
+                        if effective_seed is not None:
+                            metadata["seed"] = int(effective_seed)
                         metadata["configured_seed"] = task_seed_status.get("configured_seed")
                         metadata["seed_mode"] = task_seed_status.get("seed_mode")
                         job.set_result({
@@ -2180,13 +2185,24 @@ def create_app(
                     jobs.close(job_id)
 
         snapshot = job.snapshot()
+        # The PCM format comes from the model profile itself.  Reading it from
+        # the job snapshot is a race: a job that is still queued reports the
+        # placeholder defaults, and clients that trust the headers (the novel
+        # reader) would then decode 24 kHz mono PCM as 48 kHz stereo.
+        profile = runtime_manager.profiles.get(str(snapshot.get("model_profile") or ""))
+        if profile:
+            audio_sample_rate = int(profile["sample_rate"])
+            audio_channels = int(profile["channels"])
+        else:
+            audio_sample_rate = int(snapshot.get("sample_rate") or 24000)
+            audio_channels = int(snapshot.get("channels") or 1)
         return StreamingResponse(
             iterator(),
             media_type="application/octet-stream",
             headers={
                 "X-Audio-Codec": "pcm_s16le",
-                "X-Audio-Sample-Rate": str(snapshot.get("sample_rate", 48000)),
-                "X-Audio-Channels": str(snapshot.get("channels", 2)),
+                "X-Audio-Sample-Rate": str(audio_sample_rate),
+                "X-Audio-Channels": str(audio_channels),
                 "X-Stream-Id": job_id,
                 "X-Playback-Epoch": str(playback_status["playback_epoch"]),
             },

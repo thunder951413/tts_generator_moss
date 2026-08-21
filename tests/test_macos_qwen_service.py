@@ -915,6 +915,288 @@ def test_ggml_worker_passes_effective_seed_to_native_stream(tmp_path: Path) -> N
     assert events[-1]["data"]["metadata"]["seed"] == 424242
 
 
+def load_worker_module():
+    fake_package = types.ModuleType("faster_qwen3_tts")
+    fake_package.FasterQwen3TTS = object
+    previous = sys.modules.get("faster_qwen3_tts")
+    sys.modules["faster_qwen3_tts"] = fake_package
+    try:
+        worker_path = ROOT / "qwen_tts_service" / "qwen_worker.py"
+        spec = importlib.util.spec_from_file_location("qwen_worker_test", worker_path)
+        assert spec is not None and spec.loader is not None
+        worker_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker_module)
+        return worker_module
+    finally:
+        if previous is None:
+            sys.modules.pop("faster_qwen3_tts", None)
+        else:
+            sys.modules["faster_qwen3_tts"] = previous
+
+
+def make_worker_state(worker_module, model):
+    state = object.__new__(worker_module.WorkerState)
+    state.profile_id = "qwen_0_6b"
+    state.model_path = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    state.backend = "ggml"
+    state.quant = "Q4_K_M"
+    state.started_at = time.time()
+    state.requests = 0
+    state.reference_keys = set()
+    state.model = model
+    state.sample_rate = 24000
+    return state
+
+
+def test_worker_retries_runaway_generation_with_fresh_seed(tmp_path: Path) -> None:
+    worker_module = load_worker_module()
+    worker_module.RUNAWAY_MIN_BUDGET_SECONDS = 2.0
+    worker_module.RUNAWAY_SECONDS_PER_CHAR = 0.0
+    worker_module._retry_seed = lambda previous: 777777
+
+    class RunawayThenHealthyModel:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def _resolve_clone_reference(self, **_kwargs):
+            return {"ref_spk_emb": np.zeros(4, dtype=np.float32)}, 1.0, {"mode": "clone"}
+
+        def _stream_runtime(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["seed"] == 424242:
+                # 失控：单块音频超过 2 秒预算（复读坍缩直到撞帧上限的表现）
+                yield np.zeros(24000 * 3, dtype=np.float32), 24000, {}
+            else:
+                yield np.zeros(19200, dtype=np.float32), 24000, {}
+
+    model = RunawayThenHealthyModel()
+    state = make_worker_state(worker_module, model)
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"test")
+    events = list(
+        state.generate(
+            {
+                "text": "测试失控重试",
+                "ref_audio": str(reference),
+                "output_dir": str(tmp_path / "output"),
+                "seed": 424242,
+                "xvec_only": True,
+                "repetition_penalty": 1.05,
+            }
+        )
+    )
+
+    assert [call["seed"] for call in model.calls] == [424242, 777777]
+    # 重试时提高重复惩罚，帮助模型跳出复读吸引域
+    assert model.calls[0]["repetition_penalty"] == 1.05
+    assert model.calls[1]["repetition_penalty"] == 1.15
+
+    progress = [event for event in events if event["type"] == "progress"]
+    assert progress and progress[0]["data"]["runaway_retry"] == 1
+    audio_events = [event for event in events if event["type"] == "audio"]
+    # 只有重试那一轮的音频块被送出；19200 样本 = 10 帧
+    assert len(audio_events) == 1
+    assert audio_events[0]["data"]["samples"] == 19200
+    assert audio_events[0]["data"]["generated_frames"] == 10
+
+    result = [event for event in events if event["type"] == "result"][0]
+    metadata = result["data"]["metadata"]
+    assert metadata["runaway_retries"] == 1
+    assert metadata["effective_seed"] == 777777
+    assert metadata["seed"] == 424242
+    assert metadata["generated_frames"] == 10
+
+    import soundfile as sf
+
+    waveform, sample_rate = sf.read(result["data"]["audio_path"], dtype="float32")
+    assert sample_rate == 24000
+    assert len(waveform) == 19200
+
+
+def test_worker_aborts_when_runaway_persists_after_retry(tmp_path: Path) -> None:
+    worker_module = load_worker_module()
+    worker_module.RUNAWAY_MIN_BUDGET_SECONDS = 2.0
+    worker_module.RUNAWAY_SECONDS_PER_CHAR = 0.0
+    worker_module._retry_seed = lambda previous: 777777
+
+    class AlwaysRunawayModel:
+        def _resolve_clone_reference(self, **_kwargs):
+            return {"ref_spk_emb": np.zeros(4, dtype=np.float32)}, 1.0, {"mode": "clone"}
+
+        def _stream_runtime(self, **_kwargs):
+            while True:
+                yield np.zeros(24000 * 3, dtype=np.float32), 24000, {}
+
+    state = make_worker_state(worker_module, AlwaysRunawayModel())
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"test")
+    with pytest.raises(RuntimeError, match="失控"):
+        for _ in state.generate(
+            {
+                "text": "测试持续失控",
+                "ref_audio": str(reference),
+                "output_dir": str(tmp_path / "output"),
+                "seed": 424242,
+                "xvec_only": True,
+            }
+        ):
+            pass
+
+
+def test_worker_reports_frames_from_emitted_samples(tmp_path: Path) -> None:
+    worker_module = load_worker_module()
+
+    class FakeModel:
+        def _resolve_clone_reference(self, **_kwargs):
+            return {"ref_spk_emb": np.zeros(4, dtype=np.float32)}, 1.0, {"mode": "clone"}
+
+        def _stream_runtime(self, **_kwargs):
+            # GGML 路径的 timing 不含 total_steps_so_far
+            for _ in range(3):
+                yield np.zeros(19200, dtype=np.float32), 24000, {"chunk_index": 0}
+
+    state = make_worker_state(worker_module, FakeModel())
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"test")
+    events = list(
+        state.generate(
+            {
+                "text": "测试帧数统计",
+                "ref_audio": str(reference),
+                "output_dir": str(tmp_path / "output"),
+                "seed": 424242,
+                "xvec_only": True,
+            }
+        )
+    )
+    audio_events = [event for event in events if event["type"] == "audio"]
+    # 修复前 generated_frames 永远卡在第一个块的值（8）
+    assert [event["data"]["generated_frames"] for event in audio_events] == [10, 20, 30]
+    result = [event for event in events if event["type"] == "result"][0]
+    assert result["data"]["metadata"]["generated_frames"] == 30
+
+
+def test_stream_audio_headers_report_profile_format_while_job_queued(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_app_module()
+    module.DEFAULT_SERVICE_JOB_DIR = tmp_path / "jobs"
+    gate = threading.Event()
+
+    class FakeRuntime:
+        sample_rate = 24000
+        n_vq = 16
+
+        def synthesize(self, _request, *, output_dir):
+            output = Path(output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            audio_path = output / "fake.wav"
+            tokens_path = output / "fake.npy"
+            metadata_path = output / "fake.json"
+            audio_path.write_bytes(b"RIFF-result")
+            tokens_path.write_bytes(b"tokens")
+            metadata_path.write_text("{}", encoding="utf-8")
+            yield types.SimpleNamespace(type="metadata", data={"sample_rate": 24000, "channels": 1})
+            yield types.SimpleNamespace(
+                type="result",
+                data={
+                    "audio_path": str(audio_path),
+                    "tokens_path": str(tokens_path),
+                    "metadata_path": str(metadata_path),
+                    "metadata": {"generated_frames": 1, "duration_seconds": 0.1},
+                },
+            )
+
+    class FakeRuntimeManager:
+        def __init__(self, **_kwargs):
+            self.qwen_backend = "ggml"
+            self.qwen_quant = "Q4_K_M"
+            self.qwentts_library = ""
+            self.device = "metal"
+            self.dtype = "gguf"
+            self.attn_implementation = "ggml_metal"
+            self.profiles = {
+                "qwen_0_6b": {
+                    "label": "test",
+                    "sample_rate": 24000,
+                    "channels": 1,
+                    "streaming": True,
+                    "backend": "qwen",
+                },
+                "qwen_1_7b": {
+                    "label": "test",
+                    "sample_rate": 24000,
+                    "channels": 1,
+                    "streaming": True,
+                    "backend": "qwen",
+                },
+            }
+
+        @contextmanager
+        def session(self, _profile):
+            # 让任务停在 loading_runtime：并发占满 lane 时客户端立刻拉流，
+            # 修复前头部会泄露 48000/2 占位默认值
+            gate.wait(timeout=10.0)
+            yield FakeRuntime()
+
+        def status(self):
+            return {"state": "ready", "device": "metal", "profiles": []}
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(module, "RuntimeManager", FakeRuntimeManager)
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        stt_preload=False,
+        access_password="",
+    )
+    with TestClient(app) as client:
+        voice = client.get("/api/voices").json()["voices"][0]
+        applied = client.put(
+            "/api/service-settings",
+            json={
+                "name": "API 默认音色",
+                "settings": {
+                    "model_profile": "qwen_1_7b",
+                    "voice_name": voice["name"],
+                    "reference_audio_path": voice["audio_path"],
+                    "qwen_clone_mode": "xvec",
+                    "qwen_seed": 4321,
+                },
+            },
+        )
+        assert applied.status_code == 200
+        started = client.post(
+            "/api/generate-stream/start",
+            data={
+                "text": "验证排队时头部信息正确。",
+                "streaming_generation": "1",
+                "model_profile": "qwen_0_6b",
+            },
+        )
+        assert started.status_code == 200
+        job_id = started.json()["job_id"]
+        with client.stream("GET", f"/api/generate-stream/{job_id}/audio") as streamed:
+            assert streamed.headers["x-audio-codec"] == "pcm_s16le"
+            assert streamed.headers["x-audio-sample-rate"] == "24000"
+            assert streamed.headers["x-audio-channels"] == "1"
+        gate.set()
+        deadline = time.time() + 5.0
+        status = {}
+        while time.time() < deadline:
+            status = client.get(f"/api/generate-stream/{job_id}/status").json()
+            if status.get("state") in {"finished", "closed", "error"}:
+                break
+            time.sleep(0.05)
+        assert status.get("state") in {"finished", "closed"}
+
+
 def test_worker_preserves_virtualenv_python_symlink(monkeypatch, tmp_path: Path) -> None:
     service_dir = ROOT / "qwen_tts_service"
     sys.path.insert(0, str(service_dir))

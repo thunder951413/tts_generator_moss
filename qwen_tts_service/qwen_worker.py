@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import random
 import threading
 import time
 import uuid
@@ -27,6 +28,23 @@ from faster_qwen3_tts import FasterQwen3TTS
 
 
 LOG = logging.getLogger("qwen-worker")
+
+# Runaway-generation watchdog.  When the talker collapses into a repetition
+# loop it never emits EOS and keeps producing audio until max_new_tokens
+# (2048 frames = 163.84 s).  Normal speech never exceeds ~0.38 s per
+# character (observed P95 is 0.225), while recorded runaways were
+# 0.97-2.28 s/char, so a generous 0.6 s/char budget separates the two.
+RUNAWAY_SECONDS_PER_CHAR = 0.6
+RUNAWAY_MIN_BUDGET_SECONDS = 30.0
+RUNAWAY_MAX_RETRIES = 1
+RUNAWAY_RETRY_REPETITION_PENALTY = 1.15
+
+
+def _retry_seed(previous: int | None) -> int:
+    seed = random.randrange(1, 1_000_000)
+    if previous is not None and seed == previous:
+        seed = (seed + 1) % 1_000_000
+    return seed
 
 
 class WorkerState:
@@ -110,12 +128,18 @@ class WorkerState:
 
         chunk_size = max(1, min(24, int(payload.get("chunk_size") or 8)))
         max_new_tokens = max(2, min(2048, int(payload.get("max_new_tokens") or 2048)))
+        budget_seconds = max(
+            RUNAWAY_MIN_BUDGET_SECONDS,
+            RUNAWAY_SECONDS_PER_CHAR * max(1, len(text)),
+        )
         started = time.perf_counter()
         first_audio_latency: float | None = None
         generated_steps = 0
         audio_chunks: list[np.ndarray] = []
         emitted_samples = 0
         decode_chunks = 0
+        runaway_retries = 0
+        effective_seed = int(seed) if seed is not None and int(seed) >= 0 else None
 
         yield {
             "type": "metadata",
@@ -159,71 +183,130 @@ class WorkerState:
         }
         if self.backend == "ggml" and generation_kwargs["instruct"]:
             raise ValueError("GGML Base voice-clone backend does not support instruct")
-        if self.backend == "ggml" and seed is not None:
+
+        def build_generator(seed_value: int | None, repetition_penalty_value: float):
             # FasterQwen3TTS does not yet expose qwentts.cpp's seed argument.
             # Use its adapter preparation and native streaming helpers so the
             # effective seed saved by the service is also the seed actually used.
-            ref_kwargs, adapter_prepare_ms, adapter_profile = self.model._resolve_clone_reference(
-                ref_audio=generation_kwargs["ref_audio"],
-                ref_text=ref_text,
-                xvec_only=xvec_only,
-                append_silence=generation_kwargs["append_silence"],
-                ref_spk=None,
-                ref_rvq=None,
-                ref_spk_emb=None,
-                ref_codes=None,
-            )
-            generator = self.model._stream_runtime(
-                text=text,
-                lang="Chinese",
-                **ref_kwargs,
-                max_new_tokens=max_new_tokens,
-                do_sample=generation_kwargs["do_sample"],
-                temperature=generation_kwargs["temperature"],
-                top_k=generation_kwargs["top_k"],
-                top_p=generation_kwargs["top_p"],
-                repetition_penalty=generation_kwargs["repetition_penalty"],
-                seed=int(seed),
-                chunk_size=chunk_size,
-                adapter_prepare_ms=adapter_prepare_ms,
-                adapter_profile=adapter_profile,
-            )
-        else:
-            generator = self.model.generate_voice_clone_streaming(**generation_kwargs)
+            if self.backend == "ggml" and seed_value is not None:
+                ref_kwargs, adapter_prepare_ms, adapter_profile = self.model._resolve_clone_reference(
+                    ref_audio=generation_kwargs["ref_audio"],
+                    ref_text=ref_text,
+                    xvec_only=xvec_only,
+                    append_silence=generation_kwargs["append_silence"],
+                    ref_spk=None,
+                    ref_rvq=None,
+                    ref_spk_emb=None,
+                    ref_codes=None,
+                )
+                return self.model._stream_runtime(
+                    text=text,
+                    lang="Chinese",
+                    **ref_kwargs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=generation_kwargs["do_sample"],
+                    temperature=generation_kwargs["temperature"],
+                    top_k=generation_kwargs["top_k"],
+                    top_p=generation_kwargs["top_p"],
+                    repetition_penalty=repetition_penalty_value,
+                    seed=int(seed_value),
+                    chunk_size=chunk_size,
+                    adapter_prepare_ms=adapter_prepare_ms,
+                    adapter_profile=adapter_profile,
+                )
+            kwargs = dict(generation_kwargs)
+            kwargs["repetition_penalty"] = repetition_penalty_value
+            return self.model.generate_voice_clone_streaming(**kwargs)
 
-        for audio, sample_rate, timing in generator:
-            chunk = np.asarray(audio, dtype=np.float32).reshape(-1)
-            if chunk.size == 0:
-                continue
-            if int(sample_rate) != self.sample_rate:
-                self.sample_rate = int(sample_rate)
-            if first_audio_latency is None:
-                first_audio_latency = time.perf_counter() - started
-            audio_chunks.append(chunk.copy())
-            emitted_samples += int(chunk.size)
-            generated_steps = int(timing.get("total_steps_so_far") or generated_steps)
-            if generated_steps <= 0:
-                generated_steps = round(emitted_samples * 12.5 / float(self.sample_rate))
-            decode_chunks += 1
-            elapsed = max(1e-6, time.perf_counter() - started)
-            audio_seconds = emitted_samples / float(self.sample_rate)
-            pcm = (np.clip(chunk, -1.0, 1.0) * 32767.0).round().astype("<i2", copy=False)
-            yield {
-                "type": "audio",
-                "data": {
-                    "pcm16_base64": base64.b64encode(pcm.tobytes()).decode("ascii"),
-                    "samples": int(chunk.size),
-                    "sample_rate": self.sample_rate,
-                    "channels": 1,
-                    "generated_frames": generated_steps,
-                    "generated_audio_seconds": audio_seconds,
-                    "emitted_audio_seconds": audio_seconds,
-                    "generation_realtime_factor": audio_seconds / elapsed,
-                    "first_audio_latency_seconds": first_audio_latency,
-                    "decode_chunks_submitted": decode_chunks,
-                    "chunk_frames": chunk_size,
-                },
-            }
+        for attempt in range(RUNAWAY_MAX_RETRIES + 1):
+            seed_value = int(seed) if seed is not None and int(seed) >= 0 else None
+            repetition_penalty_value = generation_kwargs["repetition_penalty"]
+            if attempt > 0:
+                seed_value = _retry_seed(effective_seed)
+                repetition_penalty_value = max(
+                    repetition_penalty_value, RUNAWAY_RETRY_REPETITION_PENALTY
+                )
+                effective_seed = seed_value
+                audio_chunks = []
+                emitted_samples = 0
+                decode_chunks = 0
+                generated_steps = 0
+                first_audio_latency = None
+                yield {
+                    "type": "progress",
+                    "data": {
+                        "runaway_retry": attempt,
+                        "runaway_retry_seed": seed_value,
+                        "runaway_retry_note": "检测到复读式失控生成，已更换种子重试",
+                    },
+                }
+            if seed_value is not None:
+                torch.manual_seed(int(seed_value))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(int(seed_value))
+
+            runaway = False
+            generator = build_generator(seed_value, repetition_penalty_value)
+            try:
+                for audio, sample_rate, timing in generator:
+                    chunk = np.asarray(audio, dtype=np.float32).reshape(-1)
+                    if chunk.size == 0:
+                        continue
+                    if int(sample_rate) != self.sample_rate:
+                        self.sample_rate = int(sample_rate)
+                    if first_audio_latency is None:
+                        first_audio_latency = time.perf_counter() - started
+                    emitted_seconds = (emitted_samples + chunk.size) / float(self.sample_rate)
+                    if emitted_seconds > budget_seconds:
+                        runaway = True
+                        break
+                    audio_chunks.append(chunk.copy())
+                    emitted_samples += int(chunk.size)
+                    steps = timing.get("total_steps_so_far")
+                    if steps:
+                        generated_steps = int(steps)
+                    else:
+                        generated_steps = round(emitted_samples * 12.5 / float(self.sample_rate))
+                    decode_chunks += 1
+                    elapsed = max(1e-6, time.perf_counter() - started)
+                    audio_seconds = emitted_samples / float(self.sample_rate)
+                    pcm = (np.clip(chunk, -1.0, 1.0) * 32767.0).round().astype("<i2", copy=False)
+                    yield {
+                        "type": "audio",
+                        "data": {
+                            "pcm16_base64": base64.b64encode(pcm.tobytes()).decode("ascii"),
+                            "samples": int(chunk.size),
+                            "sample_rate": self.sample_rate,
+                            "channels": 1,
+                            "generated_frames": generated_steps,
+                            "generated_audio_seconds": audio_seconds,
+                            "emitted_audio_seconds": audio_seconds,
+                            "generation_realtime_factor": audio_seconds / elapsed,
+                            "first_audio_latency_seconds": first_audio_latency,
+                            "decode_chunks_submitted": decode_chunks,
+                            "chunk_frames": chunk_size,
+                        },
+                    }
+            finally:
+                # Closing cancels the native stream promptly when we break out
+                # on a runaway instead of waiting for garbage collection.
+                generator.close()
+            if not runaway:
+                break
+            LOG.warning(
+                "runaway generation detected: attempt %d produced %.1fs of audio for a %d-char text (budget %.1fs)",
+                attempt + 1,
+                emitted_samples / float(self.sample_rate),
+                len(text),
+                budget_seconds,
+            )
+            if attempt >= RUNAWAY_MAX_RETRIES:
+                raise RuntimeError(
+                    f"生成疑似复读失控：文本约 {len(text)} 字，已生成 "
+                    f"{emitted_samples / float(self.sample_rate):.1f} 秒音频仍未结束，已中止。"
+                    "请重试，或更换参考音频/种子。"
+                )
+            runaway_retries += 1
 
         elapsed = max(1e-6, time.perf_counter() - started)
         waveform = np.concatenate(audio_chunks) if audio_chunks else np.zeros(1, dtype=np.float32)
@@ -257,6 +340,8 @@ class WorkerState:
             "xvec_only": xvec_only,
             "non_streaming_mode": bool(payload.get("non_streaming_mode", False)),
             "seed": int(seed) if seed is not None else None,
+            "effective_seed": effective_seed,
+            "runaway_retries": runaway_retries,
             "backend": self.backend,
             "quant": self.quant,
         }
