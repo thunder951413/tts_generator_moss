@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [mac-qwen-metal, main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -e ".[ci]"
+      - name: Run tests
+        run: python -m pytest tests/ -q

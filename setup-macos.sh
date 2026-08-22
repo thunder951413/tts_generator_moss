@@ -44,7 +44,7 @@ fi
 "$PYTHON_BIN" -m venv "$ROOT/.venv"
 PYTHON="$ROOT/.venv/bin/python"
 "$PYTHON" -m pip install --upgrade pip setuptools wheel
-"$PYTHON" -m pip install -r "$ROOT/requirements-macos.txt"
+"$PYTHON" -m pip install -e "$ROOT"
 
 clone_at_ref() {
   local url="$1"
