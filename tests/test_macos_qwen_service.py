@@ -195,7 +195,7 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert '"api/performance/benchmark"' in native_source
         assert '"测试性能"' in native_source
         assert 'api/generate-stream/\\(jobID)/audio' in native_source
-        service_source = (ROOT / "clis" / "qwen_tts_app.py").read_text(encoding="utf-8")
+        service_source = (ROOT / "qwen_tts_service" / "webapp" / "routers" / "generation.py").read_text(encoding="utf-8")
         assert "await request.is_disconnected()" in service_source
         start_script = (ROOT / "start-macos.sh").read_text(encoding="utf-8")
         assert "Refusing LAN exposure with an empty/weak password" in start_script
@@ -789,6 +789,7 @@ def test_api_scheduler_prioritizes_internal_work_and_keeps_external_fifo() -> No
 
 def test_dead_qwen_worker_is_retired_and_restarted(tmp_path: Path) -> None:
     module = load_app_module()
+    from qwen_runtime import QwenWorkerRuntime  # noqa: E402  (path set by load_app_module)
 
     class FakeProcess:
         def __init__(self, return_code):
@@ -825,7 +826,7 @@ def test_dead_qwen_worker_is_retired_and_restarted(tmp_path: Path) -> None:
 
     dead = DeadWorker()
     replacement = ReplacementWorker()
-    runtime = object.__new__(module.QwenWorkerRuntime)
+    runtime = object.__new__(QwenWorkerRuntime)
     runtime.profile_id = "qwen_0_6b"
     runtime._closed = False
     runtime._workers = [dead]
