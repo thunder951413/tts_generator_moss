@@ -17,6 +17,9 @@ printf '%s\n' "$ROOT" > "$RESOURCES_DIR/repository-root.txt"
 xcrun swiftc \
   "$ROOT/macos/QwenTTSApp.swift" \
   "$ROOT/macos/StudioDesignSystem.swift" \
+  "$ROOT/macos/NativeStudioModels.swift" \
+  "$ROOT/macos/NativeStudioPlayback.swift" \
+  "$ROOT/macos/NativeStudioViewModel.swift" \
   "$ROOT/macos/NativeStudio.swift" \
   "$ROOT/macos/STTWorkbench.swift" \
   -o "$MACOS_DIR/QwenTTS" \

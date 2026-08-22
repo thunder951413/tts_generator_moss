@@ -137,7 +137,15 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert performance.status_code == 200
         assert performance.json()["active_recommendation"]["block_parallel"] == 1
 
-        native_source = (ROOT / "macos" / "NativeStudio.swift").read_text(encoding="utf-8")
+        native_source = "\n".join(
+            (ROOT / "macos" / name).read_text(encoding="utf-8")
+            for name in (
+                "NativeStudio.swift",
+                "NativeStudioModels.swift",
+                "NativeStudioPlayback.swift",
+                "NativeStudioViewModel.swift",
+            )
+        )
         app_source = (ROOT / "macos" / "QwenTTSApp.swift").read_text(encoding="utf-8")
         stt_source = (ROOT / "macos" / "STTWorkbench.swift").read_text(encoding="utf-8")
         reader_app_source = (ROOT / "macos" / "QwenReaderApp.swift").read_text(encoding="utf-8")
