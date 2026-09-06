@@ -128,6 +128,15 @@ struct ReferenceAudioLibraryView: View {
                                     Label("裁剪", systemImage: "scissors")
                                 }
                                 .buttonStyle(StudioCompactActionButtonStyle())
+                                if reference.kind == "custom" {
+                                    Button {
+                                        model.beginRenamingReference(reference)
+                                    } label: {
+                                        Label("改名", systemImage: "pencil")
+                                    }
+                                    .buttonStyle(StudioCompactActionButtonStyle())
+                                    .disabled(model.isRenamingReference)
+                                }
                                 Button {
                                     model.setReferenceHidden(reference, hidden: !reference.hidden)
                                 } label: {
@@ -140,7 +149,11 @@ struct ReferenceAudioLibraryView: View {
                                 if reference.kind == "custom" {
                                     Button(role: .destructive) {
                                         model.referenceLibraryStatus = ""
-                                        model.pendingReferenceDeletion = reference
+                                        if reference.usages.contains(where: { $0.hasPrefix("书籍") || $0.hasPrefix("生成任务") }) {
+                                            model.referenceLibraryStatus = "无法删除：该音频仍被书籍或生成任务引用，请先移除书籍或等待任务结束。"
+                                        } else {
+                                            model.pendingReferenceDeletion = reference
+                                        }
                                     } label: {
                                         Label("删除", systemImage: "trash")
                                     }
@@ -194,6 +207,52 @@ struct ReferenceAudioLibraryView: View {
                 Text("音频文件删除后无法恢复。")
             }
         }
+        .sheet(item: $model.pendingReferenceRename) { reference in
+            ReferenceAudioRenameView(model: model, reference: reference)
+        }
+    }
+}
+
+struct ReferenceAudioRenameView: View {
+    @ObservedObject var model: NativeStudioViewModel
+    let reference: NativeReferenceAudio
+    @FocusState private var nameFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StudioTokens.space4) {
+            Label("重命名参考音频", systemImage: "pencil")
+                .font(.title3.weight(.semibold))
+            Text("更改显示名称，音频内容和引用关系会保留。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            TextField("音频名称", text: $model.pendingReferenceRenameName)
+                .textFieldStyle(.roundedBorder)
+                .focused($nameFocused)
+                .disabled(model.isRenamingReference)
+            if !model.referenceLibraryStatus.isEmpty {
+                Text(model.referenceLibraryStatus)
+                    .font(.callout)
+                    .foregroundStyle(model.isRenamingReference ? Color.secondary : Color.red)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { model.pendingReferenceRename = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(StudioCompactActionButtonStyle())
+                    .disabled(model.isRenamingReference)
+                Button(model.isRenamingReference ? "保存中…" : "保存") {
+                    model.renameReference(reference, name: model.pendingReferenceRenameName)
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(StudioTintedButtonStyle())
+                .disabled(model.isRenamingReference || model.pendingReferenceRenameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(StudioTokens.space5)
+        .frame(width: 420)
+        .background(StudioBackground())
+        .interactiveDismissDisabled(model.isRenamingReference)
+        .onAppear { nameFocused = true }
     }
 }
 
@@ -378,7 +437,7 @@ struct NativeStudioView: View {
                             Button {
                                 model.chooseReferenceFile()
                                 } label: {
-                                    Label(model.isImportingReference ? "导入中…" : "导入音频", systemImage: "folder")
+                                    Label(model.isImportingReference ? "导入中…" : "导入音频/视频", systemImage: "folder")
                                         .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(StudioSecondaryButtonStyle())

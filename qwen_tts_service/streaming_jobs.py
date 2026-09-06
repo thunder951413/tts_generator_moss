@@ -11,12 +11,76 @@ import re
 import threading
 import time
 import uuid
+import tempfile
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import HTTPException
 
 DEFAULT_MAX_NEW_TOKENS = 7500
+
+
+class LosslessAudioQueue:
+    """Spool slow-consumer PCM to disk instead of dropping audible chunks."""
+
+    def __init__(self, *, max_bytes: int = 64 * 1024 * 1024) -> None:
+        self._condition = threading.Condition()
+        self._file = tempfile.SpooledTemporaryFile(max_size=512 * 1024, mode="w+b")
+        self._lengths: deque[int] = deque()
+        self._written = 0
+        self._read = 0
+        self._finished = False
+        self._closed = False
+        self._max_bytes = max_bytes
+
+    def put_nowait(self, item: bytes | None) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            if item is None:
+                self._finished = True
+                self._condition.notify_all()
+                return
+            if self._finished:
+                return
+            if self._written + len(item) > self._max_bytes:
+                raise queue.Full("流式音频缓存超出限制，请缩短单次生成文本")
+            self._file.seek(self._written)
+            self._file.write(item)
+            self._written += len(item)
+            self._lengths.append(len(item))
+            self._condition.notify_all()
+
+    def get(self, block: bool = True, timeout: float | None = None) -> bytes | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while not self._lengths and not self._closed and not self._finished:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if not block or (remaining is not None and remaining <= 0):
+                    raise queue.Empty
+                self._condition.wait(remaining)
+            if self._closed:
+                return None
+            if not self._lengths:
+                self.close()
+                return None
+            size = self._lengths.popleft()
+            self._file.seek(self._read)
+            chunk = self._file.read(size)
+            self._read += size
+            return chunk
+
+    def get_nowait(self) -> bytes | None:
+        return self.get(block=False)
+
+    def close(self) -> None:
+        with self._condition:
+            if not self._closed:
+                self._closed = True
+                self._file.close()
+                self._lengths.clear()
+                self._condition.notify_all()
 
 
 class StreamingJob:
@@ -29,7 +93,7 @@ class StreamingJob:
         persist_callback: Callable[["StreamingJob"], None] | None = None,
     ) -> None:
         self.job_id = job_id
-        self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        self.audio_queue = LosslessAudioQueue()
         self.status_lock = threading.Lock()
         default_status: dict[str, Any] = {
             "job_id": job_id,
@@ -131,6 +195,7 @@ class StreamingJobManager:
                     result=manifest.get("result"),
                     persist_callback=self._persist,
                 )
+                job.audio_queue.close()  # Live PCM is not restorable across service processes.
                 self._jobs[job_id] = job
                 job.persist()
             except Exception:
@@ -172,6 +237,21 @@ class StreamingJobManager:
             raise HTTPException(status_code=404, detail=f"stream job not found: {job_id}")
         return job
 
+    def reference_usage(self, path: str | Path) -> list[str]:
+        normalized = str(Path(path).resolve())
+        with self._lock:
+            jobs = list(self._jobs.values())
+        return [
+            f"生成任务“{job.snapshot().get('title') or job.job_id[:8]}”"
+            for job in jobs
+            if (
+                job.snapshot().get("state") in {"queued", "loading_runtime", "running"}
+                or (job.thread is not None and job.thread.is_alive())
+            )
+            and job.snapshot().get("reference_audio_path")
+            and str(Path(job.snapshot()["reference_audio_path"]).resolve()) == normalized
+        ]
+
     def close(self, job_id: str) -> StreamingJob:
         job = self.get(job_id)
         with job.status_lock:
@@ -179,10 +259,7 @@ class StreamingJobManager:
             job.status["closed"] = True
             if job.status.get("state") not in {"finished", "error"}:
                 job.status["state"] = "closed"
-            try:
-                job.audio_queue.put_nowait(None)
-            except queue.Full:
-                pass
+            job.audio_queue.close()
         job.persist()
         if self._close_callback is not None:
             self._close_callback(job.job_id)

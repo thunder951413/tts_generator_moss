@@ -20,7 +20,7 @@ class _PlaybackWaiter:
 class PlaybackCoordinator:
     """Grant one audible playback lease with internal-priority FIFO fairness."""
 
-    def __init__(self, *, max_waiters: int = 64, internal_burst_limit: int = 4) -> None:
+    def __init__(self, *, max_waiters: int = 64, internal_burst_limit: int = 4, initial_epoch: int = 0) -> None:
         self.max_waiters = max(1, int(max_waiters))
         self.internal_burst_limit = max(1, int(internal_burst_limit))
         self._condition = threading.Condition()
@@ -30,7 +30,8 @@ class PlaybackCoordinator:
         self._active_caller_kind = ""
         self._active_deadline: float | None = None
         self._internal_burst = 0
-        self._stop_epoch = 0
+        self._stop_epoch = initial_epoch
+        self._listening_reservations: dict[str, float] = {}
 
     @staticmethod
     def _kind(value: str) -> str:
@@ -57,6 +58,43 @@ class PlaybackCoordinator:
             self._condition.notify_all()
             return True
         return False
+
+    def _expire_listening_locked(self) -> bool:
+        now = time.monotonic()
+        expired = [session_id for session_id, deadline in self._listening_reservations.items() if now >= deadline]
+        for session_id in expired:
+            self._listening_reservations.pop(session_id, None)
+        if expired:
+            self._condition.notify_all()
+        return bool(expired)
+
+    def reserve_listening(self, session_id: str, *, ttl: float = 12.0) -> dict[str, object]:
+        """Reserve internal generation capacity across paragraph boundaries."""
+        with self._condition:
+            self._expire_listening_locked()
+            self._listening_reservations[str(session_id)] = time.monotonic() + max(1.0, float(ttl))
+            self._condition.notify_all()
+            return {"session_id": str(session_id), "playback_epoch": self._stop_epoch, "expires_in_seconds": max(1.0, float(ttl))}
+
+    def heartbeat_listening(self, session_id: str, *, expected_playback_epoch: int, ttl: float = 12.0) -> dict[str, object] | None:
+        """Renew an existing reservation without allowing a stopped run to revive it."""
+        with self._condition:
+            self._expire_listening_locked()
+            if int(expected_playback_epoch) != self._stop_epoch:
+                return None
+            session_id = str(session_id)
+            if session_id not in self._listening_reservations:
+                return None
+            self._listening_reservations[session_id] = time.monotonic() + max(1.0, float(ttl))
+            self._condition.notify_all()
+            return {"session_id": session_id, "playback_epoch": self._stop_epoch, "expires_in_seconds": max(1.0, float(ttl))}
+
+    def release_listening(self, session_id: str) -> bool:
+        with self._condition:
+            released = self._listening_reservations.pop(str(session_id), None) is not None
+            if released:
+                self._condition.notify_all()
+            return released
 
     def acquire(
         self,
@@ -145,6 +183,7 @@ class PlaybackCoordinator:
             self._active_caller_kind = ""
             self._active_deadline = None
             self._waiters.clear()
+            self._listening_reservations.clear()
             self._internal_burst = 0
             self._condition.notify_all()
             return {
@@ -155,13 +194,15 @@ class PlaybackCoordinator:
     def internal_playback_active(self) -> bool:
         with self._condition:
             self._expire_active_locked()
-            return self._active_caller_kind == "internal" or any(
+            self._expire_listening_locked()
+            return bool(self._listening_reservations) or self._active_caller_kind == "internal" or any(
                 item.caller_kind == "internal" for item in self._waiters
             )
 
     def status(self) -> dict[str, object]:
         with self._condition:
             self._expire_active_locked()
+            self._expire_listening_locked()
             return {
                 "active_job_id": self._active_job_id or None,
                 "active_caller_kind": self._active_caller_kind or None,
@@ -179,4 +220,5 @@ class PlaybackCoordinator:
                 "playback_epoch": self._stop_epoch,
                 "internal_burst": self._internal_burst,
                 "internal_burst_limit": self.internal_burst_limit,
+                "listening_reservations": len(self._listening_reservations),
             }

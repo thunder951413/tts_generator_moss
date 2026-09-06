@@ -8,9 +8,10 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -23,6 +24,10 @@ MODEL_PROFILE_LABELS = {
     "qwen_1_7b": "Qwen3-TTS 1.7B（Metal 高质量克隆）",
 }
 DEFAULT_MODEL_PROFILE = "qwen_0_6b"
+
+
+class RuntimeSessionCancelled(RuntimeError):
+    """Raised when a runtime session is invalidated before it is admitted."""
 
 
 class RuntimeManager:
@@ -85,6 +90,10 @@ class RuntimeManager:
         self._session_condition = threading.Condition()
         self._session_count = 0
         self._switching = False
+        self._closing = False
+        self._close_count = 0
+        self._generation = 0
+        self._session_waiters: deque[object] = deque()
         self._active_profile: str | None = None
         self._status_lock = threading.Lock()
         self._runtime: QwenWorkerRuntime | None = None
@@ -114,6 +123,34 @@ class RuntimeManager:
             error = self._error
             load_started_at = self._load_started_at
             ready_at = self._ready_at
+        # Model construction and worker shutdown hold ``_lock`` for a long
+        # time, so health checks snapshot the published runtime under the
+        # short-lived session condition instead.  Detach/commit use the same
+        # condition, preventing a close from turning a checked runtime into
+        # ``None`` halfway through this snapshot.
+        with self._session_condition:
+            active_profile = self._active_profile
+            runtime = self._runtime
+            if runtime is None:
+                runtime_status = {
+                    "attn_implementation": self.attn_implementation,
+                    "codec_weight_dtype": self.codec_weight_dtype,
+                    "n_vq": None,
+                    "sample_rate": None,
+                    "reference_cache_entries": 0,
+                    "reference_cache_hits": 0,
+                    "reference_cache_misses": 0,
+                }
+            else:
+                runtime_status = {
+                    "attn_implementation": runtime.attn_implementation,
+                    "codec_weight_dtype": runtime.codec_weight_dtype,
+                    "n_vq": int(runtime.n_vq),
+                    "sample_rate": int(runtime.sample_rate),
+                    "reference_cache_entries": len(runtime.reference_audio_cache),
+                    "reference_cache_hits": int(runtime.reference_audio_cache_hits),
+                    "reference_cache_misses": int(runtime.reference_audio_cache_misses),
+                }
         elapsed = None
         if load_started_at is not None:
             elapsed = max(0.0, (ready_at or time.time()) - load_started_at)
@@ -123,31 +160,23 @@ class RuntimeManager:
             "load_started_at": load_started_at,
             "ready_at": ready_at,
             "load_elapsed_seconds": elapsed,
-            "active_profile": self._active_profile,
-            "active_profile_label": MODEL_PROFILE_LABELS.get(self._active_profile or "", ""),
-            "model_dir": None if self._active_profile is None else self.profiles[self._active_profile]["model_dir"],
-            "codec_dir": None if self._active_profile is None else self.profiles[self._active_profile]["codec_dir"],
+            "active_profile": active_profile,
+            "active_profile_label": MODEL_PROFILE_LABELS.get(active_profile or "", ""),
+            "model_dir": None if active_profile is None else self.profiles[active_profile]["model_dir"],
+            "codec_dir": None if active_profile is None else self.profiles[active_profile]["codec_dir"],
             "device": self.device,
             "tts_device": self.tts_device,
             "codec_device": self.codec_device,
             "dtype": self.dtype,
             "requested_attn_implementation": self.attn_implementation,
-            "attn_implementation": (
-                self.attn_implementation
-                if self._runtime is None
-                else self._runtime.attn_implementation
-            ),
-            "codec_weight_dtype": (
-                self.codec_weight_dtype
-                if self._runtime is None
-                else self._runtime.codec_weight_dtype
-            ),
+            "attn_implementation": runtime_status["attn_implementation"],
+            "codec_weight_dtype": runtime_status["codec_weight_dtype"],
             "codec_compute_dtype": self.codec_compute_dtype,
-            "n_vq": None if self._runtime is None else int(self._runtime.n_vq),
-            "sample_rate": None if self._runtime is None else int(self._runtime.sample_rate),
-            "reference_cache_entries": 0 if self._runtime is None else len(self._runtime.reference_audio_cache),
-            "reference_cache_hits": 0 if self._runtime is None else int(self._runtime.reference_audio_cache_hits),
-            "reference_cache_misses": 0 if self._runtime is None else int(self._runtime.reference_audio_cache_misses),
+            "n_vq": runtime_status["n_vq"],
+            "sample_rate": runtime_status["sample_rate"],
+            "reference_cache_entries": runtime_status["reference_cache_entries"],
+            "reference_cache_hits": runtime_status["reference_cache_hits"],
+            "reference_cache_misses": runtime_status["reference_cache_misses"],
             "profiles": [
                 {
                     "id": profile_id,
@@ -160,7 +189,7 @@ class RuntimeManager:
                             or Path(self.qwentts_library).expanduser().is_file()
                         )
                     ),
-                    "loaded": profile_id == self._active_profile and self._runtime is not None,
+                    "loaded": profile_id == active_profile and runtime is not None,
                 }
                 for profile_id, profile in self.profiles.items()
             ],
@@ -184,22 +213,44 @@ class RuntimeManager:
         self._loader_thread.start()
 
     def _release_runtime(self) -> None:
-        runtime = self._runtime
+        with self._session_condition:
+            runtime = self._runtime
+            self._runtime = None
+            self._active_profile = None
+        self._close_runtime(runtime)
+
+    @staticmethod
+    def _close_runtime(runtime: Any | None) -> None:
         if runtime is not None and hasattr(runtime, "close"):
             try:
                 runtime.close()
             except Exception:
                 logging.exception("failed to close runtime")
-        self._runtime = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def close(self) -> None:
-        with self._lock:
-            self._release_runtime()
-            self._active_profile = None
-            self._set_status(state="not_loaded")
+        # Invalidate current sessions and pending loads before waiting for the
+        # loader lock.  A loader that finishes meanwhile will observe the new
+        # generation and discard its worker instead of publishing it.
+        with self._session_condition:
+            self._generation += 1
+            self._session_count = 0
+            self._switching = False
+            self._session_waiters.clear()
+            self._close_count += 1
+            self._closing = True
+            self._session_condition.notify_all()
+        try:
+            with self._lock:
+                self._release_runtime()
+                self._set_status(state="not_loaded")
+        finally:
+            with self._session_condition:
+                self._close_count = max(0, self._close_count - 1)
+                self._closing = self._close_count > 0
+                self._session_condition.notify_all()
 
     def interrupt_active(self) -> int:
         """Hard-stop active Metal worker processes without unloading the model controller."""
@@ -209,20 +260,27 @@ class RuntimeManager:
                 return 0
             return int(runtime.interrupt_all())
 
-    def _load(self, profile_id: str) -> QwenWorkerRuntime:
+    def _load(self, profile_id: str, generation: int | None = None) -> QwenWorkerRuntime:
         if profile_id not in self.profiles:
             raise ValueError(f"unknown model profile: {profile_id}")
         profile = self.profiles[profile_id]
+        if generation is None:
+            with self._session_condition:
+                generation = self._generation
         with self._lock:
+            with self._session_condition:
+                if generation != self._generation or self._closing:
+                    raise RuntimeSessionCancelled("runtime session was invalidated")
             if self._runtime is None or self._active_profile != profile_id:
                 self._set_status(state="loading")
+                candidate: QwenWorkerRuntime | None = None
                 try:
                     self._release_runtime()
                     if not Path(self.qwen_python).is_file():
                         raise RuntimeError(f"Qwen Python环境不存在：{self.qwen_python}")
                     if self.qwentts_library and not Path(self.qwentts_library).expanduser().is_file():
                         raise RuntimeError(f"qwentts.cpp Metal动态库不存在：{self.qwentts_library}")
-                    self._runtime = QwenWorkerRuntime(
+                    candidate = QwenWorkerRuntime(
                         profile_id=profile_id,
                         model_dir=profile["model_dir"],
                         backend=str(profile["runtime_backend"]),
@@ -234,49 +292,109 @@ class RuntimeManager:
                         base_port=int(profile["base_port"]),
                         log_dir=REPO_ROOT / "logs" / "qwen-workers",
                     )
-                    self._active_profile = profile_id
+                    with self._session_condition:
+                        stale = generation != self._generation or self._closing
+                        if not stale:
+                            self._runtime = candidate
+                            self._active_profile = profile_id
                 except Exception as exc:
-                    self._set_status(state="error", error=str(exc))
+                    with self._session_condition:
+                        stale = generation != self._generation or self._closing
+                    if not stale:
+                        self._set_status(state="error", error=str(exc))
                     raise
+                if stale:
+                    self._close_runtime(candidate)
+                    raise RuntimeSessionCancelled("runtime session was invalidated while loading")
                 self._set_status(state="ready")
             return self._runtime
 
     @contextmanager
-    def session(self, profile_id: str):
-        """Allow parallel requests for one model, but switch only when idle."""
+    def session(
+        self,
+        profile_id: str,
+        cancelled: Callable[[], bool] | None = None,
+    ):
+        """Allow same-model concurrency and fairly serialize model switches."""
         profile_id = profile_id if profile_id in self.profiles else DEFAULT_MODEL_PROFILE
+        waiter = object()
         needs_load = False
+        runtime: QwenWorkerRuntime | None = None
         with self._session_condition:
+            generation = self._generation
+            self._session_waiters.append(waiter)
             wait_deadline = time.monotonic() + self._session_wait_timeout
-            while self._switching or (self._session_count > 0 and self._active_profile != profile_id):
+            while True:
+                if generation != self._generation:
+                    if waiter in self._session_waiters:
+                        self._session_waiters.remove(waiter)
+                    self._session_condition.notify_all()
+                    raise RuntimeSessionCancelled("runtime session was invalidated")
+                try:
+                    cancel_requested = cancelled is not None and cancelled()
+                except Exception:
+                    if waiter in self._session_waiters:
+                        self._session_waiters.remove(waiter)
+                    self._session_condition.notify_all()
+                    raise
+                if cancel_requested:
+                    if waiter in self._session_waiters:
+                        self._session_waiters.remove(waiter)
+                    self._session_condition.notify_all()
+                    raise RuntimeSessionCancelled("runtime session was cancelled")
+
+                is_first = bool(self._session_waiters) and self._session_waiters[0] is waiter
+                same_runtime = self._active_profile == profile_id and self._runtime is not None
+                can_enter = (
+                    is_first
+                    and not self._closing
+                    and not self._switching
+                    and (self._session_count == 0 or same_runtime)
+                )
+                if can_enter:
+                    self._session_waiters.popleft()
+                    if same_runtime:
+                        self._session_count += 1
+                        runtime = self._runtime
+                    else:
+                        self._switching = True
+                        needs_load = True
+                    self._session_condition.notify_all()
+                    break
+
                 remaining = wait_deadline - time.monotonic()
                 if remaining <= 0:
+                    if waiter in self._session_waiters:
+                        self._session_waiters.remove(waiter)
+                    self._session_condition.notify_all()
                     raise TimeoutError(
                         f"等待切换到 {profile_id} 超过 {self._session_wait_timeout:.0f} 秒"
                     )
-                self._session_condition.wait(timeout=min(1.0, remaining))
-            if self._active_profile != profile_id or self._runtime is None:
-                self._switching = True
-                needs_load = True
-            else:
-                self._session_count += 1
+                poll_interval = 0.1 if cancelled is not None else 1.0
+                self._session_condition.wait(timeout=min(poll_interval, remaining))
         if needs_load:
             try:
-                runtime = self._load(profile_id)
+                runtime = self._load(profile_id, generation)
             except Exception:
                 with self._session_condition:
-                    self._switching = False
+                    if generation == self._generation:
+                        self._switching = False
                     self._session_condition.notify_all()
                 raise
             with self._session_condition:
+                if generation != self._generation or self._closing:
+                    self._session_condition.notify_all()
+                    raise RuntimeSessionCancelled("runtime session was invalidated while loading")
                 self._switching = False
-                self._session_count = 1
+                if cancelled is not None and cancelled():
+                    self._session_condition.notify_all()
+                    raise RuntimeSessionCancelled("runtime session was cancelled")
+                self._session_count += 1
                 self._session_condition.notify_all()
-        else:
-            runtime = self._runtime
         try:
             yield runtime
         finally:
             with self._session_condition:
-                self._session_count = max(0, self._session_count - 1)
+                if generation == self._generation:
+                    self._session_count = max(0, self._session_count - 1)
                 self._session_condition.notify_all()

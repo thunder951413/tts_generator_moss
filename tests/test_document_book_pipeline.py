@@ -224,3 +224,154 @@ def test_book_pipeline_stop_finishes_active_blocks_then_pauses(tmp_path: Path) -
     assert result["message"] == "已暂停，可随时继续"
     assert sum(segment["status"] == "completed" for segment in result["segments"]) == 2
     assert any(segment["status"] == "pending" for segment in result["segments"])
+
+
+def test_book_merge_failure_is_retryable_and_retains_completed_aac(tmp_path: Path) -> None:
+    manager = DocumentProjectManager(
+        root_dir=tmp_path / "projects",
+        runtime_session=lambda _profile: nullcontext(object()),
+        synthesize_fn=lambda *_args, **_kwargs: iter(()),
+        request_cls=StreamingRequest,
+        generation_lock=nullcontext(),
+        ffmpeg_path="ffmpeg",
+        synthesis_workers=1,
+    )
+    project = manager.create_project(
+        name="合并失败",
+        filename="book.txt",
+        data="这是一段用于验证合并重试的正文。".encode(),
+        settings={"model_profile": "qwen_0_6b", "seed": 1234, "seed_mode": "fixed"},
+        max_chars=40,
+    )
+    with manager._lock:
+        manifest = manager._load(project["id"])
+        manifest["segments"][0].update(
+            status="completed", audio_file="segments/000000.m4a", duration_seconds=1.0
+        )
+        manager._save(manifest)
+
+    attempts = 0
+
+    def merge(manifest):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("forced concat failure")
+        manifest["final_audio"] = "final/complete.m4a"
+
+    manager._merge_final_audio = merge  # type: ignore[method-assign]
+    manager.start(project["id"])
+    manager._threads[project["id"]].join(timeout=3)
+    failed = manager.get_project(project["id"])
+    assert failed["state"] == "error"
+    assert "可继续重试" in failed["message"]
+    assert failed["final_audio"] is None
+    assert failed["segments"][0]["status"] == "completed"
+
+    manager.start(project["id"])
+    manager._threads[project["id"]].join(timeout=3)
+    retried = manager.get_project(project["id"])
+    assert attempts == 2
+    assert retried["state"] == "completed"
+    assert retried["final_audio"] == "final/complete.m4a"
+
+
+def test_stop_during_book_merge_preserves_pause_state(tmp_path: Path) -> None:
+    manager = DocumentProjectManager(
+        root_dir=tmp_path / "projects",
+        runtime_session=lambda _profile: nullcontext(object()),
+        synthesize_fn=lambda *_args, **_kwargs: iter(()),
+        request_cls=StreamingRequest,
+        generation_lock=nullcontext(),
+        ffmpeg_path="ffmpeg",
+        synthesis_workers=1,
+    )
+    project = manager.create_project(
+        name="合并时停止",
+        filename="book.txt",
+        data="这是一段用于验证合并期间停止的正文。".encode(),
+        settings={"model_profile": "qwen_0_6b", "seed": 1234, "seed_mode": "fixed"},
+        max_chars=40,
+    )
+    with manager._lock:
+        manifest = manager._load(project["id"])
+        manifest["segments"][0].update(
+            status="completed", audio_file="segments/000000.m4a", duration_seconds=1.0
+        )
+        manager._save(manifest)
+
+    merge_started = threading.Event()
+    release_merge = threading.Event()
+
+    def merge(manifest):
+        merge_started.set()
+        assert release_merge.wait(timeout=2)
+        manifest["final_audio"] = "final/complete.m4a"
+
+    manager._merge_final_audio = merge  # type: ignore[method-assign]
+    manager.start(project["id"])
+    assert merge_started.wait(timeout=2)
+    stopping = manager.stop(project["id"])
+    assert stopping["state"] == "stopping"
+    release_merge.set()
+    manager._threads[project["id"]].join(timeout=3)
+
+    paused = manager.get_project(project["id"])
+    assert paused["state"] == "paused"
+    assert paused["final_audio"] == "final/complete.m4a"
+    assert "已暂停" in paused["message"]
+
+
+def test_scheduler_queue_cancellation_pauses_project_for_retry(tmp_path: Path) -> None:
+    def cancelled_synthesis(*_args, **_kwargs):
+        raise RuntimeError("generation cancelled while queued")
+        yield  # pragma: no cover - marks this as a generator for the manager
+
+    manager = DocumentProjectManager(
+        root_dir=tmp_path / "projects",
+        runtime_session=lambda _profile: nullcontext(object()),
+        synthesize_fn=cancelled_synthesis,
+        request_cls=StreamingRequest,
+        generation_lock=nullcontext(),
+        ffmpeg_path="ffmpeg",
+        synthesis_workers=1,
+    )
+    project = manager.create_project(
+        name="队列取消",
+        filename="book.txt",
+        data="这是一段等待调度取消的正文。".encode(),
+        settings={"model_profile": "qwen_0_6b", "seed": 1234, "seed_mode": "fixed"},
+        max_chars=40,
+    )
+    manager.start(project["id"])
+    manager._threads[project["id"]].join(timeout=3)
+
+    paused = manager.get_project(project["id"])
+    assert paused["state"] == "paused"
+    assert paused["segments"][0]["status"] == "pending"
+
+
+def test_reference_usage_includes_persisted_book_settings(tmp_path: Path) -> None:
+    manager = DocumentProjectManager(
+        root_dir=tmp_path / "projects",
+        runtime_session=lambda _profile: nullcontext(object()),
+        synthesize_fn=lambda *_args, **_kwargs: iter(()),
+        request_cls=StreamingRequest,
+        generation_lock=nullcontext(),
+        ffmpeg_path="ffmpeg",
+    )
+    reference = tmp_path / "voice.wav"
+    project = manager.create_project(
+        name="使用音色的书",
+        filename="book.txt",
+        data="参考音色使用检查。".encode(),
+        settings={
+            "model_profile": "qwen_0_6b",
+            "reference_audio_path": str(reference),
+            "seed": 1234,
+            "seed_mode": "fixed",
+        },
+        max_chars=40,
+    )
+    assert project["id"]
+    assert manager.reference_usage(reference) == ["书籍《使用音色的书》"]

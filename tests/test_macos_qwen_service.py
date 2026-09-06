@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -190,11 +192,21 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert "SCStreamOutput" in native_source
         assert "struct SystemAudioTrimView" in native_source
         assert "prepareReferenceAudioForTrimming" in native_source
+        assert 'panel.allowedContentTypes = [.audio, .movie, .video]' in native_source
+        assert 'title: isVideo ? "裁剪视频音轨" : "裁剪导入音频"' in native_source
+        assert 'asset.tracks(withMediaType: .audio).isEmpty' in native_source
+        assert '"导入音频/视频"' in native_source
         assert "func trimReference(_ reference: NativeReferenceAudio)" in native_source
         assert 'Label("裁剪", systemImage: "scissors")' in native_source
+        assert "func renameReference(_ reference: NativeReferenceAudio, name proposedName: String)" in native_source
+        assert 'Label("改名", systemImage: "pencil")' in native_source
+        assert '"api/reference-audio-library/\\(reference.id)"' in native_source
         assert 'Text(model.audioTrimTitle)' in native_source
         assert '"裁剪并加入参考音频"' in native_source
         assert "if trimSourceIsTemporary, let systemAudioRecordingURL" in native_source
+        assert "uploadReferenceMultipart" in native_source
+        assert "本地服务未连接，正在启动后重试" in native_source
+        assert "performResult(" in app_source
         assert "struct ReferenceAudioLibraryView" in native_source
         assert 'Text("可用音频 · \\(visibleReferences.count)")' in native_source
         assert 'Text("已隐藏 · \\(hiddenReferences.count)")' in native_source
@@ -399,6 +411,110 @@ def test_voice_presets_are_persistent_and_can_import_reference_audio(tmp_path: P
         assert client.get("/api/presets").json()["presets"] == []
 
 
+def test_reference_import_extracts_audio_track_from_video(tmp_path: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg is unavailable")
+    video = tmp_path / "sample-video.mp4"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=0.4",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-shortest",
+            "-c:v",
+            "mpeg4",
+            "-c:a",
+            "aac",
+            str(video),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+    module = load_app_module()
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=tmp_path / "upload",
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        access_password="",
+    )
+    with TestClient(app) as client:
+        imported = client.post(
+            "/api/presets/reference-audio",
+            files={"audio": (video.name, video.read_bytes(), "video/mp4")},
+        )
+        assert imported.status_code == 200, imported.text
+        reference_path = Path(imported.json()["reference_audio_path"])
+        assert reference_path.suffix == ".wav"
+        assert imported.json()["reference"]["name"] == "sample-video"
+        with wave.open(str(reference_path), "rb") as extracted:
+            assert extracted.getnchannels() == 1
+            assert extracted.getframerate() == 24000
+            assert extracted.getnframes() > 0
+
+
+def test_reference_import_rejects_video_without_audio_track(tmp_path: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg is unavailable")
+    video = tmp_path / "silent-video.mp4"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=0.2",
+            "-an",
+            "-c:v",
+            "mpeg4",
+            str(video),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+    module = load_app_module()
+    upload_dir = tmp_path / "upload"
+    app = module.create_app(
+        qwen_python=sys.executable,
+        qwentts_library="",
+        output_dir=tmp_path / "output",
+        upload_dir=upload_dir,
+        preset_dir=tmp_path / "presets",
+        preload=False,
+        access_password="",
+    )
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/presets/reference-audio",
+            files={"audio": (video.name, video.read_bytes(), "video/mp4")},
+        )
+    assert rejected.status_code == 400
+    assert "无法从音频或视频读取声音" in rejected.json()["detail"]
+    assert not list(upload_dir.glob("preset-*"))
+
+
 def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Path) -> None:
     module = load_app_module()
     app = module.create_app(
@@ -429,6 +545,22 @@ def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Pa
         assert custom["name"] == "narrator"
         assert any(item["audio_path"] == reference_path for item in client.get("/api/voices").json()["voices"])
 
+        renamed = client.put(
+            f"/api/reference-audio-library/{custom['id']}",
+            json={"name": "温柔旁白"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["reference"]["name"] == "温柔旁白"
+        custom = next(
+            item
+            for item in client.get(
+                "/api/reference-audio-library",
+                params={"include_hidden": True},
+            ).json()["references"]
+            if item["path"] == reference_path
+        )
+        assert custom["name"] == "温柔旁白"
+
         hidden = client.put(
             f"/api/reference-audio-library/{custom['id']}/visibility",
             json={"hidden": True},
@@ -447,7 +579,7 @@ def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Pa
                 "name": "引用预设",
                 "settings": {
                     "model_profile": "qwen_0_6b",
-                    "voice_name": "narrator",
+                    "voice_name": "温柔旁白",
                     "reference_audio_path": reference_path,
                 },
             },
@@ -464,6 +596,13 @@ def test_reference_audio_library_can_hide_restore_and_safely_delete(tmp_path: Pa
             },
         )
         assert applied.status_code == 200
+        renamed_again = client.put(
+            f"/api/reference-audio-library/{custom['id']}",
+            json={"name": "深夜旁白"},
+        )
+        assert renamed_again.status_code == 200
+        assert client.get("/api/service-settings").json()["settings"]["voice_name"] == "深夜旁白"
+        assert client.get("/api/presets").json()["presets"][0]["settings"]["voice_name"] == "深夜旁白"
         blocked = client.delete(f"/api/reference-audio-library/{custom['id']}")
         assert blocked.status_code == 409
         assert Path(reference_path).is_file()
@@ -676,7 +815,8 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
             Path(command[-1]).write_bytes(b"fake-aac")
             return types.SimpleNamespace(returncode=0, stderr="")
 
-        monkeypatch.setattr(module.subprocess, "run", fake_ffmpeg)
+        import webapp.routers.generation as generation_routes
+        monkeypatch.setattr(generation_routes, "run_media_process", fake_ffmpeg)
         nonstream = client.post(
             "/api/generate-stream/start",
             data={
@@ -750,10 +890,11 @@ def test_global_stop_rejects_api_keys_and_accepts_internal_session(tmp_path: Pat
             follow_redirects=False,
         )
         assert login.status_code == 303
+        epoch_before_stop = client.get("/api/playback/status").json()["playback_epoch"]
         stopped = client.post("/api/service/stop-all")
         assert stopped.status_code == 200
         assert stopped.json()["ok"] is True
-        assert stopped.json()["playback_epoch"] == 1
+        assert stopped.json()["playback_epoch"] == epoch_before_stop + 1
 
         tts_stopped = client.post("/api/tts/stop")
         assert tts_stopped.status_code == 200

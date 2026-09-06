@@ -62,7 +62,12 @@ def register_settings_performance_routes(app, ctx):
     async def get_service_settings() -> JSONResponse:
         return JSONResponse(active_service_settings())
 
-    def run_performance_benchmark(profile_id: str) -> dict[str, Any]:
+    def run_performance_benchmark(profile_id: str, epoch: int) -> dict[str, Any]:
+        def check_cancelled() -> None:
+            if ctx.stopping or not ctx.tts_enabled or epoch != ctx.tts_epoch:
+                raise RuntimeError("性能测试已被停止操作取消")
+
+        check_cancelled()
         if profile_id not in runtime_manager.profiles:
             raise ValueError("无效的模型")
         service_settings = dict(active_service_settings().get("settings") or {})
@@ -83,6 +88,7 @@ def register_settings_performance_routes(app, ctx):
         benchmark_text = "这是一段性能测试语音，用于选择最适合这台 Mac 的生成策略。"
 
         def run_case(*, chunk_frames: int, non_streaming: bool, seed: int) -> dict[str, Any]:
+            check_cancelled()
             request = StreamingRequest(
                 text=benchmark_text,
                 mode="voice_clone",
@@ -131,6 +137,7 @@ def register_settings_performance_routes(app, ctx):
                     request,
                     output_dir=benchmark_dir,
                 ):
+                    check_cancelled()
                     if event.type == "audio" and first_audio_seconds is None:
                         first_audio_seconds = time.perf_counter() - started
                     elif event.type == "result":
@@ -153,7 +160,8 @@ def register_settings_performance_routes(app, ctx):
             _remove_generated_result_files(result)
             return measurement
 
-        with generation_scheduler.exclusive_slot():
+        with generation_scheduler.exclusive_slot(cancelled=lambda: epoch != ctx.tts_epoch):
+            check_cancelled()
             with runtime_manager.session(profile_id) as runtime:
                 runtime.resize_lanes(1)
             # Warm the selected reference and model before timed cases.
@@ -190,6 +198,7 @@ def register_settings_performance_routes(app, ctx):
                 parallel_measurements = []
                 parallel_error = str(exc)
 
+            check_cancelled()
             recommendation = choose_recommendation(
                 stream_measurements=stream_measurements,
                 single_block_seconds=float(single_block["elapsed_seconds"]),
@@ -224,6 +233,7 @@ def register_settings_performance_routes(app, ctx):
             },
             "applied": True,
         }
+        check_cancelled()
         return performance_tuning.save_profile(profile_id, result)
 
     @app.get("/api/performance")
@@ -243,13 +253,15 @@ def register_settings_performance_routes(app, ctx):
     async def performance_benchmark(
         payload: dict[str, Any] = Body(default={}),
     ) -> JSONResponse:
+        if not ctx.tts_enabled or ctx.stopping:
+            raise HTTPException(status_code=503, detail="TTS 已停止，请先启动服务")
         profile_id = str(
             payload.get("model_profile")
             or active_service_settings().get("settings", {}).get("model_profile")
             or DEFAULT_MODEL_PROFILE
         )
         try:
-            result = await asyncio.to_thread(run_performance_benchmark, profile_id)
+            result = await asyncio.to_thread(run_performance_benchmark, profile_id, ctx.tts_epoch)
             return JSONResponse(result)
         except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

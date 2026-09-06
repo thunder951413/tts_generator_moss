@@ -6,7 +6,6 @@ import os
 import re
 import secrets
 import shutil
-import subprocess
 import threading
 import time
 import uuid
@@ -16,6 +15,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree
+from media_process import run_media_process
 
 
 PROJECT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -173,6 +173,7 @@ class DocumentProjectManager:
         self.ffmpeg_path = ffmpeg_path
         self.synthesis_workers = max(1, int(synthesis_workers))
         self._lock = threading.RLock()
+        self._force_stop_epoch = 0
         self._threads: dict[str, threading.Thread] = {}
         self._stop_events: dict[str, threading.Event] = {}
         self._repair_interrupted_projects()
@@ -280,6 +281,28 @@ class DocumentProjectManager:
                     continue
         projects.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
         return projects
+
+    def reference_usage(self, path: str | Path) -> list[str]:
+        """Return persisted book projects that still depend on a reference file."""
+        return self.reference_usage_index().get(str(Path(path).resolve()), [])
+
+    def reference_usage_index(self) -> dict[str, list[str]]:
+        usages: dict[str, list[str]] = {}
+        with self._lock:
+            for manifest_path in self.root_dir.glob("*/manifest.json"):
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    settings = manifest.get("settings")
+                    reference_path = (
+                        str(Path(str(settings.get("reference_audio_path") or "")).resolve())
+                        if isinstance(settings, dict)
+                        else ""
+                    )
+                    if reference_path:
+                        usages.setdefault(reference_path, []).append(f"书籍《{manifest.get('name') or '未命名项目'}》")
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+        return {path: list(dict.fromkeys(labels)) for path, labels in usages.items()}
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         with self._lock:
@@ -564,6 +587,7 @@ class DocumentProjectManager:
     def stop_all(self) -> list[str]:
         """Request an immediate pause for every active document project."""
         with self._lock:
+            self._force_stop_epoch += 1
             active_ids = list(self._stop_events)
             for project_id in active_ids:
                 self._stop_events[project_id].set()
@@ -689,7 +713,12 @@ class DocumentProjectManager:
                         try:
                             synthesis = future.result()
                         except Exception as exc:
-                            if not stop_event.is_set():
+                            if "generation cancelled while queued" in str(exc):
+                                # Scheduler cancellation is issued for a service-wide
+                                # stop. Preserve finished AAC blocks and let this
+                                # project resume instead of presenting a false error.
+                                stop_event.set()
+                            elif not stop_event.is_set():
                                 fatal_error = fatal_error or (index, exc)
                             continue
                         if fatal_error is not None:
@@ -779,26 +808,73 @@ class DocumentProjectManager:
                         )
                         if has_pending:
                             continue
-                        self._stop_run_clock(manifest)
                         all_completed = all(
                             segment["status"] == "completed"
                             for segment in manifest["segments"]
                         )
-                        if all_completed:
-                            self._merge_final_audio(manifest)
-                            manifest["state"] = "completed"
-                            manifest["message"] = "全部段落已完成，整书 M4A 已就绪"
-                        else:
+                        if not all_completed:
+                            self._stop_run_clock(manifest)
                             manifest["state"] = "paused"
                             manifest["message"] = "所选内容已生成高质量 AAC"
-                        manifest["generation_scope"] = None
-                        self._refresh_active_segments(manifest)
-                        self._save(manifest)
+                            manifest["generation_scope"] = None
+                            self._refresh_active_segments(manifest)
+                            self._save(manifest)
+                            return
+                    self._finalize_completed_project(project_id, stop_event)
                     return
         finally:
             with self._lock:
                 self._threads.pop(project_id, None)
                 self._stop_events.pop(project_id, None)
+
+    def _finalize_completed_project(self, project_id: str, stop_event: threading.Event) -> None:
+        """Merge completed AAC blocks without blocking stop/edit/delete state checks."""
+        with self._lock:
+            manifest = self._load(project_id)
+            if stop_event.is_set() or manifest.get("state") == "stopping":
+                self._stop_run_clock(manifest)
+                manifest["state"] = "paused"
+                manifest["message"] = "已暂停，可随时继续"
+                manifest["generation_scope"] = None
+                self._refresh_active_segments(manifest)
+                self._save(manifest)
+                return
+            manifest["message"] = "全部段落已完成，正在合并整书 M4A"
+            self._refresh_active_segments(manifest)
+            self._save(manifest)
+
+            # Capture while holding the stop lock; this transient key is never saved.
+            manifest["_merge_force_stop_epoch"] = self._force_stop_epoch
+        try:
+            self._merge_final_audio(manifest)
+        except Exception as exc:
+            with self._lock:
+                latest = self._load(project_id)
+                self._stop_run_clock(latest)
+                latest["generation_scope"] = None
+                if stop_event.is_set() or latest.get("state") == "stopping":
+                    latest["state"] = "paused"
+                    latest["message"] = "已暂停；整书 M4A 尚未合并，可继续重试"
+                else:
+                    latest["state"] = "error"
+                    latest["message"] = f"整书 AAC 合并失败，可继续重试：{exc}"
+                self._refresh_active_segments(latest)
+                self._save(latest)
+            return
+
+        with self._lock:
+            latest = self._load(project_id)
+            latest["final_audio"] = manifest.get("final_audio")
+            self._stop_run_clock(latest)
+            latest["generation_scope"] = None
+            if stop_event.is_set() or latest.get("state") == "stopping":
+                latest["state"] = "paused"
+                latest["message"] = "已暂停；整书 M4A 已合并，可继续播放"
+            else:
+                latest["state"] = "completed"
+                latest["message"] = "全部段落已完成，整书 M4A 已就绪"
+            self._refresh_active_segments(latest)
+            self._save(latest)
 
     def _refresh_active_segments(self, manifest: dict[str, Any]) -> None:
         active = sorted(
@@ -898,6 +974,15 @@ class DocumentProjectManager:
     def _synthesize_segment(
         self, project_id: str, segment: dict[str, Any], settings: dict[str, Any]
     ) -> dict[str, Any]:
+        with self._lock:
+            stop_event = self._stop_events.get(project_id)
+            force_stop_epoch = self._force_stop_epoch
+
+        def check_cancelled() -> None:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("generation cancelled while queued")
+
+        check_cancelled()
         project_dir = self._project_dir(project_id)
         working_dir = project_dir / "working"
         working_dir.mkdir(parents=True, exist_ok=True)
@@ -932,10 +1017,16 @@ class DocumentProjectManager:
             qwen_min_new_tokens=max(2, int(settings.get("qwen_min_new_tokens", 2))),
         )
         result_event: dict[str, Any] | None = None
-        with self.generation_lock:
+        slot = (
+            self.generation_lock.document_slot(cancelled=lambda: stop_event is not None and stop_event.is_set())
+            if hasattr(self.generation_lock, "document_slot") else self.generation_lock
+        )
+        with slot:
+            check_cancelled()
             started_at = time.perf_counter()
             model_profile = str(settings.get("model_profile") or "qwen_0_6b")
             with self.runtime_session(model_profile) as runtime:
+                check_cancelled()
                 for event in self.synthesize_fn(runtime, request, output_dir=working_dir):
                     if event.type == "result":
                         result_event = event.data
@@ -951,6 +1042,7 @@ class DocumentProjectManager:
             "seed": int(settings.get("seed", 1234)),
             "seed_mode": str(settings.get("seed_mode") or "fixed"),
             "aac_bitrate": str(settings.get("aac_bitrate") or "80k"),
+            "force_stop_epoch": force_stop_epoch,
         }
 
     def _encode_segment_aac(
@@ -983,10 +1075,17 @@ class DocumentProjectManager:
             "1",
             str(temporary_path),
         ]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
-        if completed.returncode != 0 or not temporary_path.exists():
-            raise RuntimeError(completed.stderr.strip() or "AAC 转码失败")
-        os.replace(temporary_path, output_path)
+        force_stop_epoch = synthesis.get("force_stop_epoch", self._force_stop_epoch)
+        try:
+            completed = run_media_process(command, timeout=300, cancelled=lambda: force_stop_epoch != self._force_stop_epoch)
+            if completed.returncode != 0 or not temporary_path.exists():
+                raise RuntimeError(completed.stderr.strip() or "AAC 转码失败")
+            with self._lock:
+                if force_stop_epoch != self._force_stop_epoch:
+                    raise RuntimeError("AAC 转码已停止")
+                os.replace(temporary_path, output_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
         run_dir = source_wav.parent
         working_dir = project_dir / "working"
         if run_dir.exists() and working_dir in run_dir.parents:
@@ -1000,6 +1099,7 @@ class DocumentProjectManager:
         }
 
     def _merge_final_audio(self, manifest: dict[str, Any]) -> None:
+        force_stop_epoch = manifest.pop("_merge_force_stop_epoch", self._force_stop_epoch)
         project_dir = self._project_dir(manifest["id"])
         final_dir = project_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
@@ -1028,10 +1128,16 @@ class DocumentProjectManager:
             "copy",
             str(temporary),
         ]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
-        if completed.returncode != 0 or not temporary.exists():
-            raise RuntimeError(completed.stderr.strip() or "最终 AAC 合并失败")
-        os.replace(temporary, final_path)
+        try:
+            completed = run_media_process(command, timeout=300, cancelled=lambda: force_stop_epoch != self._force_stop_epoch)
+            if completed.returncode != 0 or not temporary.exists():
+                raise RuntimeError(completed.stderr.strip() or "最终 AAC 合并失败")
+            with self._lock:
+                if force_stop_epoch != self._force_stop_epoch:
+                    raise RuntimeError("AAC 合并已停止")
+                os.replace(temporary, final_path)
+        finally:
+            temporary.unlink(missing_ok=True)
         manifest["final_audio"] = "final/complete.m4a"
 
     def media_path(self, project_id: str, relative_path: str) -> Path:

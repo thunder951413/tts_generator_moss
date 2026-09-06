@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class STTUnavailableError(RuntimeError):
@@ -39,7 +39,18 @@ class WhisperCppRuntime:
         self.log_path = Path(log_path) if log_path else None
         self._process: subprocess.Popen[bytes] | None = None
         self._log_handle: Any = None
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
+        # A transcription owns the resident whisper.cpp HTTP server for the
+        # duration of its request.  whisper-server is single-request oriented
+        # in this deployment, so serializing here also keeps each response
+        # paired with the upload that produced it.
+        self._transcribe_lock = threading.Lock()
+        self._starting = False
+        self._retiring = False
+        self._closing = False
+        self._close_owner = False
+        self._close_count = 0
+        self._lifecycle_epoch = 0
         self._started_at: float | None = None
         self._ready_at: float | None = None
         self._error: str | None = None
@@ -89,80 +100,213 @@ class WhisperCppRuntime:
         except (OSError, urllib.error.URLError):
             return False
 
-    def start(self, *, timeout: float = 30.0) -> None:
-        with self._lock:
-            if self._process is not None and self._process.poll() is None and self._is_ready():
-                return
-            available, error = self.available()
-            if not available:
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    @staticmethod
+    def _close_log_handle(handle: Any) -> None:
+        if handle is not None:
+            handle.close()
+
+    def _fail_start(
+        self,
+        process: subprocess.Popen[bytes],
+        epoch: int,
+        error: str,
+    ) -> None:
+        """Retire and clear only the startup attempt that reported the failure."""
+        log_handle = None
+        with self._condition:
+            if self._lifecycle_epoch == epoch and self._process is process:
+                self._starting = False
+                self._retiring = True
                 self._error = error
-                raise STTUnavailableError(error or "STT runtime is unavailable")
-            binary = self._resolve_binary()
-            if self.log_path:
-                self.log_path.parent.mkdir(parents=True, exist_ok=True)
-                self._log_handle = self.log_path.open("ab")
-            command = [
-                binary,
-                "-m",
-                str(self.model.resolve()),
-                "--host",
-                self.host,
-                "--port",
-                str(self.port),
-                "--convert",
-                "--language",
-                "auto",
-                "--threads",
-                str(self.threads),
-                "--flash-attn",
-            ]
-            self._started_at = time.time()
-            self._ready_at = None
-            self._error = None
-            self._process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=self._log_handle or subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                cwd=str(self.model.resolve().parent),
-                env=self._subprocess_environment(),
-            )
+                log_handle = self._log_handle
+            else:
+                return
+        retired = False
+        try:
+            self._terminate_process(process)
+            retired = True
+        finally:
+            try:
+                self._close_log_handle(log_handle)
+            finally:
+                with self._condition:
+                    if (
+                        retired
+                        and self._lifecycle_epoch == epoch
+                        and self._process is process
+                    ):
+                        self._process = None
+                        self._log_handle = None
+                    self._retiring = False
+                    self._condition.notify_all()
+
+    def start(self, *, timeout: float = 30.0) -> None:
+        """Start one worker, sharing a single startup attempt among callers."""
+        process: subprocess.Popen[bytes]
+        epoch: int
+        with self._condition:
+            request_epoch = self._lifecycle_epoch
+        while True:
+            stale_process = None
+            stale_log_handle = None
+            with self._condition:
+                if self._lifecycle_epoch != request_epoch:
+                    raise STTUnavailableError("STT runtime was stopped during startup")
+                while self._closing and self._lifecycle_epoch == request_epoch:
+                    self._condition.wait()
+                if self._lifecycle_epoch != request_epoch:
+                    raise STTUnavailableError("STT runtime was stopped during startup")
+                current = self._process
+                if current is not None and current.poll() is None and self._is_ready():
+                    return
+                if self._starting or self._retiring:
+                    waited_for_start = self._starting
+                    waiting_epoch = self._lifecycle_epoch
+                    while (
+                        (self._starting or self._retiring)
+                        and self._lifecycle_epoch == waiting_epoch
+                    ):
+                        self._condition.wait()
+                    if self._lifecycle_epoch != waiting_epoch:
+                        raise STTUnavailableError("STT runtime was stopped during startup")
+                    current = self._process
+                    if current is not None and current.poll() is None and self._is_ready():
+                        return
+                    if waited_for_start:
+                        raise STTUnavailableError(self._error or "STT runtime failed to start")
+                    continue
+                if current is not None:
+                    # A previous, completed startup left an unhealthy server.
+                    # Retire it before binding a replacement to the same port.
+                    self._retiring = True
+                    stale_process = current
+                    stale_log_handle = self._log_handle
+                else:
+                    available, error = self.available()
+                    if not available:
+                        self._error = error
+                        raise STTUnavailableError(error or "STT runtime is unavailable")
+                    binary = self._resolve_binary()
+                    log_handle = None
+                    try:
+                        if self.log_path:
+                            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                            log_handle = self.log_path.open("ab")
+                        self._starting = True
+                        epoch = self._lifecycle_epoch
+                        self._started_at = time.time()
+                        self._ready_at = None
+                        self._error = None
+                        process = subprocess.Popen(
+                            [
+                                binary, "-m", str(self.model.resolve()), "--host", self.host,
+                                "--port", str(self.port), "--convert", "--language", "auto",
+                                "--threads", str(self.threads), "--flash-attn",
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=log_handle or subprocess.DEVNULL,
+                            stderr=subprocess.STDOUT,
+                            cwd=str(self.model.resolve().parent),
+                            env=self._subprocess_environment(),
+                        )
+                    except Exception:
+                        self._starting = False
+                        self._error = "failed to launch whisper-server"
+                        self._condition.notify_all()
+                        self._close_log_handle(log_handle)
+                        raise
+                    self._process = process
+                    self._log_handle = log_handle
+                    break
+            if stale_process is not None:
+                retired = False
+                try:
+                    self._terminate_process(stale_process)
+                    retired = True
+                finally:
+                    try:
+                        self._close_log_handle(stale_log_handle)
+                    finally:
+                        with self._condition:
+                            if retired and self._process is stale_process:
+                                self._process = None
+                                self._log_handle = None
+                            self._retiring = False
+                            self._condition.notify_all()
 
         deadline = time.monotonic() + max(1.0, float(timeout))
         while time.monotonic() < deadline:
-            process = self._process
-            if process is None:
-                break
+            with self._condition:
+                if self._lifecycle_epoch != epoch or self._process is not process:
+                    raise STTUnavailableError("STT runtime was stopped during startup")
             code = process.poll()
             if code is not None:
-                self._error = f"whisper-server exited during startup with code {code}"
-                raise STTUnavailableError(self._error)
+                error = f"whisper-server exited during startup with code {code}"
+                self._fail_start(process, epoch, error)
+                raise STTUnavailableError(error)
             if self._is_ready():
-                self._ready_at = time.time()
+                with self._condition:
+                    if self._lifecycle_epoch != epoch or self._process is not process:
+                        raise STTUnavailableError("STT runtime was stopped during startup")
+                    self._ready_at = time.time()
+                    self._starting = False
+                    self._condition.notify_all()
                 return
             time.sleep(0.1)
-        self._error = f"whisper-server did not become ready within {timeout:.0f}s"
-        self.close()
-        raise STTUnavailableError(self._error)
+        error = f"whisper-server did not become ready within {timeout:.0f}s"
+        self._fail_start(process, epoch, error)
+        raise STTUnavailableError(error)
 
     def close(self) -> None:
-        with self._lock:
+        with self._condition:
+            self._lifecycle_epoch += 1
+            self._close_count += 1
+            self._closing = True
+            self._condition.notify_all()
+            while self._close_owner:
+                self._condition.wait()
+            self._close_owner = True
+            while self._retiring:
+                self._condition.wait()
             process = self._process
-            self._process = None
-        if process is not None and process.poll() is None:
-            process.terminate()
+            log_handle = self._log_handle
+            self._starting = False
+            self._retiring = process is not None
+            self._ready_at = None
+        retired = process is None
+        try:
+            if process is not None:
+                self._terminate_process(process)
+                retired = True
+        finally:
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
-        if self._log_handle is not None:
-            self._log_handle.close()
-            self._log_handle = None
+                self._close_log_handle(log_handle)
+            finally:
+                with self._condition:
+                    if retired and self._process is process:
+                        self._process = None
+                        self._log_handle = None
+                    self._retiring = False
+                    self._close_owner = False
+                    self._close_count = max(0, self._close_count - 1)
+                    self._closing = self._close_count > 0
+                    self._condition.notify_all()
 
     def status(self) -> dict[str, Any]:
         available, availability_error = self.available()
-        process = self._process
+        with self._condition:
+            process = self._process
         running = process is not None and process.poll() is None
         ready = bool(running and self._is_ready())
         return {
@@ -232,42 +376,65 @@ class WhisperCppRuntime:
         prompt: str = "",
         response_format: str = "json",
         timeout: float = 600.0,
+        cancelled: Callable[[], bool] | None = None,
     ) -> tuple[bytes, str]:
         if not audio:
             raise ValueError("audio file is empty")
-        self.start()
-        whisper_format = "verbose_json" if response_format == "verbose_json" else response_format
-        body, boundary = self._multipart(
-            audio=audio,
-            filename=filename,
-            language=language,
-            prompt=prompt,
-            response_format=whisper_format,
-        )
-        request = urllib.request.Request(
-            f"{self.base_url}/inference",
-            data=body,
-            method="POST",
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
+        if cancelled and cancelled():
+            raise STTUnavailableError("STT transcription was cancelled")
+        with self._condition:
+            requested_epoch = self._lifecycle_epoch
+        # Do not let a disconnected/force-stopped request wait behind a long
+        # transcription merely because ``Lock.acquire`` has no cancellation.
+        while not self._transcribe_lock.acquire(timeout=0.1):
+            if cancelled and cancelled():
+                raise STTUnavailableError("STT transcription was cancelled")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = response.read()
-                content_type = response.headers.get_content_type()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"whisper.cpp rejected the audio: {detail}") from exc
-        if response_format in {"json", "verbose_json"}:
-            parsed = json.loads(payload)
-            if response_format == "json":
-                payload = json.dumps(
-                    {"text": str(parsed.get("text") or "").strip()},
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            else:
-                payload = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
-            content_type = "application/json"
-        return payload, content_type
+            with self._condition:
+                if self._lifecycle_epoch != requested_epoch:
+                    raise STTUnavailableError("STT transcription was cancelled because the runtime stopped")
+            if cancelled and cancelled():
+                raise STTUnavailableError("STT transcription was cancelled")
+            self.start()
+            with self._condition:
+                if self._lifecycle_epoch != requested_epoch:
+                    raise STTUnavailableError("STT transcription was cancelled because the runtime stopped")
+            if cancelled and cancelled():
+                raise STTUnavailableError("STT transcription was cancelled")
+            whisper_format = "verbose_json" if response_format == "verbose_json" else response_format
+            body, boundary = self._multipart(
+                audio=audio, filename=filename, language=language, prompt=prompt,
+                response_format=whisper_format,
+            )
+            request = urllib.request.Request(
+                f"{self.base_url}/inference", data=body, method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = response.read()
+                    content_type = response.headers.get_content_type()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"whisper.cpp rejected the audio: {detail}") from exc
+            with self._condition:
+                if self._lifecycle_epoch != requested_epoch:
+                    raise STTUnavailableError("STT transcription was cancelled because the runtime stopped")
+            if cancelled and cancelled():
+                raise STTUnavailableError("STT transcription was cancelled")
+            if response_format in {"json", "verbose_json"}:
+                parsed = json.loads(payload)
+                if response_format == "json":
+                    payload = json.dumps(
+                        {"text": str(parsed.get("text") or "").strip()},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                else:
+                    payload = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+                content_type = "application/json"
+            return payload, content_type
+        finally:
+            self._transcribe_lock.release()
 
 
 __all__ = ["STTUnavailableError", "WhisperCppRuntime"]

@@ -300,7 +300,7 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate, WK
     }
 
     static func defaultLocalServiceURL() -> URL {
-        let port = Int(localEnvironment()["PORT"] ?? "7866") ?? 7866
+        let port = Int(localEnvironment()["PORT"] ?? "7861") ?? 7861
         return URL(string: "http://127.0.0.1:\(port)/")!
     }
 

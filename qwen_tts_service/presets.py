@@ -325,6 +325,53 @@ class VoicePresetStore:
                     return self._copy_preset(item)
         raise KeyError(reference_id)
 
+    def rename_reference_audio(self, reference_id: str, name: Any) -> dict[str, Any]:
+        """Rename a managed reference and keep settings that use it readable."""
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("参考音频名称不能为空")
+        normalized_name = normalized_name[:120]
+        with self._lock:
+            manifest = self._load()
+            self._discover_reference_audio(manifest)
+            target = next(
+                (
+                    item
+                    for item in manifest["reference_audio"]
+                    if isinstance(item, dict) and item.get("id") == reference_id
+                ),
+                None,
+            )
+            if target is None:
+                raise KeyError(reference_id)
+            path = Path(str(target.get("path") or ""))
+            if not self.is_managed_reference(path):
+                raise ValueError("只能重命名参考音频库中的文件")
+
+            target["name"] = normalized_name
+            target["updated_at"] = _now()
+            resolved_path = str(path.resolve())
+            for preset in manifest["presets"]:
+                settings = preset.get("settings") if isinstance(preset, dict) else None
+                if (
+                    isinstance(settings, dict)
+                    and str(Path(str(settings.get("reference_audio_path") or "")).resolve())
+                    == resolved_path
+                ):
+                    settings["voice_name"] = normalized_name
+                    preset["updated_at"] = _now()
+            active_service = manifest.get("active_service")
+            settings = active_service.get("settings") if isinstance(active_service, dict) else None
+            if (
+                isinstance(settings, dict)
+                and str(Path(str(settings.get("reference_audio_path") or "")).resolve())
+                == resolved_path
+            ):
+                settings["voice_name"] = normalized_name
+                active_service["updated_at"] = _now()
+            _atomic_write(self.manifest_path, manifest)
+            return self._copy_preset(target)
+
     def hidden_builtin_references(self) -> set[str]:
         with self._lock:
             manifest = self._load()

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import mimetypes
 import subprocess
@@ -27,6 +28,7 @@ from fastapi.responses import (
 )
 
 from runtime_manager import MODEL_PROFILE_LABELS
+from media_process import run_media_process
 
 from webapp.config import (
     BAILIAN_VOICE_ROWS,
@@ -87,6 +89,15 @@ def register_voices_presets_routes(app, ctx):
         return "builtin-" + hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:24]
 
     def reference_audio_library(*, include_hidden: bool) -> list[dict[str, Any]]:
+        book_usages = document_projects.reference_usage_index()
+        usage_cache: dict[str, list[str]] = {}
+
+        def reference_usages(path: str) -> list[str]:
+            if path not in usage_cache:
+                usage_cache[path] = (preset_store.reference_usage(path)
+                    + book_usages.get(str(Path(path).resolve()), []) + jobs.reference_usage(path))
+            return usage_cache[path]
+
         hidden_builtin = preset_store.hidden_builtin_references()
         rows: list[dict[str, Any]] = []
         for voice in BAILIAN_VOICE_ROWS:
@@ -106,8 +117,8 @@ def register_voices_presets_routes(app, ctx):
                     "transcript": str(voice.get("transcript") or ""),
                     "transcript_source": str(voice.get("transcript_source") or ""),
                     "hidden": hidden,
-                    "in_use": bool(preset_store.reference_usage(path)),
-                    "usages": preset_store.reference_usage(path),
+                    "in_use": bool(reference_usages(path)),
+                    "usages": reference_usages(path),
                 }
             )
         for item in preset_store.list_reference_audio(include_hidden=include_hidden):
@@ -121,8 +132,8 @@ def register_voices_presets_routes(app, ctx):
                     "language": "Chinese",
                     "transcript": "",
                     "transcript_source": "",
-                    "in_use": bool(preset_store.reference_usage(path)),
-                    "usages": preset_store.reference_usage(path),
+                    "in_use": bool(reference_usages(path)),
+                    "usages": reference_usages(path),
                 }
             )
         return rows
@@ -173,6 +184,24 @@ def register_voices_presets_routes(app, ctx):
                 raise HTTPException(status_code=404, detail="reference audio not found") from exc
         return JSONResponse({"ok": True, "hidden": hidden})
 
+    @app.put("/api/reference-audio-library/{reference_id}")
+    async def rename_reference_audio(
+        reference_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        if any(
+            builtin_reference_id(str(voice.get("audio_path") or "")) == reference_id
+            for voice in BAILIAN_VOICE_ROWS
+        ):
+            raise HTTPException(status_code=400, detail="内置参考音频不能改名")
+        try:
+            reference = preset_store.rename_reference_audio(reference_id, payload.get("name"))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="reference audio not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "reference": reference})
+
     @app.delete("/api/reference-audio-library/{reference_id}")
     async def delete_reference_audio(
         reference_id: str,
@@ -192,6 +221,10 @@ def register_voices_presets_routes(app, ctx):
             BAILIAN_VOICE_ROWS[0] if BAILIAN_VOICE_ROWS else {},
         )
         try:
+            reference = preset_store.reference_audio_record(reference_id)
+            protected_usages = document_projects.reference_usage(reference["path"]) + jobs.reference_usage(reference["path"])
+            if protected_usages:
+                raise ValueError("该音频仍被" + "、".join(protected_usages) + "引用，请先移除书籍或等待生成任务结束")
             replaced_usages = preset_store.delete_reference_audio(
                 reference_id,
                 replacement_audio_path=(
@@ -255,16 +288,24 @@ def register_voices_presets_routes(app, ctx):
     @app.post("/api/presets/reference-audio")
     async def import_preset_reference_audio(audio: UploadFile = File(...)) -> JSONResponse:
         filename = audio.filename or "reference.wav"
-        data = await audio.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="参考音频为空")
-        if len(data) > 100 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="参考音频不能超过 100 MB")
-        temporary = upload_dir / f"preset-{uuid.uuid4().hex}{Path(filename).suffix or '.wav'}"
+        temporary = upload_dir / f"preset-{uuid.uuid4().hex}{Path(filename).suffix or '.media'}"
         normalized = upload_dir / f"preset-normalized-{uuid.uuid4().hex}.wav"
         try:
-            temporary.write_bytes(data)
-            conversion = subprocess.run(
+            total = 0
+            with temporary.open("wb") as output:
+                while chunk := await audio.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > 1024 * 1024 * 1024:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="导入的音频或视频不能超过 1 GB",
+                        )
+                    output.write(chunk)
+            if total == 0:
+                raise HTTPException(status_code=400, detail="导入的音频或视频为空")
+
+            conversion = await asyncio.to_thread(
+                run_media_process,
                 [
                     ffmpeg_path,
                     "-y",
@@ -272,6 +313,8 @@ def register_voices_presets_routes(app, ctx):
                     "error",
                     "-i",
                     str(temporary),
+                    "-map",
+                    "0:a:0",
                     "-vn",
                     "-ac",
                     "1",
@@ -281,24 +324,28 @@ def register_voices_presets_routes(app, ctx):
                     "pcm_s16le",
                     str(normalized),
                 ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
+                cancelled=lambda: False,
+                timeout=300,
             )
             if conversion.returncode != 0 or not normalized.is_file() or normalized.stat().st_size <= 44:
                 detail = (conversion.stderr or "").strip().splitlines()
-                reason = detail[-1] if detail else "无法识别音频编码"
-                raise ValueError(f"参考音频无法解码：{reason[:240]}")
+                reason = detail[-1] if detail else "无法识别媒体编码或文件中没有音轨"
+                raise ValueError(f"无法从音频或视频读取声音：{reason[:240]}")
             imported = preset_store.import_reference_audio(
                 filename=f"{Path(filename).stem}.wav",
                 temporary_path=normalized,
             )
         except subprocess.TimeoutExpired as exc:
-            raise HTTPException(status_code=400, detail="参考音频转码超时") from exc
+            raise HTTPException(status_code=400, detail="音视频处理超时") from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="缺少音视频处理组件 ffmpeg",
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
+            await audio.close()
             temporary.unlink(missing_ok=True)
             normalized.unlink(missing_ok=True)
         return JSONResponse(

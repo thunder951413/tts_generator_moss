@@ -89,6 +89,28 @@ final class LocalService {
         }.resume()
     }
 
+    /// Variant used by long-running imports where a missing HTTP response must
+    /// remain distinguishable from a server-side JSON error.
+    func performResult(
+        _ path: String,
+        method: String = "GET",
+        body: Data? = nil,
+        contentType: String? = nil,
+        timeout: TimeInterval = 30,
+        completion: @escaping (Data?, HTTPURLResponse?, Error?) -> Void
+    ) {
+        let request = authorizedRequest(
+            path,
+            method: method,
+            body: body,
+            contentType: contentType,
+            timeout: timeout
+        )
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            completion(data, response as? HTTPURLResponse, error)
+        }.resume()
+    }
+
     func health(completion: @escaping ([String: Any]?) -> Void) {
         request("api/health") { data, response in
             guard response?.statusCode == 200, let data,
@@ -670,7 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func menuWillOpen(_ menu: NSMenu) {
         refreshHealth()
         refreshPresets()
-        viewModel.loadActiveServiceSettings()
+        viewModel.loadActiveServiceSettings(applyingToEditor: false)
         refreshVoiceStatus()
     }
 
@@ -707,7 +729,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             taskStatusItem?.title = ttsEnabled && active > 0
                 ? "任务：正在生成 · GPU \(active)/\(maximum)"
                 : (ttsEnabled ? "任务：空闲 · GPU \(active)/\(maximum)" : "任务：TTS 已停止")
-            sttStatusItem?.title = sttReady ? "转写：STT 已就绪" : "转写：STT 未就绪"
+            let waitingSTT = scheduler?["waiting_stt"] as? Int ?? 0
+            let activeSTT = scheduler?["stt_active"] as? Bool ?? false
+            sttStatusItem?.title = activeSTT ? "转写：正在处理"
+                : (waitingSTT > 0 ? "转写：等待计算 · \(waitingSTT) 个请求"
+                    : (sttReady ? "转写：STT 已就绪" : "转写：STT 未就绪"))
             statusItem.button?.toolTip = ttsEnabled
                 ? (active > 0 ? "Qwen TTS · 正在生成" : "Qwen TTS · 服务就绪")
                 : "Qwen TTS · TTS 已停止"
@@ -798,7 +824,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func refreshVoiceStatus() {
-        let voice = viewModel.referenceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let voice = viewModel.appliedServiceVoiceName.trimmingCharacters(in: .whitespacesAndNewlines)
         voiceStatusItem?.title = "当前音色：\(voice.isEmpty ? "尚未设置" : voice)"
     }
 
@@ -995,6 +1021,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 }
 
+#if !QWEN_STUDIO_TESTS
 @main
 enum QwenTTSApplication {
     static func main() {
@@ -1005,3 +1032,4 @@ enum QwenTTSApplication {
         app.run()
     }
 }
+#endif

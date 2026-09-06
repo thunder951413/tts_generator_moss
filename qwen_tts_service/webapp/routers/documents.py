@@ -67,6 +67,10 @@ def register_documents_routes(app, ctx):
     preset_payload = ctx.preset_payload
     _remove_generated_result_files = ctx.remove_generated_result_files
 
+    def require_tts_admission() -> None:
+        if not ctx.tts_enabled or bool(getattr(ctx, "stopping", False)):
+            raise HTTPException(status_code=503, detail="TTS service is stopping or disabled")
+
     async def _acquire_media_playback(
         request: Request,
         session_id: str,
@@ -233,6 +237,7 @@ def register_documents_routes(app, ctx):
     @app.post("/api/document-projects/{project_id}/start")
     async def start_document_project(project_id: str) -> JSONResponse:
         try:
+            require_tts_admission()
             project = document_projects.get_project(project_id)
             apply_performance_profile(
                 str((project.get("settings") or {}).get("model_profile") or DEFAULT_MODEL_PROFILE)
@@ -253,9 +258,14 @@ def register_documents_routes(app, ctx):
         settings_json: str = Form(""),
     ) -> JSONResponse:
         try:
+            require_tts_admission()
             project = document_projects.get_project(project_id)
+            requested_settings = document_settings(settings_json) if settings_json.strip() else None
             apply_performance_profile(
-                str((project.get("settings") or {}).get("model_profile") or DEFAULT_MODEL_PROFILE)
+                str(
+                    (requested_settings or project.get("settings") or {}).get("model_profile")
+                    or DEFAULT_MODEL_PROFILE
+                )
             )
             maximum = max(0, len(project.get("segments", [])) - 1)
             start_index = _safe_int(segment_start, default=0, minimum=0, maximum=maximum)
@@ -268,7 +278,7 @@ def register_documents_routes(app, ctx):
             return JSONResponse(
                 document_projects.start(
                     project_id,
-                    settings=document_settings(settings_json) if settings_json.strip() else None,
+                    settings=requested_settings,
                     segment_indices=list(range(start_index, end_index + 1)),
                 )
             )

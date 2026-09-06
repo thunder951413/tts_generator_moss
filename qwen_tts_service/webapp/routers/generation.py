@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import secrets
 import subprocess
@@ -30,6 +31,7 @@ from fastapi.responses import (
 )
 
 from qwen_protocol import StreamingRequest
+from media_process import run_media_process
 
 from runtime_manager import (
     DEFAULT_MODEL_PROFILE,
@@ -76,6 +78,26 @@ def register_generation_routes(app, ctx):
     active_service_settings = ctx.active_service_settings
     preset_payload = ctx.preset_payload
     _remove_generated_result_files = ctx.remove_generated_result_files
+    aac_flights: dict[str, asyncio.Task[Path]] = {}
+    aac_flights_lock = asyncio.Lock()
+
+    def _tts_admission_open(epoch: int) -> bool:
+        return (
+            bool(ctx.tts_enabled)
+            and not bool(getattr(ctx, "stopping", False))
+            and int(getattr(ctx, "tts_epoch", 0)) == epoch
+        )
+
+    def _remove_owned_prompt_audio(job: StreamingJob) -> None:
+        path = str(job.snapshot().get("owned_prompt_audio_path") or "")
+        if not path:
+            return
+        try:
+            candidate = Path(path).resolve()
+            candidate.relative_to(upload_dir.resolve())
+            candidate.unlink(missing_ok=True)
+        except (OSError, RuntimeError, ValueError):
+            return
 
     def _put_stream_audio(job: StreamingJob, pcm_bytes: bytes) -> None:
         with job.status_lock:
@@ -84,34 +106,26 @@ def register_generation_routes(app, ctx):
         try:
             job.audio_queue.put_nowait(pcm_bytes)
         except queue.Full:
-            # Browser playback is best-effort. Never let a disconnected or
-            # slow client block the server-side generation task.
-            try:
-                job.audio_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                job.audio_queue.put_nowait(pcm_bytes)
-            except queue.Full:
-                pass
+            raise RuntimeError("lossless audio queue capacity exceeded")
 
     def _finish_stream_audio(job: StreamingJob) -> None:
-        while True:
-            try:
-                job.audio_queue.put_nowait(None)
-                return
-            except queue.Full:
-                try:
-                    job.audio_queue.get_nowait()
-                except queue.Empty:
-                    return
+        job.audio_queue.put_nowait(None)
 
     def _run_job(
         job: StreamingJob, request: StreamingRequest, mode_name: str,
         streaming_generation: bool, model_profile: str, caller_kind: str,
     ) -> None:
+        admitted_epoch = int(job.snapshot().get("tts_epoch", 0))
+
+        def cancelled() -> bool:
+            return (
+                job.is_closed
+                or bool(getattr(ctx, "stopping", False))
+                or int(getattr(ctx, "tts_epoch", 0)) != admitted_epoch
+            )
+
         try:
-            if job.is_closed:
+            if cancelled():
                 return
             job.update(
                 state="loading_runtime",
@@ -123,16 +137,18 @@ def register_generation_routes(app, ctx):
             )
             with generation_scheduler.api_slot(
                 caller_kind,
-                cancelled=lambda: job.is_closed,
+                cancelled=cancelled,
             ):
-              if job.is_closed:
+              if cancelled():
                 return
               with runtime_manager.session(model_profile) as runtime:
+                if cancelled():
+                    return
                 channels = int(runtime_manager.profiles[model_profile]["channels"])
                 job.update(state="running", sample_rate=runtime.sample_rate, channels=channels, n_vq=runtime.n_vq)
                 for event in synthesize_for_profile_runtime(runtime, request, output_dir=output_dir):
                     with job.status_lock:
-                        if job.is_closed:
+                        if cancelled():
                             if event.type == "result" and job.status.get("ephemeral_audio"):
                                 _remove_generated_result_files(event.data)
                             break
@@ -197,6 +213,8 @@ def register_generation_routes(app, ctx):
             else:
                 job.update(state="error", error=str(exc))
             _finish_stream_audio(job)
+        finally:
+            _remove_owned_prompt_audio(job)
 
     @app.post("/api/generate-stream/start")
     async def generate_stream_start(
@@ -227,9 +245,17 @@ def register_generation_routes(app, ctx):
         prompt_audio: UploadFile | None = File(None),
         use_service_settings: int = Form(1),
         ephemeral_audio: int = Form(0),
+        expected_playback_epoch: int | None = Form(None),
     ) -> JSONResponse:
-        if not ctx.tts_enabled:
+        admission_epoch = int(getattr(ctx, "tts_epoch", 0))
+        if not _tts_admission_open(admission_epoch):
             raise HTTPException(status_code=503, detail="TTS service is stopped")
+        admission_playback_epoch = int(playback_coordinator.status()["playback_epoch"])
+        if (
+            expected_playback_epoch is not None
+            and int(expected_playback_epoch) != admission_playback_epoch
+        ):
+            raise HTTPException(status_code=409, detail="playback session is stale")
         text = (text or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail="text must not be empty")
@@ -288,13 +314,27 @@ def register_generation_routes(app, ctx):
         ))
         if use_applied_service_settings:
             prompt_audio = None
+        if model_profile not in runtime_manager.profiles:
+            raise HTTPException(status_code=400, detail="invalid model profile")
 
         prompt_audio_path = ""
+        owned_prompt_path: Path | None = None
         if prompt_audio is not None and prompt_audio.filename:
             suffix = Path(prompt_audio.filename).suffix or ".wav"
             prompt_path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
-            prompt_path.write_bytes(await prompt_audio.read())
-            prompt_audio_path = str(prompt_path)
+            total = 0
+            try:
+                with prompt_path.open("xb") as destination:
+                    while chunk := await prompt_audio.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > 50 * 1024 * 1024:
+                            raise HTTPException(status_code=413, detail="prompt audio exceeds 50 MB")
+                        destination.write(chunk)
+                prompt_audio_path = str(prompt_path)
+                owned_prompt_path = prompt_path
+            except Exception:
+                prompt_path.unlink(missing_ok=True)
+                raise
         elif example_audio_path:
             try:
                 prompt_audio_path = str(
@@ -320,8 +360,6 @@ def register_generation_routes(app, ctx):
         )
         codec_chunk_frames = _safe_int(codec_chunk_frames, default=16, minimum=0, maximum=32)
         streaming_generation_enabled = bool(_safe_int(streaming_generation, default=1, minimum=0, maximum=1))
-        if model_profile not in runtime_manager.profiles:
-            raise HTTPException(status_code=400, detail="invalid model profile")
         if runtime_manager.profiles[model_profile].get("backend") == "qwen":
             max_new_tokens = _safe_int(max_new_tokens, default=2048, minimum=2, maximum=2048)
             codec_chunk_frames = _safe_int(codec_chunk_frames, default=8, minimum=1, maximum=24)
@@ -330,7 +368,12 @@ def register_generation_routes(app, ctx):
         resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
         if not runtime_manager.profiles[model_profile]["streaming"]:
             streaming_generation_enabled = False
-        performance_recommendation = apply_performance_profile(model_profile)
+        try:
+            performance_recommendation = apply_performance_profile(model_profile)
+        except Exception:
+            if owned_prompt_path is not None:
+                owned_prompt_path.unlink(missing_ok=True)
+            raise
         if (
             streaming_generation_enabled
             and use_applied_service_settings
@@ -366,24 +409,44 @@ def register_generation_routes(app, ctx):
                 qwen_min_new_tokens, default=2, minimum=2, maximum=256
             ),
         )
-        job = jobs.create(
-            summary={
-                "task_type": "text_generation",
-                "title": text[:80],
-                "text_preview": text[:240],
-                "model_profile": model_profile,
-                "model_label": MODEL_PROFILE_LABELS[model_profile],
-                "voice_name": str(voice_name or "本地克隆音色")[:120],
-                "seed": resolved_seed,
-                "configured_seed": configured_seed,
-                "seed_mode": seed_mode,
-                "ephemeral_audio": bool(
-                    _safe_int(ephemeral_audio, default=0, minimum=0, maximum=1)
-                ),
-                "caller_kind": caller_kind,
-                "playback_epoch": playback_coordinator.status()["playback_epoch"],
-            }
-        )
+        if not _tts_admission_open(admission_epoch):
+            if owned_prompt_path is not None:
+                owned_prompt_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=503, detail="TTS service stopped while receiving the request")
+        if (
+            expected_playback_epoch is not None
+            and int(expected_playback_epoch)
+            != int(playback_coordinator.status()["playback_epoch"])
+        ):
+            if owned_prompt_path is not None:
+                owned_prompt_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=409, detail="playback session is stale")
+        try:
+            job = jobs.create(
+                summary={
+                    "task_type": "text_generation",
+                    "title": text[:80],
+                    "text_preview": text[:240],
+                    "model_profile": model_profile,
+                    "model_label": MODEL_PROFILE_LABELS[model_profile],
+                    "voice_name": str(voice_name or "本地克隆音色")[:120],
+                    "seed": resolved_seed,
+                    "configured_seed": configured_seed,
+                    "seed_mode": seed_mode,
+                    "ephemeral_audio": bool(
+                        _safe_int(ephemeral_audio, default=0, minimum=0, maximum=1)
+                    ),
+                    "caller_kind": caller_kind,
+                    "playback_epoch": admission_playback_epoch,
+                    "reference_audio_path": prompt_audio_path,
+                    "owned_prompt_audio_path": str(owned_prompt_path) if owned_prompt_path else "",
+                    "tts_epoch": admission_epoch,
+                }
+            )
+        except Exception:
+            if owned_prompt_path is not None:
+                owned_prompt_path.unlink(missing_ok=True)
+            raise
         thread = threading.Thread(
             target=_run_job,
             args=(
@@ -397,7 +460,12 @@ def register_generation_routes(app, ctx):
             daemon=True,
         )
         job.thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            jobs.close(job.job_id)
+            _remove_owned_prompt_audio(job)
+            raise
         return JSONResponse(
             {
                 "job_id": job.job_id,
@@ -438,12 +506,21 @@ def register_generation_routes(app, ctx):
     ) -> dict[str, object]:
         job.update(playback_state="waiting")
         disconnected = threading.Event()
+        expected_epoch = int(job.snapshot().get("playback_epoch", -1))
+        current_epoch = int(playback_coordinator.status()["playback_epoch"])
+        if expected_epoch != current_epoch:
+            job.update(playback_state="cancelled")
+            raise HTTPException(status_code=409, detail="playback session is stale")
         acquire_task = asyncio.create_task(
             asyncio.to_thread(
                 playback_coordinator.acquire,
                 job.job_id,
                 str(job.snapshot().get("caller_kind") or "external"),
-                cancelled=lambda: job.is_closed or disconnected.is_set(),
+                cancelled=lambda: (
+                    job.is_closed
+                    or disconnected.is_set()
+                    or int(playback_coordinator.status()["playback_epoch"]) != expected_epoch
+                ),
                 timeout=600.0,
                 lease_timeout=lease_timeout,
             )
@@ -462,6 +539,10 @@ def register_generation_routes(app, ctx):
             job.update(playback_state="cancelled")
             raise HTTPException(status_code=409, detail="playback was cancelled or queue is full")
         status = playback_coordinator.status()
+        if int(status["playback_epoch"]) != expected_epoch:
+            playback_coordinator.release(job.job_id)
+            job.update(playback_state="cancelled")
+            raise HTTPException(status_code=409, detail="playback session is stale")
         job.update(
             playback_state="active",
             playback_epoch=status["playback_epoch"],
@@ -572,45 +653,95 @@ def register_generation_routes(app, ctx):
             raise HTTPException(status_code=404, detail="generated audio is missing")
         selected_bitrate = _safe_aac_bitrate(bitrate)
         target = reader_temp_dir / f"{job_id}-{selected_bitrate}.m4a"
-        if not target.is_file():
+        conversion_epoch = getattr(ctx, "tts_epoch", 0)
+
+        def conversion_cancelled() -> bool:
+            return job.is_closed or conversion_epoch != getattr(ctx, "tts_epoch", 0)
+
+        def encode_aac() -> Path:
+            temporary = target.with_name(
+                f".{target.stem}.{uuid.uuid4().hex}.tmp{target.suffix}"
+            )
             try:
-                completed = subprocess.run(
-                    [
-                        ffmpeg_path,
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-i",
-                        str(source),
-                        "-vn",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "48000",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        selected_bitrate,
-                        "-movflags",
-                        "+faststart",
-                        str(target),
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-            except FileNotFoundError as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail="AAC 编码器 ffmpeg 未找到，请运行 brew install ffmpeg",
-                ) from exc
-            if completed.returncode != 0 or not target.is_file():
-                target.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=500,
-                    detail=(completed.stderr or "AAC encoding failed").strip(),
-                )
+                try:
+                    completed = run_media_process(
+                        [
+                            ffmpeg_path,
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-y",
+                            "-i",
+                            str(source),
+                            "-vn",
+                            "-ac",
+                            "1",
+                            "-ar",
+                            "48000",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            selected_bitrate,
+                            "-movflags",
+                            "+faststart",
+                            str(temporary),
+                        ],
+                        timeout=120,
+                        cancelled=conversion_cancelled,
+                    )
+                except FileNotFoundError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="AAC 编码器 ffmpeg 未找到，请运行 brew install ffmpeg",
+                    ) from exc
+                except subprocess.TimeoutExpired as exc:
+                    raise HTTPException(status_code=504, detail="AAC encoding timed out") from exc
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if completed.returncode != 0 or not temporary.is_file():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(completed.stderr or "AAC encoding failed").strip(),
+                    )
+                # ``jobs.close`` takes this lock before flagging the job closed.
+                # The publication check and atomic replacement therefore cannot
+                # race a close into making a newly encoded file visible afterwards.
+                with job.status_lock:
+                    if conversion_cancelled():
+                        raise HTTPException(status_code=409, detail="generation job was closed")
+                    os.replace(temporary, target)
+                return target
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        async def ensure_aac() -> Path:
+            key = f"{job_id}:{selected_bitrate}"
+            async with aac_flights_lock:
+                task = aac_flights.get(key)
+                if task is None:
+                    task = asyncio.create_task(asyncio.to_thread(encode_aac))
+                    aac_flights[key] = task
+                    def cleanup_completed_task(completed: asyncio.Task[Path]) -> None:
+                        # Consume failures so an abandoned client cannot leave
+                        # an unobserved-task warning, then retire this exact
+                        # flight. Task callbacks run on this same event loop.
+                        try:
+                            completed.exception()
+                        except asyncio.CancelledError:
+                            pass
+                        if aac_flights.get(key) is completed:
+                            aac_flights.pop(key, None)
+                    task.add_done_callback(cleanup_completed_task)
+            try:
+                return await asyncio.shield(task)
+            finally:
+                if task.done():
+                    async with aac_flights_lock:
+                        if aac_flights.get(key) is task:
+                            aac_flights.pop(key, None)
+
+        if not target.is_file():
+            await ensure_aac()
         headers = None
         if _playback_requested(playback, request):
             playback_status = await _acquire_playback(

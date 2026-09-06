@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -106,7 +107,9 @@ def create_app(
     for profile_id, profile in runtime_manager.profiles.items():
         if performance_tuning.profile(profile_id) is not None:
             profile["lanes"] = performance_tuning.recommendation(profile_id)["block_parallel"]
-    playback_coordinator = PlaybackCoordinator(max_waiters=64, internal_burst_limit=4)
+    playback_coordinator = PlaybackCoordinator(
+        max_waiters=64, internal_burst_limit=4, initial_epoch=time.time_ns() // 1_000_000,
+    )
     jobs = StreamingJobManager(
         service_job_dir,
         max_active_jobs=64,
@@ -141,6 +144,11 @@ def create_app(
     )
     should_preload_stt = bool(preload if stt_preload is None else stt_preload)
     def synthesize_for_profile_runtime(runtime: Any, request: StreamingRequest, *, output_dir: str | Path):
+        # A queued request may target a different model from the one currently
+        # resident. Apply shared scheduling only once its session is admitted.
+        profile_id = getattr(runtime, "profile_id", None)
+        if profile_id in runtime_manager.profiles and not generation_scheduler.status()["performance_test_active"]:
+            apply_performance_profile(profile_id)
         yield from runtime.synthesize(request, output_dir=output_dir)
 
     document_projects = DocumentProjectManager(
@@ -163,10 +171,13 @@ def create_app(
     def apply_performance_profile(profile_id: str) -> dict[str, int]:
         recommendation = performance_tuning.recommendation(profile_id)
         if performance_tuning.profile(profile_id) is None:
-            return recommendation
-        runtime_manager.profiles[profile_id]["lanes"] = recommendation["block_parallel"]
-        generation_scheduler.configure_max_parallel(recommendation["block_parallel"])
-        document_projects.configure_synthesis_workers(recommendation["document_workers"])
+            recommendation["block_parallel"] = min(2, max(1, int(runtime_manager.profiles[profile_id].get("lanes", 1))))
+            recommendation["document_workers"] = min(recommendation["block_parallel"], max(1, int(document_parallel_generations)))
+        else:
+            runtime_manager.profiles[profile_id]["lanes"] = recommendation["block_parallel"]
+        if runtime_manager.status().get("active_profile") in {None, profile_id}:
+            generation_scheduler.configure_max_parallel(recommendation["block_parallel"])
+            document_projects.configure_synthesis_workers(recommendation["document_workers"])
         return recommendation
 
     @asynccontextmanager

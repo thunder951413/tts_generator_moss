@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 
 struct NativeVoice: Identifiable, Hashable {
     let id: String
-    let name: String
+    var name: String
     let description: String
     let audioPath: String
     let language: String
@@ -29,7 +29,7 @@ struct NativeVoice: Identifiable, Hashable {
 
 struct NativeReferenceAudio: Identifiable, Hashable {
     let id: String
-    let name: String
+    var name: String
     let path: String
     let kind: String
     let hidden: Bool

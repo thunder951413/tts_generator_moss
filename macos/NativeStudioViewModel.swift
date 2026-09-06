@@ -21,6 +21,7 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var selectedVoicePath = ""
     @Published var referenceAudioPath = ""
     @Published var referenceName = "尚未选择参考音色"
+    @Published var appliedServiceVoiceName = "尚未设置"
     @Published var text = "欢迎使用 Qwen3-TTS 原生 Mac 音频工作台。"
     @Published var modelProfile = "qwen_0_6b"
     @Published var cloneMode = "xvec"
@@ -51,9 +52,12 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var referenceLibrary: [NativeReferenceAudio] = []
     @Published var referenceLibraryPresented = false
     @Published var pendingReferenceDeletion: NativeReferenceAudio?
+    @Published var pendingReferenceRename: NativeReferenceAudio?
+    @Published var pendingReferenceRenameName = ""
     @Published var referenceLibraryStatus = ""
     @Published var referenceLibraryTab = "visible"
     @Published var isDeletingReference = false
+    @Published var isRenamingReference = false
     @Published var isRecordingSystemAudio = false
     @Published var isPreparingSystemAudioCapture = false
     @Published var systemAudioStatus = "可录制 Mac 正在播放的声音"
@@ -292,7 +296,7 @@ final class NativeStudioViewModel: ObservableObject {
             : "测试完成，推荐策略已保存并立即应用"
     }
 
-    func loadActiveServiceSettings() {
+    func loadActiveServiceSettings(applyingToEditor: Bool = true) {
         service.perform("api/service-settings") { [weak self] data, response in
             guard let self else { return }
             do {
@@ -303,6 +307,9 @@ final class NativeStudioViewModel: ObservableObject {
                 let activePresetID = payload["active_preset_id"] as? String ?? ""
                 let name = payload["name"] as? String ?? "服务设置"
                 DispatchQueue.main.async {
+                    self.appliedServiceVoiceName = self.string(settings["voice_name"], fallback: name)
+                    self.serviceSettingsStatus = "当前服务设置：\(name)"
+                    guard applyingToEditor else { return }
                     self.modelProfile = self.string(settings["model_profile"], fallback: "qwen_0_6b")
                     self.cloneMode = self.string(settings["qwen_clone_mode"], fallback: "xvec")
                     self.referenceText = self.string(settings["qwen_reference_text"])
@@ -473,6 +480,72 @@ final class NativeStudioViewModel: ObservableObject {
         }
     }
 
+    func beginRenamingReference(_ reference: NativeReferenceAudio) {
+        guard reference.kind == "custom" else {
+            referenceLibraryStatus = "内置参考音频不能改名。"
+            return
+        }
+        referenceLibraryStatus = ""
+        pendingReferenceRenameName = reference.name
+        pendingReferenceRename = reference
+    }
+
+    func renameReference(_ reference: NativeReferenceAudio, name proposedName: String) {
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            referenceLibraryStatus = "参考音频名称不能为空。"
+            return
+        }
+        guard !isRenamingReference else { return }
+        guard let body = try? JSONSerialization.data(withJSONObject: ["name": name]) else {
+            referenceLibraryStatus = "无法保存参考音频名称。"
+            return
+        }
+        isRenamingReference = true
+        referenceLibraryStatus = "正在将“\(reference.name)”改名…"
+        service.perform(
+            "api/reference-audio-library/\(reference.id)",
+            method: "PUT",
+            body: body,
+            contentType: "application/json"
+        ) { [weak self] data, response in
+            guard let self else { return }
+            do {
+                if response?.statusCode == 405 {
+                    throw NativeStudioError.server("后台仍是旧版本，请重启本地服务后再保存。")
+                }
+                let payload = try self.jsonObject(data, response: response)
+                guard let record = payload["reference"] as? [String: Any],
+                      let savedName = record["name"] as? String,
+                      record["id"] as? String == reference.id,
+                      !savedName.isEmpty else {
+                    throw NativeStudioError.invalidResponse
+                }
+                DispatchQueue.main.async {
+                    self.isRenamingReference = false
+                    if self.referenceAudioPath == reference.path {
+                        self.referenceName = savedName
+                    }
+                    for index in self.referenceLibrary.indices where self.referenceLibrary[index].id == reference.id {
+                        self.referenceLibrary[index].name = savedName
+                    }
+                    for index in self.voices.indices where self.voices[index].audioPath == reference.path {
+                        self.voices[index].name = savedName
+                    }
+                    self.referenceLibraryStatus = "已将“\(reference.name)”改名为“\(savedName)”"
+                    self.pendingReferenceRename = nil
+                    // Metadata refresh must not activate a preset or replace unsaved workbench edits.
+                    self.refreshPresets(applyingActivePreset: false)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isRenamingReference = false
+                    self.referenceLibraryStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+
     func setReferenceHidden(_ reference: NativeReferenceAudio, hidden: Bool) {
         let body = try? JSONSerialization.data(withJSONObject: ["hidden": hidden])
         service.perform(
@@ -546,7 +619,7 @@ final class NativeStudioViewModel: ObservableObject {
         }
     }
 
-    func refreshPresets(selecting presetID: String? = nil) {
+    func refreshPresets(selecting presetID: String? = nil, applyingActivePreset: Bool = false) {
         service.perform("api/presets") { [weak self] data, response in
             guard let self else { return }
             do {
@@ -557,7 +630,7 @@ final class NativeStudioViewModel: ObservableObject {
                     self.presets = presets
                     if let presetID, presets.contains(where: { $0.id == presetID }) {
                         self.selectedPresetID = presetID
-                    } else if !activePresetID.isEmpty,
+                    } else if applyingActivePreset, !activePresetID.isEmpty,
                               let activePreset = presets.first(where: { $0.id == activePresetID }) {
                         self.applyPreset(activePreset)
                     }
@@ -591,16 +664,22 @@ final class NativeStudioViewModel: ObservableObject {
 
     func chooseReferenceFile() {
         let panel = NSOpenPanel()
-        panel.title = "选择语音克隆参考音频"
+        panel.title = "选择参考音频或视频"
+        panel.message = "视频会自动提取音轨，再进入同一个试听与裁剪流程。"
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.audio]
+        panel.allowedContentTypes = [.audio, .movie, .video]
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        let contentType = UTType(filenameExtension: url.pathExtension)
+        let isVideo = contentType?.conforms(to: .movie) == true
+            || contentType?.conforms(to: .video) == true
         prepareReferenceAudioForTrimming(
             url,
             name: url.deletingPathExtension().lastPathComponent,
-            title: "裁剪导入音频",
-            subtitle: "先选择需要的声音片段，再压缩并加入参考音频。",
+            title: isVideo ? "裁剪视频音轨" : "裁剪导入音频",
+            subtitle: isVideo
+                ? "已从视频读取声音；选择需要的片段后，将只保存音频作为参考。"
+                : "先选择需要的声音片段，再压缩并加入参考音频。",
             sourceIsTemporary: false
         )
     }
@@ -633,42 +712,113 @@ final class NativeStudioViewModel: ObservableObject {
                 )
             )
             DispatchQueue.main.async { self.audioTrimProgress = "正在上传并标准化音频…" }
-            self.service.perform(
-                "api/presets/reference-audio",
-                method: "POST",
-                body: multipart.data,
-                contentType: multipart.contentType,
-                timeout: 180
-            ) { [weak self] data, response in
-                guard let self else { return }
-                if url.deletingLastPathComponent() == FileManager.default.temporaryDirectory,
-                   url.lastPathComponent.hasPrefix("qwen-system-export-") {
-                    try? FileManager.default.removeItem(at: url)
-                }
-                do {
-                    let payload = try self.jsonObject(data, response: response)
-                    guard let path = payload["reference_audio_path"] as? String else {
-                        throw NativeStudioError.invalidResponse
-                    }
+            self.uploadReferenceMultipart(
+                multipart,
+                sourceURL: url,
+                displayName: displayName,
+                restartServiceIfNeeded: true,
+                completion: completion
+            )
+        }
+    }
+
+    private func uploadReferenceMultipart(
+        _ multipart: (data: Data, contentType: String),
+        sourceURL: URL,
+        displayName: String?,
+        restartServiceIfNeeded: Bool,
+        completion: ((Bool) -> Void)?
+    ) {
+        service.performResult(
+            "api/presets/reference-audio",
+            method: "POST",
+            body: multipart.data,
+            contentType: multipart.contentType,
+            timeout: 180
+        ) { [weak self] data, response, transportError in
+            guard let self else { return }
+            guard let response else {
+                if restartServiceIfNeeded {
                     DispatchQueue.main.async {
-                        self.isImportingReference = false
-                        self.audioTrimProgress = "导入完成"
-                        self.referenceAudioPath = path
-                        self.referenceName = displayName ?? url.deletingPathExtension().lastPathComponent
-                        self.referenceText = ""
-                        self.loadReferenceLibrary()
-                        self.loadVoices()
-                        completion?(true)
+                        self.audioTrimProgress = "本地服务未连接，正在启动后重试…"
                     }
-                } catch {
-                    DispatchQueue.main.async {
-                        self.isImportingReference = false
-                        self.audioTrimProgress = "导入失败：\(error.localizedDescription)"
-                        completion?(false)
+                    self.service.startIfNeeded { [weak self] result in
+                        guard let self else { return }
+                        switch result {
+                        case .success:
+                            DispatchQueue.main.async {
+                                self.audioTrimProgress = "服务已就绪，正在重新导入…"
+                            }
+                            self.uploadReferenceMultipart(
+                                multipart,
+                                sourceURL: sourceURL,
+                                displayName: displayName,
+                                restartServiceIfNeeded: false,
+                                completion: completion
+                            )
+                        case .failure(let error):
+                            self.finishReferenceImport(
+                                .failure(
+                                    NativeStudioError.server(
+                                        "无法连接本地语音服务，且自动启动失败：\(error.localizedDescription)"
+                                    )
+                                ),
+                                completion: completion
+                            )
+                        }
                     }
-                    self.show(error)
+                    return
                 }
+                self.finishReferenceImport(
+                    .failure(
+                        NativeStudioError.server(
+                            "无法连接本地语音服务：\(transportError?.localizedDescription ?? "请求没有收到响应")"
+                        )
+                    ),
+                    completion: completion
+                )
+                return
             }
+
+            do {
+                let payload = try self.jsonObject(data, response: response)
+                guard let path = payload["reference_audio_path"] as? String else {
+                    throw NativeStudioError.invalidResponse
+                }
+                if sourceURL.deletingLastPathComponent() == FileManager.default.temporaryDirectory,
+                   sourceURL.lastPathComponent.hasPrefix("qwen-system-export-") {
+                    try? FileManager.default.removeItem(at: sourceURL)
+                }
+                DispatchQueue.main.async {
+                    self.isImportingReference = false
+                    self.audioTrimProgress = "导入完成"
+                    self.referenceAudioPath = path
+                    self.referenceName = displayName ?? sourceURL.deletingPathExtension().lastPathComponent
+                    self.referenceText = ""
+                    self.loadReferenceLibrary()
+                    self.loadVoices()
+                    completion?(true)
+                }
+            } catch {
+                self.finishReferenceImport(.failure(error), completion: completion)
+            }
+        }
+    }
+
+    private func finishReferenceImport(
+        _ result: Result<Void, Error>,
+        completion: ((Bool) -> Void)?
+    ) {
+        switch result {
+        case .success:
+            return
+        case .failure(let error):
+            DispatchQueue.main.async {
+                self.isImportingReference = false
+                self.audioTrimProgress = "导入失败：\(error.localizedDescription)"
+                completion?(false)
+            }
+            show(error)
         }
     }
 
@@ -832,6 +982,14 @@ final class NativeStudioViewModel: ObservableObject {
         audioTrimSubtitle = subtitle
         audioTrimProgress = "正在分析音频…"
         let asset = AVURLAsset(url: url)
+        guard !asset.tracks(withMediaType: .audio).isEmpty else {
+            if sourceIsTemporary { try? FileManager.default.removeItem(at: url) }
+            systemAudioRecordingURL = nil
+            trimSourceIsTemporary = false
+            systemAudioStatus = "所选文件没有可用音轨"
+            show(NativeStudioError.server("所选音频或视频不包含可用音轨。"))
+            return
+        }
         let duration = CMTimeGetSeconds(asset.duration)
         guard duration.isFinite, duration > 0.1 else {
             if sourceIsTemporary { try? FileManager.default.removeItem(at: url) }
@@ -1428,6 +1586,9 @@ final class NativeStudioViewModel: ObservableObject {
                 let name = payload["name"] as? String ?? "当前预设"
                 DispatchQueue.main.async {
                     self.serviceSettingsStatus = "服务已应用：\(name)"
+                    if let settings = payload["settings"] as? [String: Any] {
+                        self.appliedServiceVoiceName = self.string(settings["voice_name"], fallback: name)
+                    }
                 }
             } catch {
                 self.show(error)
@@ -1483,6 +1644,9 @@ final class NativeStudioViewModel: ObservableObject {
                     self.isApplyingServiceSettings = false
                     self.selectedPresetID = ""
                     self.serviceSettingsStatus = "已应用：\(name)；后续调用将使用此配置"
+                    if let settings = result["settings"] as? [String: Any] {
+                        self.appliedServiceVoiceName = self.string(settings["voice_name"], fallback: name)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async { self.isApplyingServiceSettings = false }

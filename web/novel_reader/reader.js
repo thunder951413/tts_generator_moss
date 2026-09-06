@@ -22,6 +22,10 @@ const state = {
   playbackControlStopping: false,
   playbackSessionId: "",
   playbackLeaseId: "",
+  listeningSessionId: "",
+  listeningRunId: 0,
+  listeningEpoch: null,
+  listeningHeartbeat: null,
   qualityQueue: [],
   qualityJobs: new Set(),
   qualityPlaybackReject: null,
@@ -96,6 +100,47 @@ async function releaseMediaPlayback() {
   state.playbackSessionId = "";
   if (!leaseId) return;
   await fetch(`/api/playback/${encodeURIComponent(leaseId)}/release`, { method: "POST" }).catch(() => {});
+}
+
+async function releaseContinuousListening(runId = null) {
+  if (runId != null && state.listeningRunId !== runId) return;
+  const sessionId = state.listeningSessionId;
+  window.clearInterval(state.listeningHeartbeat);
+  state.listeningHeartbeat = null;
+  state.listeningSessionId = "";
+  state.listeningRunId = 0;
+  state.listeningEpoch = null;
+  if (!sessionId) return;
+  await fetch(`/api/listening/${encodeURIComponent(sessionId)}/release`, { method: "POST" }).catch(() => {});
+}
+
+async function reserveContinuousListening(runId) {
+  const sessionId = newPlaybackSessionId();
+  const reservation = await jsonFetch(
+    `/api/listening/${encodeURIComponent(sessionId)}/heartbeat`,
+    { method: "POST" }
+  );
+  if (state.stopped || runId !== state.streamRunId) {
+    await fetch(`/api/listening/${encodeURIComponent(sessionId)}/release`, { method: "POST" }).catch(() => {});
+    throw new DOMException("Stopped", "AbortError");
+  }
+  state.listeningSessionId = sessionId;
+  state.listeningRunId = runId;
+  state.listeningEpoch = Number(reservation.playback_epoch);
+  state.listeningHeartbeat = window.setInterval(async () => {
+    if (state.listeningSessionId !== sessionId || state.listeningRunId !== runId) return;
+    try {
+      await jsonFetch(
+        `/api/listening/${encodeURIComponent(sessionId)}/heartbeat?playback_epoch=${encodeURIComponent(state.listeningEpoch)}`,
+        { method: "POST" }
+      );
+    } catch (_) {
+      if (state.listeningSessionId === sessionId && state.listeningRunId === runId) {
+        state.stopped = true;
+        await stopPlayback(false);
+      }
+    }
+  }, 3000);
 }
 
 function currentChapter() {
@@ -953,10 +998,14 @@ async function prepareQualityBlock(segment, runId) {
   form.set("qwen_non_streaming_mode", "1");
   form.set("ephemeral_audio", "1");
   const started = await jsonFetch("/api/generate-stream/start", { method: "POST", body: form });
+  const jobId = started.job_id;
+  if (state.stopped || runId !== state.streamRunId) {
+    await fetch(`/api/generate-stream/${encodeURIComponent(jobId)}/ephemeral-audio`, { method: "DELETE" }).catch(() => {});
+    throw new DOMException("Stopped", "AbortError");
+  }
   if (Number.isFinite(Number(started.playback_epoch))) {
     state.playbackEpoch = Number(started.playback_epoch);
   }
-  const jobId = started.job_id;
   state.qualityJobs.add(jobId);
   state.currentJob = jobId;
   setActionsEnabled(true);
@@ -970,8 +1019,11 @@ async function prepareQualityBlock(segment, runId) {
     );
     if (!response.ok) throw new Error(await response.text());
     const playbackEpoch = Number(response.headers.get("X-Playback-Epoch"));
-    if (Number.isFinite(playbackEpoch)) state.playbackEpoch = playbackEpoch;
     const blob = await response.blob();
+    if (state.stopped || runId !== state.streamRunId) {
+      throw new DOMException("Stopped", "AbortError");
+    }
+    if (Number.isFinite(playbackEpoch)) state.playbackEpoch = playbackEpoch;
     return {
       segment,
       jobId,
@@ -1008,8 +1060,10 @@ async function startQualityChapter() {
   updatePlayer(segments[0], "高质量非流式 · 正在完整生成", null);
   renderCurrentChapter();
   scrollPlayingBlock();
-  let pendingPreparation = queueQualityBlock(segments[0], runId);
+  let pendingPreparation = null;
   try {
+    await reserveContinuousListening(runId);
+    pendingPreparation = queueQualityBlock(segments[0], runId);
     for (let index = 0; index < segments.length; index += 1) {
       const outcome = await pendingPreparation;
       pendingPreparation = null;
@@ -1047,6 +1101,7 @@ async function startQualityChapter() {
   } catch (error) {
     if (!state.stopped && error.name !== "AbortError") toast(error.message, true);
   } finally {
+    await releaseContinuousListening(runId);
     if (pendingPreparation) {
       const outcome = await pendingPreparation;
       if (outcome.prepared) {
@@ -1207,6 +1262,9 @@ function streamForm(segment, seedOverride = null) {
   form.append("streaming_generation", "1");
   form.append("example_audio_path", settings.reference_audio_path);
   form.append("use_service_settings", "1");
+  if (state.listeningEpoch != null) {
+    form.append("expected_playback_epoch", String(state.listeningEpoch));
+  }
   return form;
 }
 
@@ -1223,15 +1281,17 @@ async function startStreamChapter() {
   $("stream-listen").disabled = true;
   $("playback-mode").textContent = "实时流式";
   try {
+    await reserveContinuousListening(runId);
     let streamSeed = null;
     for (const segment of segments) {
       if (state.stopped || runId !== state.streamRunId) break;
-      streamSeed = await streamOneBlock(segment, streamSeed);
+      streamSeed = await streamOneBlock(segment, streamSeed, runId);
       await savePlayback(segment.index, 0);
     }
   } catch (error) {
     if (!state.stopped && error.name !== "AbortError") toast(error.message, true);
   } finally {
+    await releaseContinuousListening(runId);
     if (runId !== state.streamRunId) return;
     $("stream-listen").disabled = false;
     state.currentJob = "";
@@ -1244,7 +1304,7 @@ async function startStreamChapter() {
   }
 }
 
-async function streamOneBlock(segment, seedOverride = null) {
+async function streamOneBlock(segment, seedOverride = null, runId = state.streamRunId) {
   activatePlaybackChapter(segment.index);
   state.playingBlock = segment.index;
   state.selectedBlock = segment.index;
@@ -1255,11 +1315,15 @@ async function streamOneBlock(segment, seedOverride = null) {
     "/api/generate-stream/start",
     { method: "POST", body: streamForm(segment, seedOverride) }
   );
+  if (state.stopped || runId !== state.streamRunId) {
+    await fetch(`/api/generate-stream/${encodeURIComponent(start.job_id)}/close`, { method: "POST" }).catch(() => {});
+    throw new DOMException("Stopped", "AbortError");
+  }
   if (Number.isFinite(Number(start.playback_epoch))) {
     state.playbackEpoch = Number(start.playback_epoch);
   }
   try {
-    await playStreamingAudio(start);
+    await playStreamingAudio(start, runId);
   } finally {
     await fetch(`/api/generate-stream/${encodeURIComponent(start.job_id)}/close`, {
       method: "POST",
@@ -1268,7 +1332,10 @@ async function streamOneBlock(segment, seedOverride = null) {
   return start.seed;
 }
 
-async function playStreamingAudio(start) {
+async function playStreamingAudio(start, runId = state.streamRunId) {
+  if (state.stopped || runId !== state.streamRunId) {
+    throw new DOMException("Stopped", "AbortError");
+  }
   state.currentJob = start.job_id;
   setActionsEnabled(Boolean(state.book));
   $("playback-seed").textContent = `Seed ${start.seed}${start.seed_mode === "random" ? " · 本次随机" : ""}`;
@@ -1278,10 +1345,16 @@ async function playStreamingAudio(start) {
   }
   const audioContext = state.audioContext;
   await audioContext.resume();
+  if (state.stopped || runId !== state.streamRunId) {
+    throw new DOMException("Stopped", "AbortError");
+  }
   $("play-toggle").textContent = "Ⅱ";
   state.streamAbort = new AbortController();
   const response = await fetch(`/api/generate-stream/${start.job_id}/audio`, { signal: state.streamAbort.signal });
   if (!response.ok || !response.body) throw new Error(await response.text());
+  if (state.stopped || runId !== state.streamRunId) {
+    throw new DOMException("Stopped", "AbortError");
+  }
   const playbackEpoch = Number(response.headers.get("X-Playback-Epoch"));
   if (Number.isFinite(playbackEpoch)) state.playbackEpoch = playbackEpoch;
   // The /start response carries the profile's real PCM format and is race-free;
@@ -1403,6 +1476,7 @@ async function stopPlayback(markStopped = true) {
   state.qualityAudio.pause();
   state.qualityAudio.removeAttribute("src");
   state.qualityAudio.load();
+  await releaseContinuousListening();
   await releaseMediaPlayback();
   if (state.streamAbort) state.streamAbort.abort();
   state.streamAbort = null;
@@ -1614,6 +1688,12 @@ function bindEvents() {
     }
   });
   window.addEventListener("pagehide", () => {
+    if (state.listeningSessionId) {
+      navigator.sendBeacon(
+        `/api/listening/${encodeURIComponent(state.listeningSessionId)}/release`,
+        new Blob([], { type: "application/octet-stream" })
+      );
+    }
     const ephemeralJobs = [...state.qualityJobs];
     for (const jobId of ephemeralJobs) {
       navigator.sendBeacon(

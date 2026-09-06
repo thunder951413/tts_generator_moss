@@ -11,6 +11,7 @@ read through the context (``ctx.tts_enabled``) so updates are visible.
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 from typing import Any, Callable
 
 
@@ -61,3 +62,8 @@ class ServiceContext:
         self.preset_payload = preset_payload
         self.remove_generated_result_files = remove_generated_result_files
         self.tts_enabled = tts_enabled
+        self.stopping = False
+        self.tts_epoch = 0
+        self.stt_epoch = 0
+        self.stt_requests = 0
+        self.control_lock = asyncio.Lock()
