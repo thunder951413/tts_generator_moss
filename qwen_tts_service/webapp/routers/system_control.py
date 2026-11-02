@@ -30,6 +30,7 @@ from runtime_manager import (
 from stt_runtime import STTUnavailableError
 
 from streaming_jobs import DEFAULT_MAX_NEW_TOKENS
+from service_identity import API_VERSION, BUILD_ID, CAPABILITIES
 
 def register_system_control_routes(app, ctx):
     runtime_manager = ctx.runtime_manager
@@ -67,10 +68,10 @@ def register_system_control_routes(app, ctx):
                 stopped_jobs = jobs.close_all()
                 stopped_projects = document_projects.stop_all()
                 interrupted_workers, stt_stopped = await asyncio.gather(
-                    asyncio.to_thread(runtime_manager.interrupt_active),
-                    asyncio.to_thread(stt_runtime.close),
+                    ctx.run_blocking(runtime_manager.interrupt_active),
+                    ctx.run_blocking(stt_runtime.close),
                 )
-                await asyncio.to_thread(runtime_manager.close)
+                await ctx.run_blocking(runtime_manager.close)
             finally:
                 ctx.stopping = False
         return JSONResponse(
@@ -100,8 +101,8 @@ def register_system_control_routes(app, ctx):
                 stopped_jobs = jobs.close_all()
                 stopped_projects = document_projects.stop_all()
                 # Job cancellation handles TTS waiters; STT requests remain valid.
-                interrupted = await asyncio.to_thread(runtime_manager.interrupt_active)
-                await asyncio.to_thread(runtime_manager.close)
+                interrupted = await ctx.run_blocking(runtime_manager.interrupt_active)
+                await ctx.run_blocking(runtime_manager.close)
             finally:
                 ctx.stopping = False
         return JSONResponse(
@@ -137,7 +138,7 @@ def register_system_control_routes(app, ctx):
                     pass
 
         try:
-            await asyncio.to_thread(warm_runtime)
+            await ctx.run_blocking(warm_runtime)
         except Exception as exc:  # noqa: BLE001
             if epoch == ctx.tts_epoch:
                 ctx.tts_enabled = False
@@ -152,7 +153,7 @@ def register_system_control_routes(app, ctx):
         if not stt_enabled:
             raise HTTPException(status_code=503, detail="STT is disabled")
         ctx.stt_epoch += 1
-        await asyncio.to_thread(stt_runtime.close)
+        await ctx.run_blocking(stt_runtime.close)
         return JSONResponse({"ok": True, "stt": stt_runtime.status()})
 
     @app.post("/api/stt/start")
@@ -171,10 +172,28 @@ def register_system_control_routes(app, ctx):
             ):
                 stt_runtime.start()
         try:
-            await asyncio.to_thread(warm_stt)
+            await ctx.run_blocking(warm_stt)
         except (STTUnavailableError, RuntimeError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "stt": stt_runtime.status()})
+
+    # Health is polled constantly (menu-bar app, reader). Every component
+    # status below is served from in-memory/cached state: no network probes
+    # or filesystem walks run on the event loop.
+    def _stt_status() -> dict[str, Any]:
+        if not stt_enabled:
+            return {"state": "disabled", "ready": False, "available": False}
+        return stt_runtime.status()
+
+    def _shared_status() -> dict[str, Any]:
+        return {
+            "generation_scheduler": {
+                **generation_scheduler.status(),
+                "document_parallel": document_projects.synthesis_workers,
+            },
+            "playback": playback_coordinator.status(),
+            "stt": _stt_status(),
+        }
 
     @app.get("/api/runtime")
     async def runtime_info() -> JSONResponse:
@@ -189,24 +208,13 @@ def register_system_control_routes(app, ctx):
                 "dtype": runtime_manager.dtype,
                 "attn_implementation": runtime_manager.attn_implementation,
                 "runtime": runtime_manager.status(),
-                "generation_scheduler": {
-                    **generation_scheduler.status(),
-                    "document_parallel": document_projects.synthesis_workers,
-                },
-                "playback": playback_coordinator.status(),
-                "stt": stt_runtime.status() if stt_enabled else {
-                    "state": "disabled",
-                    "ready": False,
-                    "available": False,
-                },
+                **_shared_status(),
             }
         )
 
     @app.get("/api/stt/status")
     async def stt_status() -> JSONResponse:
-        if not stt_enabled:
-            return JSONResponse({"state": "disabled", "ready": False, "available": False})
-        return JSONResponse(stt_runtime.status())
+        return JSONResponse(_stt_status())
 
     @app.post("/v1/audio/transcriptions")
     async def transcribe_audio(
@@ -232,10 +240,21 @@ def register_system_control_routes(app, ctx):
         work = None
         try:
             # Multipart uploads are already disk-spooled by Starlette. Keep
-            # waiters on that spool rather than retaining 16 x 500 MB in RAM.
-            if file.size is not None and file.size > 500 * 1024 * 1024:
+            # waiters on that spool rather than retaining 16 x 500 MB in RAM,
+            # and stream it to whisper.cpp instead of copying it into memory.
+            def spooled_size() -> int:
+                handle = file.file
+                position = handle.tell()
+                try:
+                    handle.seek(0, 2)
+                    return int(handle.tell())
+                finally:
+                    handle.seek(position)
+
+            upload_size = file.size if file.size is not None else await asyncio.to_thread(spooled_size)
+            if upload_size > 500 * 1024 * 1024:
                 raise HTTPException(status_code=413, detail="audio file exceeds 500 MB")
-            if file.size == 0:
+            if upload_size == 0:
                 raise HTTPException(status_code=400, detail="audio file is empty")
 
             def cancelled() -> bool:
@@ -247,18 +266,9 @@ def register_system_control_routes(app, ctx):
                 ):
                     if cancelled():
                         raise RuntimeError("STT 请求已取消")
-                    audio = bytearray()
                     file.file.seek(0)
-                    while chunk := file.file.read(1024 * 1024):
-                        if cancelled():
-                            raise RuntimeError("STT 请求已取消")
-                        audio.extend(chunk)
-                        if len(audio) > 500 * 1024 * 1024:
-                            raise HTTPException(status_code=413, detail="audio file exceeds 500 MB")
-                    if not audio:
-                        raise HTTPException(status_code=400, detail="audio file is empty")
                     result = stt_runtime.transcribe(
-                        audio=audio, filename=file.filename or "audio.wav",
+                        audio=file.file, audio_size=upload_size, filename=file.filename or "audio.wav",
                         language=(language or "auto").strip(),
                         prompt=(prompt or "").strip(), response_format=response_format,
                         cancelled=cancelled,
@@ -267,7 +277,7 @@ def register_system_control_routes(app, ctx):
                         raise RuntimeError("STT 请求已取消")
                     return result
 
-            work = asyncio.create_task(asyncio.to_thread(transcribe_when_idle))
+            work = ctx.run_blocking(transcribe_when_idle)
             while not work.done():
                 await asyncio.wait({work}, timeout=0.2)
                 if await request.is_disconnected():
@@ -291,17 +301,11 @@ def register_system_control_routes(app, ctx):
         return JSONResponse(
             {
                 **runtime_manager.status(),
+                "service": {"name": "qwen-local-speech", "api_version": API_VERSION,
+                            "build_id": BUILD_ID, "capabilities": CAPABILITIES},
+                "storage": app.state.storage_policy.status(),
                 "tts_enabled": ctx.tts_enabled,
-                "generation_scheduler": {
-                    **generation_scheduler.status(),
-                    "document_parallel": document_projects.synthesis_workers,
-                },
-                "playback": playback_coordinator.status(),
-                "stt": stt_runtime.status() if stt_enabled else {
-                    "state": "disabled",
-                    "ready": False,
-                    "available": False,
-                },
+                **_shared_status(),
             }
         )
 

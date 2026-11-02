@@ -19,11 +19,36 @@ def _now() -> float:
     return time.time()
 
 
-def _atomic_write(path: Path, value: dict[str, Any]) -> None:
+def atomic_write_text(path: Path, text: str) -> None:
+    """Crash-safe replace: unique temp file in the same dir, fsync, rename.
+
+    A unique name keeps concurrent writers of the same path from truncating
+    each other's temp file; fsync before rename avoids an empty file after a
+    power loss.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path: Path, value: Any, *, indent: int | None = 2) -> None:
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=indent))
+
+
+def _atomic_write(path: Path, value: dict[str, Any]) -> None:
+    atomic_write_json(path, value)
 
 
 class VoicePresetStore:

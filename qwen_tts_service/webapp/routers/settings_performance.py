@@ -261,7 +261,7 @@ def register_settings_performance_routes(app, ctx):
             or DEFAULT_MODEL_PROFILE
         )
         try:
-            result = await asyncio.to_thread(run_performance_benchmark, profile_id, ctx.tts_epoch)
+            result = await ctx.run_blocking(run_performance_benchmark, profile_id, ctx.tts_epoch)
             return JSONResponse(result)
         except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

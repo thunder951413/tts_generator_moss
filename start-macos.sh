@@ -34,6 +34,14 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
 fi
 
 mkdir -p "$LOG_DIR"
+# Python logging rotates logs/service.log itself; keep the raw stdout/stderr
+# captures bounded too (they only hold startup output and crashes now).
+for captured in "$LOG_DIR/service.out.log" "$LOG_DIR/service.err.log"; do
+  if [[ -f "$captured" && $(wc -c <"$captured") -gt 5242880 ]]; then
+    mv -f "$captured" "$captured.1"
+  fi
+done
+export QWEN_TTS_LOG_DIR="${QWEN_TTS_LOG_DIR:-$LOG_DIR}"
 export QWEN_TTS_PYTHON="$ROOT/.venv/bin/python"
 export QWEN_TTS_BACKEND="ggml"
 export QWENTTS_CPP_LIBRARY="$LIBQWEN"

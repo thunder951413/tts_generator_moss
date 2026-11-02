@@ -6,14 +6,35 @@ import SwiftUI
 private let serviceSessionCookie = "qwen_tts_service_session"
 
 final class LocalService {
+    /// Lifecycle of the service this app manages. Mutated only on the main queue.
+    enum LifecycleState {
+        case idle
+        case starting
+        case running
+        case stopping
+    }
+
     let repositoryRoot: URL
     private(set) var configuration: [String: String]
     private(set) var port: Int
     private(set) var ownsProcess = false
     private var process: Process?
+    // hasReachedReady / lastExitStatus / lifecycle state are confined to the main queue.
     private var hasReachedReady = false
     private var lastExitStatus: Int32?
+    private(set) var lifecycleState: LifecycleState = .idle
+    private var pendingStartCompletions: [(Result<[String: Any], Error>) -> Void] = []
     var onUnexpectedTermination: ((Int32) -> Void)?
+
+    private static let logQueue = DispatchQueue(label: "qwen-local-service-log")
+    // Both are only touched on logQueue.
+    private static let logTimestampFormatter = ISO8601DateFormatter()
+    private static var logHandles: [String: FileHandle] = [:]
+
+    /// True while a start (or a restart after changed settings) is in progress.
+    var isStarting: Bool {
+        lifecycleState == .starting || lifecycleState == .stopping
+    }
 
     var baseURL: URL {
         URL(string: "http://127.0.0.1:\(port)/")!
@@ -123,16 +144,108 @@ final class LocalService {
         }
     }
 
+    static func sourceBuildID(repositoryRoot: URL) -> String? {
+        let repositoryRoot = repositoryRoot.resolvingSymlinksInPath().standardizedFileURL
+        var files: [(relative: String, url: URL)] = []
+        for directory in ["qwen_tts_service", "web/novel_reader"] {
+            let directoryURL = repositoryRoot.appendingPathComponent(directory)
+            guard let entries = FileManager.default.enumerator(atPath: directoryURL.path) else { return nil }
+            for case let entry as String in entries {
+                let relative = "\(directory)/\(entry)"
+                let file = repositoryRoot.appendingPathComponent(relative)
+                if ["py", "js", "html", "css"].contains(file.pathExtension),
+                   (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                    files.append((relative, file))
+                }
+            }
+        }
+        var digest = SHA256()
+        for file in files.sorted(by: { $0.relative < $1.relative }) {
+            guard let data = try? Data(contentsOf: file.url) else { return nil }
+            digest.update(data: Data(file.relative.utf8))
+            digest.update(data: Data([0]))
+            digest.update(data: data)
+            digest.update(data: Data([0]))
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    func compatibilityError(_ status: [String: Any]) -> Error? {
+        guard let identity = status["service"] as? [String: Any],
+              identity["name"] as? String == "qwen-local-speech",
+              identity["api_version"] as? Int == 2,
+              let capabilities = identity["capabilities"] as? [String],
+              Set(["worker-auth", "bounded-worker-recovery", "resumable-reader", "storage-policy"]).isSubset(of: Set(capabilities)),
+              let buildID = Self.sourceBuildID(repositoryRoot: repositoryRoot),
+              identity["build_id"] as? String == buildID else {
+            return ServiceError.incompatibleService
+        }
+        return nil
+    }
+
+    /// Starts (or attaches to) the local service. Concurrent callers are coalesced onto the
+    /// one in-flight start so a second process can never replace and orphan the first.
+    /// Completions are delivered on the main queue.
     func startIfNeeded(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.startIfNeeded(completion: completion)
+            }
+            return
+        }
+        pendingStartCompletions.append(completion)
+        guard pendingStartCompletions.count == 1 else {
+            log("service start already in progress; waiting for it")
+            return
+        }
+        lifecycleState = .starting
         log("checking local service")
         health { [weak self] status in
-            if let status {
-                self?.log("using existing local service")
-                completion(.success(status))
-                return
+            guard let self else { return }
+            // Hashing the source tree is comparatively slow, keep it off the main queue.
+            let incompatibility: Error? = status.flatMap { self.compatibilityError($0) }
+            DispatchQueue.main.async {
+                if let status {
+                    if let incompatibility {
+                        self.finishStart(.failure(incompatibility))
+                        return
+                    }
+                    self.log("using existing local service")
+                    self.finishStart(.success(status))
+                    return
+                }
+                if self.ownsProcess, self.process?.isRunning == true {
+                    // Our own process is alive but not answering yet; wait for it instead of
+                    // launching a second one on the same port.
+                    self.log("owned service process still running; waiting for health")
+                    self.waitUntilReady(remainingAttempts: 660) { [weak self] result in
+                        self?.finishStart(result)
+                    }
+                    return
+                }
+                self.log("local service unavailable; starting owned process")
+                self.start { [weak self] result in
+                    self?.finishStart(result)
+                }
             }
-            self?.log("local service unavailable; starting owned process")
-            self?.start(completion: completion)
+        }
+    }
+
+    private func finishStart(_ result: Result<[String: Any], Error>) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.finishStart(result) }
+            return
+        }
+        switch result {
+        case .success:
+            lifecycleState = .running
+        case .failure:
+            lifecycleState = ownsRunningProcess ? .running : .idle
+        }
+        let completions = pendingStartCompletions
+        pendingStartCompletions = []
+        for completion in completions {
+            completion(result)
         }
     }
 
@@ -143,6 +256,10 @@ final class LocalService {
         corsOrigins: String,
         completion: @escaping (Result<[String: Any], Error>) -> Void
     ) {
+        guard pendingStartCompletions.isEmpty, lifecycleState != .stopping else {
+            completion(.failure(ServiceError.serviceBusy))
+            return
+        }
         guard (1024 ... 65_535).contains(newPort) else {
             completion(.failure(ServiceError.invalidPort))
             return
@@ -175,12 +292,19 @@ final class LocalService {
         }
         ownsProcess = false
         process = nil
+        // Any start requested while the old process shuts down joins this restart.
+        lifecycleState = .stopping
+        pendingStartCompletions.append(completion)
         runningProcess.terminate()
         log("restarting owned service after external API settings changed")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             runningProcess.waitUntilExit()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                self?.start(completion: completion)
+                guard let self else { return }
+                self.lifecycleState = .starting
+                self.start { [weak self] result in
+                    self?.finishStart(result)
+                }
             }
         }
     }
@@ -221,18 +345,26 @@ final class LocalService {
         let logsDirectory = repositoryRoot.appendingPathComponent("logs")
         try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
         let logURL = logsDirectory.appendingPathComponent("macos-app-service.log")
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        Self.rotateServiceLogIfNeeded(logURL)
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
         let logHandle = try? FileHandle(forWritingTo: logURL)
         logHandle?.seekToEndOfFile()
         process.standardOutput = logHandle
         process.standardError = logHandle
         process.terminationHandler = { [weak self] terminated in
+            // The child keeps its own descriptor; release the app's copy.
+            try? logHandle?.close()
             DispatchQueue.main.async {
                 guard let self, self.ownsProcess, self.process === terminated else { return }
                 let shouldRecover = self.hasReachedReady
                 self.lastExitStatus = terminated.terminationStatus
                 self.ownsProcess = false
                 self.process = nil
+                if self.lifecycleState == .running {
+                    self.lifecycleState = .idle
+                }
                 self.log("owned service exited unexpectedly with status \(terminated.terminationStatus)")
                 if shouldRecover {
                     self.onUnexpectedTermination?(terminated.terminationStatus)
@@ -246,7 +378,7 @@ final class LocalService {
             log("started service process pid=\(process.processIdentifier)")
             self.process = process
             ownsProcess = true
-            waitUntilReady(remainingAttempts: 80, completion: completion)
+            waitUntilReady(remainingAttempts: 660, completion: completion)
         } catch {
             log("could not start service: \(error.localizedDescription)")
             completion(.failure(error))
@@ -258,22 +390,37 @@ final class LocalService {
         completion: @escaping (Result<[String: Any], Error>) -> Void
     ) {
         health { [weak self] status in
-            if let status, status["state"] as? String == "ready" {
-                self?.hasReachedReady = true
-                completion(.success(status))
-                return
+            guard let self else { return }
+            let readyStatus: [String: Any]?
+            if let status, ["ready", "degraded"].contains(status["state"] as? String ?? "") {
+                readyStatus = status
+            } else {
+                readyStatus = nil
             }
-            if let status = self?.lastExitStatus {
-                completion(.failure(ServiceError.serviceExited(status)))
-                return
-            }
-            guard remainingAttempts > 0 else {
-                self?.log("timed out while waiting for service health")
-                completion(.failure(ServiceError.startTimedOut))
-                return
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self?.waitUntilReady(remainingAttempts: remainingAttempts - 1, completion: completion)
+            let incompatibility: Error? = readyStatus.flatMap { self.compatibilityError($0) }
+            // Readiness bookkeeping is shared with the termination handler; keep it on main.
+            DispatchQueue.main.async {
+                if let readyStatus {
+                    if let incompatibility {
+                        completion(.failure(incompatibility))
+                        return
+                    }
+                    self.hasReachedReady = true
+                    completion(.success(readyStatus))
+                    return
+                }
+                if let exitStatus = self.lastExitStatus {
+                    completion(.failure(ServiceError.serviceExited(exitStatus)))
+                    return
+                }
+                guard remainingAttempts > 0 else {
+                    self.log("timed out while waiting for service health")
+                    completion(.failure(ServiceError.startTimedOut))
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    self?.waitUntilReady(remainingAttempts: remainingAttempts - 1, completion: completion)
+                }
             }
         }
     }
@@ -282,24 +429,49 @@ final class LocalService {
         guard ownsProcess, let process, process.isRunning else { return }
         ownsProcess = false
         self.process = nil
+        lifecycleState = .idle
+        if !pendingStartCompletions.isEmpty {
+            // The termination handler ignores processes we no longer own, so tell a pending
+            // waitUntilReady loop directly instead of letting it poll for minutes.
+            lastExitStatus = SIGTERM
+        }
         process.terminate()
         log("stopped owned service process")
     }
 
+    /// Keeps one previous generation of the service log once it grows past 10 MB.
+    private static func rotateServiceLogIfNeeded(_ logURL: URL) {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+              let size = attributes[.size] as? NSNumber,
+              size.int64Value > 10 * 1024 * 1024
+        else { return }
+        let rotatedURL = logURL.appendingPathExtension("1")
+        try? FileManager.default.removeItem(at: rotatedURL)
+        try? FileManager.default.moveItem(at: logURL, to: rotatedURL)
+    }
+
     private func log(_ message: String) {
         let logsDirectory = repositoryRoot.appendingPathComponent("logs")
-        try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
         let logURL = logsDirectory.appendingPathComponent("macos-app.log")
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logURL.path),
-               let handle = try? FileHandle(forWritingTo: logURL) {
-                handle.seekToEndOfFile()
-                try? handle.write(contentsOf: data)
-                try? handle.close()
-            } else {
-                try? data.write(to: logURL, options: .atomic)
+        let date = Date()
+        LocalService.logQueue.async {
+            let line = "[\(LocalService.logTimestampFormatter.string(from: date))] \(message)\n"
+            guard let data = line.data(using: .utf8) else { return }
+            let key = logURL.path
+            var openHandle = LocalService.logHandles[key]
+            if openHandle == nil {
+                try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+                if !FileManager.default.fileExists(atPath: key) {
+                    FileManager.default.createFile(atPath: key, contents: nil)
+                }
+                if let created = try? FileHandle(forWritingTo: logURL) {
+                    created.seekToEndOfFile()
+                    LocalService.logHandles[key] = created
+                    openHandle = created
+                }
             }
+            guard let handle = openHandle else { return }
+            try? handle.write(contentsOf: data)
         }
     }
 
@@ -349,7 +521,130 @@ final class LocalService {
     }
 }
 
+/// Single adaptive poller for `api/health`. Every consumer (menu bar, studio, STT workbench)
+/// observes the latest snapshot instead of issuing its own requests. Main-queue only.
+final class ServiceHealthMonitor {
+    private let service: LocalService
+    private var observers: [([String: Any]?) -> Void] = []
+    private var timer: Timer?
+    private var requestInFlight = false
+    private var refreshQueuedWhileInFlight = false
+    private var consecutiveFailures = 0
+    private var running = false
+    private(set) var latest: [String: Any]?
+
+    /// True while something the user is waiting on is changing (start/stop/toggle/generation).
+    var isTransitioning: () -> Bool = { false }
+    /// True while a window is visible or the status menu is open.
+    var isForeground: () -> Bool = { false }
+
+    init(service: LocalService) {
+        self.service = service
+    }
+
+    func addObserver(_ observer: @escaping ([String: Any]?) -> Void) {
+        observers.append(observer)
+    }
+
+    func start() {
+        guard !running else { return }
+        running = true
+        schedule(after: 0.5)
+    }
+
+    func stop() {
+        running = false
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// Requests one immediate refresh. Bursts collapse into the request already in flight
+    /// plus at most one follow-up.
+    func refreshNow() {
+        guard running else { return }
+        if requestInFlight {
+            refreshQueuedWhileInFlight = true
+            return
+        }
+        timer?.invalidate()
+        timer = nil
+        poll()
+    }
+
+    /// Pulls the next tick forward when activity starts (never pushes it back).
+    func refreshSoon() {
+        guard running, !requestInFlight else { return }
+        let soon = Date().addingTimeInterval(1.5)
+        if let fireDate = timer?.fireDate, fireDate <= soon { return }
+        schedule(after: 1.5)
+    }
+
+    private func schedule(after interval: TimeInterval) {
+        timer?.invalidate()
+        let next = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.timer = nil
+            if !self.requestInFlight {
+                self.poll()
+            }
+        }
+        next.tolerance = max(0.1, interval * 0.2)
+        RunLoop.main.add(next, forMode: .common)
+        timer = next
+    }
+
+    private func poll() {
+        requestInFlight = true
+        service.health { [weak self] payload in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.requestInFlight = false
+                self.latest = payload
+                self.consecutiveFailures = payload == nil ? self.consecutiveFailures + 1 : 0
+                for observer in self.observers {
+                    observer(payload)
+                }
+                guard self.running else { return }
+                if self.refreshQueuedWhileInFlight {
+                    self.refreshQueuedWhileInFlight = false
+                    self.poll()
+                    return
+                }
+                self.schedule(after: self.nextInterval(payload))
+            }
+        }
+    }
+
+    private func nextInterval(_ payload: [String: Any]?) -> TimeInterval {
+        let foreground = isForeground()
+        if isTransitioning() {
+            return 1.5
+        }
+        guard let payload else {
+            // Unreachable: back off 2 → 4 → 8 → 30 s.
+            let backoff: [TimeInterval] = [2, 4, 8, 30]
+            return backoff[min(max(consecutiveFailures, 1), backoff.count) - 1]
+        }
+        let state = payload["state"] as? String ?? "unknown"
+        let scheduler = payload["generation_scheduler"] as? [String: Any]
+        let active = (scheduler?["active"] as? NSNumber)?.intValue ?? 0
+        var waiting = 0
+        for key in ["waiting_interactive", "waiting_document", "waiting_external", "waiting_stt"] {
+            let count = (scheduler?[key] as? NSNumber)?.intValue ?? 0
+            waiting += count
+        }
+        let sttActive = (scheduler?["stt_active"] as? NSNumber)?.boolValue ?? false
+        let ttsEnabled = (payload["tts_enabled"] as? NSNumber)?.boolValue ?? true
+        let settling = ttsEnabled && ["loading", "starting", "recovering", "restarting"].contains(state)
+        if active > 0 || waiting > 0 || sttActive || settling {
+            return foreground ? 1.5 : 5
+        }
+        return foreground ? 5 : 30
+    }
+}
+
 private enum ServiceError: LocalizedError {
+    case incompatibleService
     case runtimeMissing(String)
     case startTimedOut
     case invalidPort
@@ -357,13 +652,16 @@ private enum ServiceError: LocalizedError {
     case restartRequired
     case serviceNotOwned
     case serviceExited(Int32)
+    case serviceBusy
 
     var errorDescription: String? {
         switch self {
+        case .incompatibleService:
+            return "当前端口的服务版本与此应用目录不一致。请重启该目录的后台服务，再启动应用。"
         case .runtimeMissing(let root):
             return "找不到 Metal 运行环境。请先在以下目录运行 ./setup-macos.sh：\n\(root)"
         case .startTimedOut:
-            return "本地语音服务在 40 秒内没有就绪。请查看 logs/macos-app-service.log。"
+            return "本地语音服务在 330 秒内没有就绪。请查看模型下载进度及 logs/macos-app-service.log。"
         case .invalidPort:
             return "端口必须在 1024 到 65535 之间。"
         case .insecureLANPassword:
@@ -374,6 +672,8 @@ private enum ServiceError: LocalizedError {
             return "当前服务不是由本应用启动，不能从菜单栏停止。"
         case .serviceExited(let status):
             return "本地语音服务启动后立即退出（状态 \(status)）。请检查端口是否被占用及 logs/macos-app-service.log。"
+        case .serviceBusy:
+            return "本地语音服务正在启动或重启，请稍后再试。"
         }
     }
 }
@@ -393,7 +693,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var presetsMenu: NSMenu!
     private var window: NSWindow!
     private var sttWindow: NSWindow!
-    private var statusTimer: Timer?
+    private let healthMonitor: ServiceHealthMonitor
+    private var statusMenuIsOpen = false
+    private var lastHealthReachable = false
+    private var lastMenuMetadataRefresh: Date?
     private var isTerminating = false
     private var isForceStopping = false
     private let launchInBackground = CommandLine.arguments.contains("--background")
@@ -403,7 +706,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         self.service = service
         self.viewModel = NativeStudioViewModel(service: service)
         self.sttViewModel = STTWorkbenchViewModel(service: service)
+        self.healthMonitor = ServiceHealthMonitor(service: service)
         super.init()
+        healthMonitor.addObserver { [weak self] health in
+            self?.handleHealthSnapshot(health)
+        }
+        healthMonitor.isTransitioning = { [weak self] in
+            guard let self else { return false }
+            return self.service.isStarting
+                || self.isForceStopping
+                || self.viewModel.isTogglingTTS
+                || self.viewModel.isTogglingSTT
+                || self.viewModel.isGenerating
+                || self.sttViewModel.isProcessing
+        }
+        healthMonitor.isForeground = { [weak self] in
+            guard let self else { return false }
+            return self.statusMenuIsOpen
+                || (self.window?.isVisible ?? false)
+                || (self.sttWindow?.isVisible ?? false)
+        }
+        sttViewModel.requestHealthRefresh = { [weak self] in
+            self?.healthMonitor.refreshNow()
+        }
         viewModel.onTTSServiceToggleRequested = { [weak self] in
             self?.requestTTSRuntimeToggle()
         }
@@ -428,7 +753,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                         case .success(let health):
                             self?.applyServiceHealth(health)
                             self?.viewModel.updateHealth(health)
-                            self?.viewModel.loadInitialData()
+                            // Keep unsaved editor settings; only refresh metadata.
+                            self?.viewModel.reloadAfterServiceRestart()
                         case .failure(let error):
                             self?.updateMenuStatus("自动恢复失败（\(status)）")
                             self?.presentError(error)
@@ -458,20 +784,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }
             }
         }
-        statusTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            self?.refreshHealth()
-        }
+        healthMonitor.start()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func systemDidWake(_ notification: Notification) {
+        healthMonitor.refreshNow()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         isTerminating = true
-        statusTimer?.invalidate()
+        healthMonitor.stop()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         service.stopIfOwned()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
         return false
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        healthMonitor.refreshNow()
     }
 
     private func buildWindow() {
@@ -616,8 +955,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         )
         apiSettingsItem.target = self
         menu.addItem(apiSettingsItem)
-        let presetItem = NSMenuItem(title: "切换语音预设", action: nil, keyEquivalent: "")
-        presetsMenu = NSMenu(title: "切换语音预设")
+        let presetItem = NSMenuItem(title: "服务默认音色", action: nil, keyEquivalent: "")
+        presetsMenu = NSMenu(title: "服务默认音色")
         presetItem.submenu = presetsMenu
         menu.addItem(presetItem)
         let refreshItem = NSMenuItem(title: "刷新状态和预设", action: #selector(refreshFromMenu(_:)), keyEquivalent: "r")
@@ -663,54 +1002,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func makeTTSStatusIcon() -> NSImage {
-        let size = NSSize(width: 27, height: 16)
-        let image = NSImage(size: size, flipped: false) { rect in
-            let style = NSMutableParagraphStyle()
-            style.alignment = .center
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 9.7, weight: .bold),
-                .foregroundColor: NSColor.labelColor,
-                .kern: -0.45,
-                .paragraphStyle: style,
-            ]
-            let text = NSAttributedString(string: "TTS", attributes: attributes)
-            let textSize = text.size()
-            let textRect = NSRect(
-                x: rect.midX - textSize.width / 2,
-                y: rect.midY - textSize.height / 2 + 0.5,
-                width: textSize.width,
-                height: textSize.height
-            )
-            text.draw(in: textRect)
+        // A speech bubble with a waveform stays legible at menu-bar scale.
+        // Draw in points so AppKit can rasterize the template at any display scale.
+        let size = NSSize(width: 20, height: 18)
+        let image = NSImage(size: size, flipped: false) { _ in
+            NSColor.black.setStroke()
+            let bubble = NSBezierPath()
+            bubble.lineWidth = 1.5
+            bubble.lineCapStyle = .round
+            bubble.lineJoinStyle = .round
+            bubble.move(to: NSPoint(x: 5.25, y: 16.25))
+            bubble.line(to: NSPoint(x: 14.75, y: 16.25))
+            bubble.curve(to: NSPoint(x: 18.25, y: 12.75),
+                         controlPoint1: NSPoint(x: 16.75, y: 16.25),
+                         controlPoint2: NSPoint(x: 18.25, y: 14.75))
+            bubble.line(to: NSPoint(x: 18.25, y: 8.5))
+            bubble.curve(to: NSPoint(x: 14.75, y: 5),
+                         controlPoint1: NSPoint(x: 18.25, y: 6.5),
+                         controlPoint2: NSPoint(x: 16.75, y: 5))
+            bubble.line(to: NSPoint(x: 8.5, y: 5))
+            bubble.line(to: NSPoint(x: 4.75, y: 2.25))
+            bubble.line(to: NSPoint(x: 4.75, y: 5.05))
+            bubble.curve(to: NSPoint(x: 1.75, y: 8.5),
+                         controlPoint1: NSPoint(x: 2.95, y: 5.25),
+                         controlPoint2: NSPoint(x: 1.75, y: 6.65))
+            bubble.line(to: NSPoint(x: 1.75, y: 12.75))
+            bubble.curve(to: NSPoint(x: 5.25, y: 16.25),
+                         controlPoint1: NSPoint(x: 1.75, y: 14.75),
+                         controlPoint2: NSPoint(x: 3.25, y: 16.25))
+            bubble.close()
+            bubble.stroke()
+
+            let waveform = NSBezierPath()
+            waveform.lineWidth = 1.75
+            waveform.lineCapStyle = .round
+            for (x, height): (CGFloat, CGFloat) in [(6.5, 3), (10, 6), (13.5, 4)] {
+                waveform.move(to: NSPoint(x: x, y: 10.5 - height / 2))
+                waveform.line(to: NSPoint(x: x, y: 10.5 + height / 2))
+            }
+            waveform.stroke()
             return true
         }
         image.isTemplate = true
-        image.accessibilityDescription = "TTS"
+        image.accessibilityDescription = "Qwen TTS 语音工作台"
         return image
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        refreshHealth()
+        statusMenuIsOpen = true
+        healthMonitor.refreshNow()
+        refreshVoiceStatus()
+        // Presets and the applied voice change rarely; avoid a request burst on every open.
+        let now = Date()
+        if let last = lastMenuMetadataRefresh, now.timeIntervalSince(last) < 15 { return }
+        lastMenuMetadataRefresh = now
         refreshPresets()
         viewModel.loadActiveServiceSettings(applyingToEditor: false)
-        refreshVoiceStatus()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        statusMenuIsOpen = false
     }
 
     private func refreshHealth() {
-        service.health { [weak self] health in
-            DispatchQueue.main.async {
-                if let health {
-                    self?.applyServiceHealth(health)
-                    self?.viewModel.updateHealth(health)
-                }
-                else {
-                    self?.viewModel.serviceReady = false
-                    self?.viewModel.ttsReady = false
-                    self?.viewModel.sttReady = false
-                    self?.updateMenuStatus("服务未连接")
-                    self?.updateServiceMenuActions(isReachable: false)
-                }
-            }
+        healthMonitor.refreshNow()
+    }
+
+    private func handleHealthSnapshot(_ health: [String: Any]?) {
+        sttViewModel.applyHealth(health)
+        if let health {
+            applyServiceHealth(health)
+            viewModel.updateHealth(health)
+        } else {
+            viewModel.markServiceUnreachable()
+            updateMenuStatus(service.isStarting ? "正在启动本地服务…" : "服务未连接")
+            updateServiceMenuActions(isReachable: false)
         }
     }
 
@@ -723,7 +1089,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let sttReady = stt?["ready"] as? Bool ?? false
         let active = scheduler?["active"] as? Int ?? 0
         let maximum = scheduler?["max_parallel"] as? Int ?? 0
-        if state == "ready" || !ttsEnabled {
+        if state == "ready" || state == "degraded" || !ttsEnabled {
             serviceStatusItem?.title = ttsEnabled ? "服务：Metal 已连接" : "服务：HTTP 已连接 · TTS 已停止"
             modelStatusItem?.title = "当前模型：\(profile.isEmpty ? viewModel.modelDisplayName : profile)"
             taskStatusItem?.title = ttsEnabled && active > 0
@@ -750,8 +1116,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func updateServiceMenuActions(isReachable: Bool) {
-        startServiceMenuItem?.isEnabled = !isReachable
+        lastHealthReachable = isReachable
+        startServiceMenuItem?.isEnabled = !isReachable && !service.isStarting
         stopServiceMenuItem?.isEnabled = isReachable && service.ownsRunningProcess
+    }
+
+    /// The status menu auto-enables items, so the explicit isEnabled flags above only take
+    /// effect through this validation hook.
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem === startServiceMenuItem {
+            return !lastHealthReachable && !service.isStarting
+        }
+        if menuItem === stopServiceMenuItem {
+            return lastHealthReachable && service.ownsRunningProcess && !service.isStarting
+        }
+        return true
     }
 
     private func updateMenuStatus(_ text: String) {
@@ -787,6 +1166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ) { [weak self] in
             guard let self else { return }
             self.updateMenuStatus(shouldStart ? "正在启动 TTS…" : "正在停止 TTS…")
+            self.healthMonitor.refreshSoon()
             self.viewModel.setTTSService(enabled: shouldStart) { [weak self] result in
                 switch result {
                 case .success:
@@ -811,6 +1191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ) { [weak self] in
             guard let self else { return }
             self.updateMenuStatus(shouldStart ? "正在启动 STT…" : "正在停止 STT…")
+            self.healthMonitor.refreshSoon()
             self.viewModel.setSTTService(enabled: shouldStart) { [weak self] result in
                 switch result {
                 case .success:
@@ -833,6 +1214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func renderPresets(_ presets: [NativePreset]) {
+        guard presetsMenu != nil else { return }
         presetsMenu.removeAllItems()
         if presets.isEmpty {
             let empty = NSMenuItem(title: "尚无预设，请在工作台中保存", action: nil, keyEquivalent: "")
@@ -840,11 +1222,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             presetsMenu.addItem(empty)
             return
         }
+        let hint = NSMenuItem(title: "用于 API 调用与新导入的书；已导入的书不受影响", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        presetsMenu.addItem(hint)
+        if viewModel.serviceActivePresetID.isEmpty {
+            let custom = NSMenuItem(title: "工作台自定义：\(viewModel.appliedServiceVoiceName)", action: nil, keyEquivalent: "")
+            custom.state = .on
+            custom.isEnabled = false
+            presetsMenu.addItem(custom)
+        }
+        presetsMenu.addItem(.separator())
         for preset in presets {
             let item = NSMenuItem(title: preset.name, action: #selector(selectPreset(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = preset.id
-            item.state = preset.id == viewModel.selectedPresetID ? .on : .off
+            item.state = preset.id == viewModel.serviceActivePresetID ? .on : .off
             presetsMenu.addItem(item)
         }
     }
@@ -853,8 +1245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let presetID = sender.representedObject as? String,
               let preset = viewModel.presets.first(where: { $0.id == presetID })
         else { return }
-        viewModel.applyPreset(preset)
-        showStudio()
+        viewModel.makePresetServiceDefault(preset)
     }
 
     @objc private func openStudio(_ sender: Any?) { showStudio() }
@@ -875,7 +1266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func showSTTWorkbench() {
-        sttViewModel.refreshHealth()
+        healthMonitor.refreshNow()
         NSApp.activate(ignoringOtherApps: true)
         sttWindow.makeKeyAndOrderFront(nil)
     }
@@ -918,15 +1309,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             confirmTitle: "启动服务"
         ) { [weak self] in
             guard let self else { return }
+            guard !self.service.isStarting else {
+                self.updateMenuStatus("正在启动本地服务…")
+                return
+            }
             self.updateMenuStatus("正在启动本地服务…")
             self.updateServiceMenuActions(isReachable: false)
+            self.healthMonitor.refreshSoon()
             self.service.startIfNeeded { [weak self] result in
                 DispatchQueue.main.async {
                     switch result {
                     case .success(let health):
                         self?.applyServiceHealth(health)
                         self?.viewModel.updateHealth(health)
-                        self?.viewModel.loadInitialData()
+                        self?.viewModel.reloadAfterServiceRestart()
                     case .failure(let error):
                         self?.updateMenuStatus("服务启动失败")
                         self?.updateServiceMenuActions(isReachable: false)
@@ -953,11 +1349,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             self.viewModel.forceStopAllAudioAndComputation { [weak self] _ in
                 guard let self else { return }
                 self.service.stopIfOwned()
-                self.viewModel.serviceReady = false
-                self.viewModel.ttsReady = false
-                self.viewModel.sttReady = false
+                self.viewModel.markServiceUnreachable()
                 self.updateMenuStatus("本地服务已停止")
                 self.updateServiceMenuActions(isReachable: false)
+                self.healthMonitor.refreshSoon()
             }
         }
     }

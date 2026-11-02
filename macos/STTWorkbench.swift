@@ -43,7 +43,11 @@ final class STTWorkbenchViewModel: ObservableObject {
     @Published var sttReady = false
 
     let service: LocalService
+    /// When set (by the app delegate), health comes from the shared ServiceHealthMonitor.
+    var requestHealthRefresh: (() -> Void)?
     private var uploadTask: URLSessionUploadTask?
+    /// Identifies the newest transcription so a cancelled run cannot clear a newer run's state.
+    private var activeRunID: UUID?
 
     init(service: LocalService) {
         self.service = service
@@ -70,14 +74,24 @@ final class STTWorkbenchViewModel: ObservableObject {
     }
 
     func refreshHealth() {
+        if let requestHealthRefresh {
+            requestHealthRefresh()
+            return
+        }
         service.health { [weak self] payload in
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.serviceReachable = payload != nil
-                let stt = payload?["stt"] as? [String: Any]
-                self.sttReady = stt?["ready"] as? Bool ?? false
+                self?.applyHealth(payload)
             }
         }
+    }
+
+    /// Applies a health snapshot (nil = unreachable), publishing only real changes.
+    func applyHealth(_ payload: [String: Any]?) {
+        let reachable = payload != nil
+        let stt = payload?["stt"] as? [String: Any]
+        let ready = stt?["ready"] as? Bool ?? false
+        if serviceReachable != reachable { serviceReachable = reachable }
+        if sttReady != ready { sttReady = ready }
     }
 
     func chooseFile() {
@@ -119,6 +133,8 @@ final class STTWorkbenchViewModel: ObservableObject {
         let boundary = "----QwenSTT\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         let bodyURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-stt-upload-\(UUID().uuidString).multipart")
+        let runID = UUID()
+        activeRunID = runID
         isProcessing = true
         errorText = ""
         resultText = ""
@@ -136,7 +152,7 @@ final class STTWorkbenchViewModel: ObservableObject {
                 )
             } catch {
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.activeRunID == runID else { return }
                     self.isProcessing = false
                     self.errorText = "无法读取所选文件：\(error.localizedDescription)"
                     self.statusText = "处理失败"
@@ -144,20 +160,25 @@ final class STTWorkbenchViewModel: ObservableObject {
                 return
             }
             DispatchQueue.main.async {
-                guard let self, self.isProcessing else {
+                guard let self, self.isProcessing, self.activeRunID == runID else {
                     try? FileManager.default.removeItem(at: bodyURL)
+                    // Stopped while the upload body was being prepared.
+                    if let self, self.activeRunID == runID, !self.isProcessing {
+                        self.statusText = "已停止当前转写"
+                    }
                     return
                 }
                 self.startUpload(
                     bodyURL: bodyURL,
                     boundary: boundary,
-                    sourceKind: self.mediaKind
+                    sourceKind: self.mediaKind,
+                    runID: runID
                 )
             }
         }
     }
 
-    private func startUpload(bodyURL: URL, boundary: String, sourceKind: STTMediaKind) {
+    private func startUpload(bodyURL: URL, boundary: String, sourceKind: STTMediaKind, runID: UUID) {
         var request = service.authorizedRequest(
             "v1/audio/transcriptions",
             method: "POST",
@@ -170,7 +191,8 @@ final class STTWorkbenchViewModel: ObservableObject {
         let task = URLSession.shared.uploadTask(with: request, fromFile: bodyURL) { [weak self] data, response, error in
             try? FileManager.default.removeItem(at: bodyURL)
             DispatchQueue.main.async {
-                guard let self else { return }
+                // A newer transcription owns the shared state now; drop this stale result.
+                guard let self, self.activeRunID == runID else { return }
                 self.isProcessing = false
                 self.uploadTask = nil
                 if let error = error as? URLError, error.code == .cancelled {
@@ -356,7 +378,7 @@ struct STTWorkbenchView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        .onChange(of: model.mediaKind) { _ in model.clearSelection() }
+                        .onChange(of: model.mediaKind) { model.clearSelection() }
 
                         Button(action: model.chooseFile) {
                             HStack(spacing: StudioTokens.space3) {

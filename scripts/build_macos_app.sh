@@ -23,7 +23,10 @@ xcrun swiftc \
   "$ROOT/macos/NativeStudio.swift" \
   "$ROOT/macos/STTWorkbench.swift" \
   -o "$MACOS_DIR/QwenTTS" \
+  -O \
+  -whole-module-optimization \
   -parse-as-library \
+  -target "$(uname -m)-apple-macos14.0" \
   -framework AppKit \
   -framework AVFoundation \
   -framework CoreMedia \

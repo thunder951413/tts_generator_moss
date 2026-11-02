@@ -13,7 +13,11 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable, Iterator
+
+READY_REPROBE_SECONDS = 10.0
+AVAILABILITY_CACHE_SECONDS = 30.0
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class STTUnavailableError(RuntimeError):
@@ -54,6 +58,14 @@ class WhisperCppRuntime:
         self._started_at: float | None = None
         self._ready_at: float | None = None
         self._error: str | None = None
+        # status() is called from async routes (/api/health is polled), so it
+        # serves cached readiness: set when start() confirms the server, and
+        # re-probed by a background thread at most every READY_REPROBE_SECONDS.
+        self._ready_cached = False
+        self._ready_process: Any = None
+        self._ready_probed_at = 0.0
+        self._probe_running = False
+        self._availability_cache: tuple[float, bool, str | None, int | None] | None = None
 
     @property
     def base_url(self) -> str:
@@ -93,6 +105,44 @@ class WhisperCppRuntime:
             return False, f"Whisper model not found: {self.model}"
         return True, None
 
+    def _mark_ready(self, process: Any, ready: bool) -> None:
+        self._ready_cached = bool(ready)
+        self._ready_process = process if ready else None
+        self._ready_probed_at = time.monotonic()
+
+    def _cached_availability(self) -> tuple[bool, str | None, int | None]:
+        cached = self._availability_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < AVAILABILITY_CACHE_SECONDS:
+            return cached[1], cached[2], cached[3]
+        available, error = self.available()
+        try:
+            size = self.model.stat().st_size if self.model.is_file() else None
+        except OSError:
+            size = None
+        self._availability_cache = (now, available, error, size)
+        return available, error, size
+
+    def _reprobe_in_background(self, process: Any) -> None:
+        with self._condition:
+            if self._probe_running:
+                return
+            self._probe_running = True
+
+        def probe() -> None:
+            try:
+                ready = self._is_ready()
+                with self._condition:
+                    if self._process is process and process.poll() is None:
+                        self._mark_ready(process, ready)
+                    else:
+                        self._mark_ready(None, False)
+            finally:
+                with self._condition:
+                    self._probe_running = False
+
+        threading.Thread(target=probe, name="whisper-ready-probe", daemon=True).start()
+
     def _is_ready(self, *, timeout: float = 0.5) -> bool:
         try:
             with urllib.request.urlopen(f"{self.base_url}/", timeout=timeout) as response:
@@ -129,6 +179,7 @@ class WhisperCppRuntime:
                 self._starting = False
                 self._retiring = True
                 self._error = error
+                self._mark_ready(None, False)
                 log_handle = self._log_handle
             else:
                 return
@@ -169,6 +220,7 @@ class WhisperCppRuntime:
                     raise STTUnavailableError("STT runtime was stopped during startup")
                 current = self._process
                 if current is not None and current.poll() is None and self._is_ready():
+                    self._mark_ready(current, True)
                     return
                 if self._starting or self._retiring:
                     waited_for_start = self._starting
@@ -182,6 +234,7 @@ class WhisperCppRuntime:
                         raise STTUnavailableError("STT runtime was stopped during startup")
                     current = self._process
                     if current is not None and current.poll() is None and self._is_ready():
+                        self._mark_ready(current, True)
                         return
                     if waited_for_start:
                         raise STTUnavailableError(self._error or "STT runtime failed to start")
@@ -202,6 +255,11 @@ class WhisperCppRuntime:
                     try:
                         if self.log_path:
                             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                            try:
+                                if self.log_path.stat().st_size > 5 * 1024 * 1024:
+                                    os.replace(self.log_path, self.log_path.with_name(self.log_path.name + ".1"))
+                            except OSError:
+                                pass
                             log_handle = self.log_path.open("ab")
                         self._starting = True
                         epoch = self._lifecycle_epoch
@@ -261,6 +319,7 @@ class WhisperCppRuntime:
                         raise STTUnavailableError("STT runtime was stopped during startup")
                     self._ready_at = time.time()
                     self._starting = False
+                    self._mark_ready(process, True)
                     self._condition.notify_all()
                 return
             time.sleep(0.1)
@@ -284,6 +343,7 @@ class WhisperCppRuntime:
             self._starting = False
             self._retiring = process is not None
             self._ready_at = None
+            self._mark_ready(None, False)
         retired = process is None
         try:
             if process is not None:
@@ -304,11 +364,20 @@ class WhisperCppRuntime:
                     self._condition.notify_all()
 
     def status(self) -> dict[str, Any]:
-        available, availability_error = self.available()
+        """Non-blocking status: cached readiness, no HTTP probe inline."""
+        available, availability_error, model_size = self._cached_availability()
         with self._condition:
             process = self._process
+            ready_cached = self._ready_cached and self._ready_process is process
+            probe_due = time.monotonic() - self._ready_probed_at >= READY_REPROBE_SECONDS
+            starting = self._starting
         running = process is not None and process.poll() is None
-        ready = bool(running and self._is_ready())
+        if not running and self._ready_cached:
+            with self._condition:
+                self._mark_ready(None, False)
+        ready = bool(running and ready_cached)
+        if running and probe_due and not starting:
+            self._reprobe_in_background(process)
         return {
             "state": "ready" if ready else ("stopped" if available else "unavailable"),
             "ready": ready,
@@ -317,7 +386,7 @@ class WhisperCppRuntime:
             "backend": "whisper.cpp",
             "device": "metal",
             "model": str(self.model),
-            "model_size_bytes": self.model.stat().st_size if self.model.is_file() else None,
+            "model_size_bytes": model_size,
             "pid": process.pid if running else None,
             "host": self.host,
             "port": self.port,
@@ -367,18 +436,63 @@ class WhisperCppRuntime:
         parts.append(f"--{boundary}--\r\n".encode())
         return b"".join(parts), boundary
 
+    @staticmethod
+    def _multipart_stream(
+        *,
+        audio: BinaryIO,
+        audio_size: int,
+        filename: str,
+        language: str,
+        prompt: str,
+        response_format: str,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[Iterator[bytes], int, str]:
+        """Multipart body streamed from a (spooled) file, with exact length."""
+        head, boundary = WhisperCppRuntime._multipart(
+            audio=b"\x00", filename=filename, language=language, prompt=prompt,
+            response_format=response_format,
+        )
+        # Split the single-byte placeholder body around the audio payload.
+        marker = head.index(b"\r\n\r\n\x00\r\n") + 4
+        prefix, suffix = head[:marker], head[marker + 1:]
+
+        def body() -> Iterator[bytes]:
+            yield prefix
+            remaining = int(audio_size)
+            while remaining > 0:
+                if cancelled and cancelled():
+                    raise STTUnavailableError("STT transcription was cancelled")
+                chunk = audio.read(min(_UPLOAD_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise STTUnavailableError("audio upload ended early")
+                remaining -= len(chunk)
+                yield chunk
+            yield suffix
+
+        return body(), len(prefix) + int(audio_size) + len(suffix), boundary
+
     def transcribe(
         self,
         *,
-        audio: bytes,
+        audio: bytes | BinaryIO,
         filename: str,
+        audio_size: int | None = None,
         language: str = "auto",
         prompt: str = "",
         response_format: str = "json",
         timeout: float = 600.0,
         cancelled: Callable[[], bool] | None = None,
     ) -> tuple[bytes, str]:
-        if not audio:
+        streamed = not isinstance(audio, (bytes, bytearray, memoryview))
+        if streamed:
+            if audio_size is None:
+                position = audio.tell()
+                audio.seek(0, 2)
+                audio_size = audio.tell() - position
+                audio.seek(position)
+            if not audio_size:
+                raise ValueError("audio file is empty")
+        elif not audio:
             raise ValueError("audio file is empty")
         if cancelled and cancelled():
             raise STTUnavailableError("STT transcription was cancelled")
@@ -402,13 +516,23 @@ class WhisperCppRuntime:
             if cancelled and cancelled():
                 raise STTUnavailableError("STT transcription was cancelled")
             whisper_format = "verbose_json" if response_format == "verbose_json" else response_format
-            body, boundary = self._multipart(
-                audio=audio, filename=filename, language=language, prompt=prompt,
-                response_format=whisper_format,
-            )
+            if streamed:
+                body, length, boundary = self._multipart_stream(
+                    audio=audio, audio_size=int(audio_size), filename=filename, language=language,
+                    prompt=prompt, response_format=whisper_format, cancelled=cancelled,
+                )
+                headers = {
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(length),
+                }
+            else:
+                body, boundary = self._multipart(
+                    audio=bytes(audio), filename=filename, language=language, prompt=prompt,
+                    response_format=whisper_format,
+                )
+                headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
             request = urllib.request.Request(
-                f"{self.base_url}/inference", data=body, method="POST",
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                f"{self.base_url}/inference", data=body, method="POST", headers=headers,
             )
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:

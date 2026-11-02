@@ -169,7 +169,7 @@ with `QWEN_TTS_DOCUMENT_PARALLEL_GENERATIONS` (default `2`).
 
 ### Local novel reader
 
-Open `http://127.0.0.1:7866/reader` (or choose **打开小说阅读器** from the
+Open `http://127.0.0.1:7861/reader` (or choose **打开小说阅读器** from the
 menu-bar app). The reader accepts TXT, Markdown, and DOCX novels, recognizes
 common Chinese and English chapter headings, and maps every chapter to
 approximately 120–260 character display/audio blocks.
@@ -250,3 +250,8 @@ Generation is non-streaming at the document API boundary: a segment becomes play
 - `/api/health` reports scheduler concurrency and reference-cache hit counters.
 
 Safe-concurrency scaling on the installed RTX 4090 Laptop GPU was measured with identical fixed-seed, 30.64-second document outputs. Two-way concurrency reached 1.615x aggregate realtime speed, versus 1.590x for three-way and 1.591x for four-way. Peak GPU memory was about 13.38 GB, 13.67 GB, and 14.07 GB respectively. All completed outputs had identical decoded PCM. Two-way concurrency is therefore the default; higher values add latency and memory use without improving aggregate throughput on this machine. Per-request CUDA random generators keep generated tokens deterministic under concurrency.
+
+
+The port in all examples is the default. Use `PORT` from `.env.macos` for the deployed instance. Setup downloads and verifies Whisper small; Qwen GGUF files download on first model load. The example environment selects two lanes measured on an M4 Max with 128 GB; use one lane on smaller machines, and account for saved performance recommendations.
+
+The App bundle points at this checkout and its external runtime. Rebuild after moving the checkout or updating source, and restart the service before opening the updated app. `/api/health` includes API version 2, required capabilities, the source build ID, and storage usage. Native startup refuses a different build. See the README's data-retention section for cache TTLs, capacity admission, precise reader resume, and regression commands.

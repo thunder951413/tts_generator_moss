@@ -17,6 +17,9 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var voices: [NativeVoice] = []
     @Published var presets: [NativePreset] = []
     @Published var selectedPresetID = ""
+    /// The preset the service uses as its default ("" when the default is a
+    /// custom workbench configuration). Independent of the editor selection.
+    @Published var serviceActivePresetID = ""
     @Published var presetName = ""
     @Published var selectedVoicePath = ""
     @Published var referenceAudioPath = ""
@@ -38,9 +41,22 @@ final class NativeStudioViewModel: ObservableObject {
     @Published var nonStreamingInput = false
     @Published var streamingGeneration = true
     @Published var isGenerating = false
+    /// True while streamed PCM is still audible after the generation itself has ended.
+    @Published var isStreamPlaying = false
+    /// Output playback speed (time-stretched, pitch preserved). Applies to streamed PCM and
+    /// to the saved result; generation itself is unaffected.
+    @Published var playbackRate: Double = NativeStudioViewModel.storedPlaybackRate() {
+        didSet {
+            guard playbackRate != oldValue else { return }
+            UserDefaults.standard.set(playbackRate, forKey: NativeStudioViewModel.playbackRateKey)
+            applyPlaybackRate()
+        }
+    }
+    static let playbackRateOptions: [Double] = [0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
+    private static let playbackRateKey = "qwenStudioPlaybackRate"
     @Published var generatedProgress = 0.0
     @Published var generationSummary = "等待生成"
-    @Published var serviceSettingsStatus = "尚未应用为服务默认设置"
+    @Published var serviceSettingsStatus = "正在读取服务默认…"
     @Published var isApplyingServiceSettings = false
     @Published var actualGenerationSeed: Int?
     @Published var submittedSeedSetting: Int?
@@ -92,15 +108,20 @@ final class NativeStudioViewModel: ObservableObject {
     var onTTSServiceToggleRequested: (() -> Void)?
     var onSTTServiceToggleRequested: (() -> Void)?
     private var pollingTimer: Timer?
+    private var pollInFlightJobID: String?
+    private var consecutivePollFailures = 0
     private var currentJobID: String?
     private var stoppedJobIDs: Set<String> = []
     private var pcmStreamPlayer: NativePCMStreamPlayer?
+    private var streamPlaybackJobID: String?
     private var generationEpoch = 0
     private var isForceStopping = false
     private var generationFinished = false
     private var streamPlaybackFinished = false
     private var resultDownloaded = false
     private var player: AVPlayer?
+    /// Whether `player` currently plays generated output (speed applies) rather than a reference.
+    private var playerUsesOutputRate = false
     private var playbackEndObserver: NSObjectProtocol?
     private var playbackFailureObserver: NSObjectProtocol?
     private var playbackJobID: String?
@@ -113,6 +134,8 @@ final class NativeStudioViewModel: ObservableObject {
     private var reopenReferenceLibraryAfterTrim = false
     private var systemAudioTimer: Timer?
     private var systemAudioStartedAt: Date?
+    /// Editor values last loaded from the service or a preset; nil until the first load.
+    private var lastLoadedEditorSnapshot: [String]?
 
     init(service: LocalService) {
         self.service = service
@@ -149,15 +172,28 @@ final class NativeStudioViewModel: ObservableObject {
         let sttReady = stt?["ready"] as? Bool ?? false
         let active = number(scheduler?["active"]).intValue
         let maximum = number(scheduler?["max_parallel"]).intValue
-        ttsEnabled = boolean(health["tts_enabled"], fallback: true)
-        ttsReady = state == "ready"
-        self.sttReady = sttReady
-        serviceReady = ttsEnabled && ttsReady
-        serviceSummary = serviceReady
+        let newTTSEnabled = boolean(health["tts_enabled"], fallback: true)
+        let newTTSReady = state == "ready" || state == "degraded"
+        let newServiceReady = newTTSEnabled && newTTSReady
+        let newSummary = newServiceReady
             ? "TTS Metal · STT \(sttReady ? "就绪" : "未就绪") · \(profile) · GPU \(active)/\(maximum)"
-            : (ttsEnabled
+            : (newTTSEnabled
                 ? "TTS 服务状态：\(state)"
                 : "HTTP 服务已连接 · TTS 已停止 · STT \(sttReady ? "就绪" : "未就绪")")
+        // Every @Published assignment invalidates the whole studio view, even when the value
+        // is unchanged, so only publish real changes from the periodic health snapshot.
+        if ttsEnabled != newTTSEnabled { ttsEnabled = newTTSEnabled }
+        if ttsReady != newTTSReady { ttsReady = newTTSReady }
+        if self.sttReady != sttReady { self.sttReady = sttReady }
+        if serviceReady != newServiceReady { serviceReady = newServiceReady }
+        if serviceSummary != newSummary { serviceSummary = newSummary }
+    }
+
+    /// Marks every lane unavailable without republishing values that are already false.
+    func markServiceUnreachable() {
+        if serviceReady { serviceReady = false }
+        if ttsReady { ttsReady = false }
+        if sttReady { sttReady = false }
     }
 
     func setTTSService(enabled: Bool, completion: @escaping (Result<[String: Any], Error>) -> Void) {
@@ -214,6 +250,41 @@ final class NativeStudioViewModel: ObservableObject {
         refreshPresets()
         loadActiveServiceSettings()
         loadPerformanceProfile()
+    }
+
+    /// Used after a restart, crash recovery or changed API settings: refreshes metadata but only
+    /// replaces the editor with the service settings while the editor has no unsaved edits.
+    func reloadAfterServiceRestart() {
+        loadVoices()
+        loadReferenceLibrary()
+        refreshPresets()
+        loadActiveServiceSettings(applyingToEditor: editorIsPristine)
+        loadPerformanceProfile()
+    }
+
+    private var editorIsPristine: Bool {
+        guard let lastLoadedEditorSnapshot else { return true }
+        return lastLoadedEditorSnapshot == editorSnapshot()
+    }
+
+    private func editorSnapshot() -> [String] {
+        [
+            modelProfile,
+            cloneMode,
+            referenceText,
+            String(temperature),
+            String(topP),
+            String(topK),
+            String(repetitionPenalty),
+            String(maxNewTokens),
+            String(chunkFrames),
+            String(minNewTokens),
+            String(seed),
+            String(appendSilence),
+            String(nonStreamingInput),
+            String(streamingGeneration),
+            referenceAudioPath,
+        ]
     }
 
     func loadPerformanceProfile() {
@@ -308,7 +379,9 @@ final class NativeStudioViewModel: ObservableObject {
                 let name = payload["name"] as? String ?? "服务设置"
                 DispatchQueue.main.async {
                     self.appliedServiceVoiceName = self.string(settings["voice_name"], fallback: name)
-                    self.serviceSettingsStatus = "当前服务设置：\(name)"
+                    self.serviceActivePresetID = activePresetID
+                    self.serviceSettingsStatus = "服务默认：\(name)"
+                    self.onPresetsChanged?(self.presets)
                     guard applyingToEditor else { return }
                     self.modelProfile = self.string(settings["model_profile"], fallback: "qwen_0_6b")
                     self.cloneMode = self.string(settings["qwen_clone_mode"], fallback: "xvec")
@@ -330,7 +403,8 @@ final class NativeStudioViewModel: ObservableObject {
                     self.selectedVoicePath = self.voices.contains(where: { $0.audioPath == self.referenceAudioPath })
                         ? self.referenceAudioPath
                         : ""
-                    self.serviceSettingsStatus = "当前服务设置：\(name)"
+                    self.serviceSettingsStatus = "服务默认：\(name)"
+                    self.lastLoadedEditorSnapshot = self.editorSnapshot()
                 }
             } catch {
                 self.show(error)
@@ -398,7 +472,7 @@ final class NativeStudioViewModel: ObservableObject {
                     self.externalPassword = password
                     self.externalCORSOrigins = corsOrigins
                     self.updateHealth(health)
-                    self.loadInitialData()
+                    self.reloadAfterServiceRestart()
                     self.externalSettingsStatus = "设置已生效，TTS/STT 服务已重新就绪"
                 case .failure(let error):
                     self.externalSettingsStatus = error.localizedDescription
@@ -628,6 +702,7 @@ final class NativeStudioViewModel: ObservableObject {
                 let activePresetID = payload["active_preset_id"] as? String ?? ""
                 DispatchQueue.main.async {
                     self.presets = presets
+                    self.serviceActivePresetID = activePresetID
                     if let presetID, presets.contains(where: { $0.id == presetID }) {
                         self.selectedPresetID = presetID
                     } else if applyingActivePreset, !activePresetID.isEmpty,
@@ -923,7 +998,11 @@ final class NativeStudioViewModel: ObservableObject {
                 self.systemAudioTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) {
                     [weak self] _ in
                     guard let self, let startedAt = self.systemAudioStartedAt else { return }
-                    self.systemAudioElapsed = Date().timeIntervalSince(startedAt)
+                    let elapsed = Date().timeIntervalSince(startedAt)
+                    // The UI shows whole seconds; skip republishing inside the same second.
+                    if Int(elapsed) != Int(self.systemAudioElapsed) {
+                        self.systemAudioElapsed = elapsed
+                    }
                 }
             case .failure(let error):
                 self.isPreparingSystemAudioCapture = false
@@ -981,32 +1060,32 @@ final class NativeStudioViewModel: ObservableObject {
         audioTrimTitle = title
         audioTrimSubtitle = subtitle
         audioTrimProgress = "正在分析音频…"
-        let asset = AVURLAsset(url: url)
-        guard !asset.tracks(withMediaType: .audio).isEmpty else {
-            if sourceIsTemporary { try? FileManager.default.removeItem(at: url) }
-            systemAudioRecordingURL = nil
-            trimSourceIsTemporary = false
-            systemAudioStatus = "所选文件没有可用音轨"
-            show(NativeStudioError.server("所选音频或视频不包含可用音轨。"))
-            return
+        Task { @MainActor [weak self] in
+            do {
+                let asset = AVURLAsset(url: url)
+                let tracks = try await asset.loadTracks(withMediaType: .audio)
+                let duration = CMTimeGetSeconds(try await asset.load(.duration))
+                guard !tracks.isEmpty, duration.isFinite, duration > 0.1 else {
+                    throw NativeStudioError.server("音频或视频没有可用音轨，或声音太短。")
+                }
+                guard let self, self.systemAudioRecordingURL == url else { return }
+                self.systemAudioDuration = duration
+                self.systemAudioTrimStart = 0
+                self.systemAudioTrimEnd = duration
+                self.systemAudioName = name
+                self.systemAudioWaveform = []
+                self.systemAudioStatus = "音频已准备，可裁剪后加入参考音频"
+                self.systemAudioTrimPresented = true
+                self.analyzeWaveform(url)
+            } catch {
+                guard let self, self.systemAudioRecordingURL == url else { return }
+                if sourceIsTemporary { try? FileManager.default.removeItem(at: url) }
+                self.systemAudioRecordingURL = nil
+                self.trimSourceIsTemporary = false
+                self.systemAudioStatus = "无法读取可用音轨"
+                self.show(error)
+            }
         }
-        let duration = CMTimeGetSeconds(asset.duration)
-        guard duration.isFinite, duration > 0.1 else {
-            if sourceIsTemporary { try? FileManager.default.removeItem(at: url) }
-            systemAudioRecordingURL = nil
-            trimSourceIsTemporary = false
-            systemAudioStatus = "没有捕获到可用声音"
-            show(NativeStudioError.server("音频太短、无法读取或没有可用声音。"))
-            return
-        }
-        systemAudioDuration = duration
-        systemAudioTrimStart = 0
-        systemAudioTrimEnd = duration
-        systemAudioName = name
-        systemAudioWaveform = []
-        systemAudioStatus = "音频已准备，可裁剪后加入参考音频"
-        systemAudioTrimPresented = true
-        analyzeWaveform(url)
     }
 
     private func analyzeWaveform(_ url: URL) {
@@ -1055,6 +1134,7 @@ final class NativeStudioViewModel: ObservableObject {
         let item = AVPlayerItem(url: url)
         item.forwardPlaybackEndTime = CMTime(seconds: systemAudioTrimEnd, preferredTimescale: 600)
         player = AVPlayer(playerItem: item)
+        playerUsesOutputRate = false
         player?.seek(to: CMTime(seconds: systemAudioTrimStart, preferredTimescale: 600))
         player?.play()
     }
@@ -1120,26 +1200,21 @@ final class NativeStudioViewModel: ObservableObject {
             show(NativeStudioError.server("无法创建音频裁剪任务。"))
             return
         }
-        exporter.outputURL = outputURL
-        exporter.outputFileType = .m4a
         exporter.timeRange = CMTimeRange(
             start: CMTime(seconds: start, preferredTimescale: 600),
             duration: CMTime(seconds: duration, preferredTimescale: 600)
         )
         isExportingSystemAudio = true
         audioTrimProgress = "正在导出并压缩选区…"
-        exporter.exportAsynchronously { [weak self] in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard exporter.status == .completed else {
-                    self.isExportingSystemAudio = false
-                    try? FileManager.default.removeItem(at: outputURL)
-                    self.audioTrimProgress = "导出失败，可调整选区后重试"
-                    self.show(
-                        exporter.error ?? NativeStudioError.server("裁剪后的音频导出失败。")
-                    )
-                    return
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if #available(macOS 15.0, *) {
+                    try await exporter.export(to: outputURL, as: .m4a)
+                } else {
+                    try await Self.exportLegacy(exporter, to: outputURL)
                 }
+
                 self.stopPreview()
                 self.importReference(
                     outputURL,
@@ -1164,8 +1239,36 @@ final class NativeStudioViewModel: ObservableObject {
                         }
                     }
                 }
+            } catch {
+                self.isExportingSystemAudio = false
+                try? FileManager.default.removeItem(at: outputURL)
+                self.audioTrimProgress = "导出失败，可调整选区后重试"
+                self.show(error)
             }
         }
+    }
+
+    @available(macOS, introduced: 14.0, obsoleted: 15.0)
+    private static func exportLegacy(_ exporter: AVAssetExportSession, to url: URL) async throws {
+        exporter.outputURL = url
+        exporter.outputFileType = .m4a
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            // The exporter is configured once above. Completion reads its
+            // final status only after AVFoundation finishes all writes.
+            let completedExport = LegacyCompletedExport(exporter: exporter)
+            exporter.exportAsynchronously {
+                if completedExport.exporter.status == .completed {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: completedExport.exporter.error ?? NativeStudioError.server("音频导出失败。"))
+                }
+            }
+        }
+    }
+
+    private final class LegacyCompletedExport: @unchecked Sendable {
+        let exporter: AVAssetExportSession
+        init(exporter: AVAssetExportSession) { self.exporter = exporter }
     }
 
     private static let recordingDateFormatter: DateFormatter = {
@@ -1179,18 +1282,56 @@ final class NativeStudioViewModel: ObservableObject {
             show(NativeStudioError.missingReference)
             return
         }
-        play(URL(fileURLWithPath: referenceAudioPath))
+        play(URL(fileURLWithPath: referenceAudioPath), appliesOutputRate: false)
+    }
+
+    static func playbackRateLabel(_ rate: Double) -> String {
+        if rate == rate.rounded() {
+            return String(format: "%.0f×", rate)
+        }
+        if (rate * 10).rounded() == rate * 10 {
+            return String(format: "%.1f×", rate)
+        }
+        return String(format: "%.2f×", rate)
+    }
+
+    private static func storedPlaybackRate() -> Double {
+        let stored = UserDefaults.standard.double(forKey: playbackRateKey)
+        guard stored > 0 else { return 1.0 }
+        // Snap to the nearest offered option so the picker always has a matching tag.
+        return playbackRateOptions.min(by: { abs($0 - stored) < abs($1 - stored) }) ?? 1.0
+    }
+
+    private func applyPlaybackRate() {
+        let rate = Float(playbackRate)
+        pcmStreamPlayer?.rate = rate
+        if playerUsesOutputRate, let player {
+            player.defaultRate = rate
+            if player.rate != 0 {
+                player.rate = rate
+            }
+        }
     }
 
     func playOutput() {
         guard let outputAudioURL else { return }
+        // Don't overlap the saved result with streamed audio that is still playing.
+        if isStreamPlaying {
+            stopStreamPlayback(closeJob: true)
+            generationSummary = "生成完成，可以试听"
+        }
         play(outputAudioURL)
     }
 
-    private func play(_ url: URL, jobID: String? = nil) {
+    private func play(_ url: URL, jobID: String? = nil, appliesOutputRate: Bool = true) {
         stopPreview()
         let item = AVPlayerItem(url: url)
-        player = AVPlayer(playerItem: item)
+        // Speech-friendly time stretching: speed changes keep the original pitch.
+        item.audioTimePitchAlgorithm = .spectral
+        let newPlayer = AVPlayer(playerItem: item)
+        newPlayer.defaultRate = appliesOutputRate ? Float(playbackRate) : 1.0
+        player = newPlayer
+        playerUsesOutputRate = appliesOutputRate
         playbackJobID = jobID
         let finishPlayback: () -> Void = { [weak self] in
             guard let self else { return }
@@ -1208,12 +1349,12 @@ final class NativeStudioViewModel: ObservableObject {
             }
         }
         playbackEndObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
+            forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: item,
             queue: .main
         ) { _ in finishPlayback() }
         playbackFailureObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemFailedToPlayToEndTime,
+            forName: AVPlayerItem.failedToPlayToEndTimeNotification,
             object: item,
             queue: .main
         ) { _ in finishPlayback() }
@@ -1235,8 +1376,7 @@ final class NativeStudioViewModel: ObservableObject {
             return
         }
         stopPolling()
-        pcmStreamPlayer?.stop()
-        pcmStreamPlayer = nil
+        stopStreamPlayback(closeJob: true)
         removeTemporaryOutput()
         outputAudioURL = nil
         isGenerating = true
@@ -1292,7 +1432,13 @@ final class NativeStudioViewModel: ObservableObject {
                 let sampleRate = self.number(payload["sample_rate"]).doubleValue
                 let channels = self.number(payload["channels"]).intValue
                 DispatchQueue.main.async {
-                    guard self.generationEpoch == requestEpoch, !self.isForceStopping else { return }
+                    guard self.generationEpoch == requestEpoch, !self.isForceStopping else {
+                        // Stopped while the submission was in flight: close the job right away
+                        // so it neither keeps computing nor starts playing.
+                        self.stoppedJobIDs.insert(jobID)
+                        self.service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
+                        return
+                    }
                     self.currentJobID = jobID
                     self.stoppedJobIDs.remove(jobID)
                     self.currentJobDisplayID = String(jobID.prefix(8))
@@ -1319,11 +1465,27 @@ final class NativeStudioViewModel: ObservableObject {
     }
 
     func stopGeneration() {
-        guard let currentJobID else { return }
+        guard let currentJobID else {
+            guard isGenerating else {
+                // Generation already ended; only the remaining streamed audio is playing.
+                if isStreamPlaying {
+                    stopStreamPlayback(closeJob: true)
+                    generationSummary = "已停止播放"
+                }
+                return
+            }
+            // The start request has not returned a job ID yet. Invalidate its callback; the
+            // job is closed as soon as the ID arrives (see generate()).
+            generationEpoch &+= 1
+            stopStreamPlayback(closeJob: false)
+            stopPolling()
+            isGenerating = false
+            generationSummary = "已停止当前生成"
+            return
+        }
         stoppedJobIDs.insert(currentJobID)
         service.perform("api/generate-stream/\(currentJobID)/close", method: "POST") { _, _ in }
-        pcmStreamPlayer?.stop()
-        pcmStreamPlayer = nil
+        stopStreamPlayback(closeJob: false)
         stopPolling()
         isGenerating = false
         self.currentJobID = nil
@@ -1342,8 +1504,7 @@ final class NativeStudioViewModel: ObservableObject {
         if let currentJobID {
             stoppedJobIDs.insert(currentJobID)
         }
-        pcmStreamPlayer?.stop()
-        pcmStreamPlayer = nil
+        stopStreamPlayback(closeJob: false)
         stopPreview()
         stopPolling()
         currentJobID = nil
@@ -1388,25 +1549,32 @@ final class NativeStudioViewModel: ObservableObject {
                 channels: AVAudioChannelCount(channels)
             )
             stream.onFirstAudio = { [weak self] in
-                guard let self, self.currentJobID == jobID else { return }
+                guard let self, self.streamPlaybackJobID == jobID, self.isGenerating else { return }
                 self.generationSummary = "正在边生成边播放 PCM 音频…"
             }
             stream.onComplete = { [weak self] in
-                guard let self, self.currentJobID == jobID else { return }
+                guard let self, self.streamPlaybackJobID == jobID else { return }
                 self.streamPlaybackFinished = true
+                self.isStreamPlaying = false
                 self.finishStreamingGenerationIfReady()
             }
             stream.onError = { [weak self] error in
-                guard let self, self.currentJobID == jobID,
+                guard let self, self.streamPlaybackJobID == jobID,
                       !self.stoppedJobIDs.contains(jobID)
                 else { return }
                 self.service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
+                self.stopStreamPlayback(closeJob: false)
                 self.stopPolling()
                 self.isGenerating = false
-                self.currentJobID = nil
+                if self.currentJobID == jobID {
+                    self.currentJobID = nil
+                }
                 self.show(error)
             }
+            stream.rate = Float(playbackRate)
             pcmStreamPlayer = stream
+            streamPlaybackJobID = jobID
+            isStreamPlaying = true
             stream.start()
         } catch {
             service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
@@ -1425,43 +1593,105 @@ final class NativeStudioViewModel: ObservableObject {
     }
 
     private func poll(_ jobID: String) {
+        // One status request at a time; a slow response must not pile up 0.5 s ticks.
+        guard pollInFlightJobID != jobID else { return }
+        pollInFlightJobID = jobID
         service.perform("api/generate-stream/\(jobID)/status") { [weak self] data, response in
             guard let self else { return }
+            let statusCode = response?.statusCode
+            let payload: [String: Any]?
+            let failure: Error?
             do {
-                let payload = try self.jsonObject(data, response: response)
-                let state = payload["state"] as? String ?? "unknown"
-                let generated = self.number(payload["generated_frames"]).doubleValue
-                let maximum = max(1, self.number(payload["max_new_tokens"]).doubleValue)
-                let audioSeconds = self.number(payload["emitted_audio_seconds"]).doubleValue
-                let resolvedSeed = payload["seed"] == nil ? nil : self.number(payload["seed"]).intValue
-                DispatchQueue.main.async {
-                    guard self.currentJobID == jobID else { return }
-                    if let resolvedSeed {
-                        self.actualGenerationSeed = resolvedSeed
-                    }
-                    self.generatedProgress = min(1, generated / maximum)
-                    self.generationSummary = "\(self.nativeStateLabel(state)) · \(Int(generated))/\(Int(maximum)) 帧 · \(String(format: "%.1f", audioSeconds)) 秒音频"
-                    if state == "finished" {
-                        self.stopPolling()
-                        self.generationFinished = true
-                        self.downloadResult(jobID, autoPlay: !self.streamingGeneration)
-                    } else if state == "error" || state == "closed" {
-                        self.stopPolling()
-                        self.isGenerating = false
-                        self.pcmStreamPlayer?.stop()
-                        self.pcmStreamPlayer = nil
-                        if state == "closed" && self.stoppedJobIDs.contains(jobID) {
-                            self.generationSummary = "已停止当前生成"
-                        } else {
-                            self.errorMessage = payload["error"] as? String ?? "生成任务失败。"
-                        }
-                        self.currentJobID = nil
-                    }
-                }
+                payload = try self.jsonObject(data, response: response)
+                failure = nil
             } catch {
-                self.show(error)
+                payload = nil
+                failure = error
+            }
+            DispatchQueue.main.async {
+                if self.pollInFlightJobID == jobID {
+                    self.pollInFlightJobID = nil
+                }
+                guard self.currentJobID == jobID else { return }
+                guard let payload else {
+                    if statusCode == 404 {
+                        // The service no longer knows this job (typically restarted).
+                        self.abandonGeneration(
+                            jobID,
+                            summary: "生成任务已丢失",
+                            message: "服务已不再保留此生成任务（可能已重启），请重新生成。"
+                        )
+                        return
+                    }
+                    self.consecutivePollFailures += 1
+                    if self.consecutivePollFailures >= 5 {
+                        let detail = failure?.localizedDescription ?? "请求没有收到响应"
+                        self.abandonGeneration(
+                            jobID,
+                            summary: "无法读取生成进度",
+                            message: "连续 5 次无法读取生成进度：\(detail)"
+                        )
+                    }
+                    return
+                }
+                self.consecutivePollFailures = 0
+                self.applyPollStatus(payload, jobID: jobID)
             }
         }
+    }
+
+    private func applyPollStatus(_ payload: [String: Any], jobID: String) {
+        let state = payload["state"] as? String ?? "unknown"
+        let generated = number(payload["generated_frames"]).doubleValue
+        let maximum = max(1, number(payload["max_new_tokens"]).doubleValue)
+        let audioSeconds = number(payload["emitted_audio_seconds"]).doubleValue
+        if payload["seed"] != nil {
+            let resolvedSeed = number(payload["seed"]).intValue
+            if actualGenerationSeed != resolvedSeed {
+                actualGenerationSeed = resolvedSeed
+            }
+        }
+        let progress = min(1, generated / maximum)
+        if generatedProgress != progress {
+            generatedProgress = progress
+        }
+        let summary = "\(nativeStateLabel(state)) · \(Int(generated))/\(Int(maximum)) 帧 · \(String(format: "%.1f", audioSeconds)) 秒音频"
+        if generationSummary != summary {
+            generationSummary = summary
+        }
+        if state == "finished" {
+            stopPolling()
+            generationFinished = true
+            downloadResult(jobID, autoPlay: !streamingGeneration)
+        } else if state == "interrupted" {
+            abandonGeneration(
+                jobID,
+                summary: "生成已中断",
+                message: payload["error"] as? String ?? "生成任务因服务重启而中断，请重新生成。"
+            )
+        } else if state == "error" || state == "closed" {
+            stopPolling()
+            isGenerating = false
+            stopStreamPlayback(closeJob: false)
+            if state == "closed" && stoppedJobIDs.contains(jobID) {
+                generationSummary = "已停止当前生成"
+            } else {
+                errorMessage = payload["error"] as? String ?? "生成任务失败。"
+            }
+            currentJobID = nil
+        }
+    }
+
+    /// Ends a generation whose job can no longer complete (interrupted, unknown or unreachable).
+    private func abandonGeneration(_ jobID: String, summary: String, message: String) {
+        stopPolling()
+        stoppedJobIDs.insert(jobID)
+        stopStreamPlayback(closeJob: false)
+        isGenerating = false
+        currentJobID = nil
+        generationSummary = summary
+        errorMessage = message
+        service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
     }
 
     private func downloadResult(_ jobID: String, autoPlay: Bool) {
@@ -1495,6 +1725,14 @@ final class NativeStudioViewModel: ObservableObject {
                         self.play(url, jobID: jobID)
                         self.currentJobID = nil
                     } else {
+                        // The job is complete and its WAV is saved: generation has ended even
+                        // if buffered PCM is still audible, so unlock the controls now instead
+                        // of waiting for the playback-finished callback.
+                        self.isGenerating = false
+                        self.currentJobID = nil
+                        if self.pcmStreamPlayer == nil {
+                            self.streamPlaybackFinished = true
+                        }
                         self.generationSummary = self.streamPlaybackFinished
                             ? "流式播放完成，可以再次试听"
                             : "生成完成，正在播放剩余音频…"
@@ -1513,14 +1751,30 @@ final class NativeStudioViewModel: ObservableObject {
 
     private func finishStreamingGenerationIfReady() {
         guard generationFinished, streamPlaybackFinished, resultDownloaded else { return }
-        let finishedJobID = currentJobID
+        let finishedJobID = streamPlaybackJobID ?? currentJobID
         isGenerating = false
         currentJobID = nil
         pcmStreamPlayer = nil
+        streamPlaybackJobID = nil
+        isStreamPlaying = false
         generatedProgress = 1
         generationSummary = "流式播放完成，可以再次试听"
         if let finishedJobID {
             service.perform("api/generate-stream/\(finishedJobID)/close", method: "POST") { _, _ in }
+        }
+    }
+
+    /// Stops streamed PCM playback (if any). `closeJob` also releases the server-side job of a
+    /// generation that already ended, so its playback lease is not held.
+    private func stopStreamPlayback(closeJob: Bool) {
+        let jobID = streamPlaybackJobID
+        pcmStreamPlayer?.stop()
+        pcmStreamPlayer = nil
+        streamPlaybackJobID = nil
+        isStreamPlaying = false
+        if closeJob, let jobID, jobID != currentJobID {
+            stoppedJobIDs.insert(jobID)
+            service.perform("api/generate-stream/\(jobID)/close", method: "POST") { _, _ in }
         }
     }
 
@@ -1569,11 +1823,32 @@ final class NativeStudioViewModel: ObservableObject {
         selectedPresetID = preset.id
         presetName = preset.name
         errorMessage = ""
+        lastLoadedEditorSnapshot = editorSnapshot()
+    }
+
+    /// Whether "设为服务默认" would link the service to the selected preset
+    /// (editor unchanged since it was loaded) rather than a custom copy.
+    var serviceDefaultTargetsPreset: Bool {
+        !selectedPresetID.isEmpty && editorIsPristine
+    }
+
+    var editorIsServiceDefault: Bool {
+        serviceDefaultTargetsPreset && selectedPresetID == serviceActivePresetID
+    }
+
+    /// Menu bar "服务默认音色": switch the service default to a preset. The
+    /// editor follows only when it has no unsaved edits.
+    func makePresetServiceDefault(_ preset: NativePreset) {
+        if editorIsPristine {
+            applyPreset(preset)
+        }
         activatePresetForService(preset.id)
     }
 
     private func activatePresetForService(_ presetID: String) {
         guard let data = try? JSONSerialization.data(withJSONObject: ["preset_id": presetID]) else { return }
+        isApplyingServiceSettings = true
+        serviceSettingsStatus = "正在设为服务默认…"
         service.perform(
             "api/service-settings/active-preset",
             method: "PUT",
@@ -1585,12 +1860,16 @@ final class NativeStudioViewModel: ObservableObject {
                 let payload = try self.jsonObject(data, response: response)
                 let name = payload["name"] as? String ?? "当前预设"
                 DispatchQueue.main.async {
-                    self.serviceSettingsStatus = "服务已应用：\(name)"
+                    self.isApplyingServiceSettings = false
+                    self.serviceActivePresetID = presetID
+                    self.serviceSettingsStatus = "已应用：服务默认为预设“\(name)”"
                     if let settings = payload["settings"] as? [String: Any] {
                         self.appliedServiceVoiceName = self.string(settings["voice_name"], fallback: name)
                     }
+                    self.onPresetsChanged?(self.presets)
                 }
             } catch {
+                DispatchQueue.main.async { self.isApplyingServiceSettings = false }
                 self.show(error)
             }
         }
@@ -1599,6 +1878,11 @@ final class NativeStudioViewModel: ObservableObject {
     func applyCurrentAsServiceSettings() {
         guard !referenceAudioPath.isEmpty else {
             show(NativeStudioError.missingReference)
+            return
+        }
+        if serviceDefaultTargetsPreset {
+            // Keep the link to the preset so later "更新" also updates the service.
+            activatePresetForService(selectedPresetID)
             return
         }
         isApplyingServiceSettings = true
@@ -1643,7 +1927,10 @@ final class NativeStudioViewModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.isApplyingServiceSettings = false
                     self.selectedPresetID = ""
-                    self.serviceSettingsStatus = "已应用：\(name)；后续调用将使用此配置"
+                    self.serviceActivePresetID = ""
+                    self.lastLoadedEditorSnapshot = self.editorSnapshot()
+                    self.serviceSettingsStatus = "已应用：\(name)；API 与新书将使用此配置"
+                    self.onPresetsChanged?(self.presets)
                     if let settings = result["settings"] as? [String: Any] {
                         self.appliedServiceVoiceName = self.string(settings["voice_name"], fallback: name)
                     }
@@ -1706,7 +1993,12 @@ final class NativeStudioViewModel: ObservableObject {
                     self.isSavingPreset = false
                     self.applyPreset(preset)
                     self.refreshPresets(selecting: preset.id)
-                    self.generationSummary = "预设已保存：\(preset.name)"
+                    if preset.id == self.serviceActivePresetID {
+                        self.generationSummary = "预设已更新：\(preset.name)；它是服务默认，API 与新书立即使用新参数"
+                        self.loadActiveServiceSettings(applyingToEditor: false)
+                    } else {
+                        self.generationSummary = "预设已保存：\(preset.name)（未改变服务默认）"
+                    }
                 }
             } catch {
                 DispatchQueue.main.async { self.isSavingPreset = false }
@@ -1718,6 +2010,7 @@ final class NativeStudioViewModel: ObservableObject {
     func deleteSelectedPreset() {
         guard !selectedPresetID.isEmpty else { return }
         let deletingID = selectedPresetID
+        let wasServiceDefault = deletingID == serviceActivePresetID
         service.perform("api/presets/\(deletingID)", method: "DELETE") { [weak self] data, response in
             guard let self else { return }
             do {
@@ -1726,6 +2019,11 @@ final class NativeStudioViewModel: ObservableObject {
                     self.selectedPresetID = ""
                     self.presetName = ""
                     self.refreshPresets()
+                    if wasServiceDefault {
+                        // The service falls back to its built-in voice.
+                        self.loadActiveServiceSettings(applyingToEditor: false)
+                        self.generationSummary = "已删除预设；它曾是服务默认，服务已恢复为内置默认音色"
+                    }
                 }
             } catch {
                 self.show(error)
@@ -1736,6 +2034,8 @@ final class NativeStudioViewModel: ObservableObject {
     private func stopPolling() {
         pollingTimer?.invalidate()
         pollingTimer = nil
+        pollInFlightJobID = nil
+        consecutivePollFailures = 0
     }
 
     private func jsonObject(_ data: Data?, response: HTTPURLResponse?) throws -> [String: Any] {
@@ -1796,6 +2096,7 @@ final class NativeStudioViewModel: ObservableObject {
             "finished": "已完成",
             "closed": "已停止",
             "error": "错误",
+            "interrupted": "已中断",
         ][state] ?? state
     }
 
@@ -2024,8 +2325,18 @@ struct ExternalAPISettingsView: View {
                                     .textSelection(.enabled)
                                 Spacer()
                             }
+                            Text("TTS 调用默认使用服务默认音色“\(model.appliedServiceVoiceName)”（工作台“设为服务默认”或菜单栏“服务默认音色”可修改）；已导入的书使用各自的朗读设置。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+
+                    Text("保存后会重启本地服务，正在进行的生成与播放会中断；整书生成已完成的段落会保留，可稍后继续。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     if !model.externalSettingsStatus.isEmpty {
                         Text(model.externalSettingsStatus)

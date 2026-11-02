@@ -31,7 +31,9 @@ from fastapi.responses import (
 )
 
 from qwen_protocol import StreamingRequest
+from text_processing import SUPPORTED_LANGUAGES, detect_language, normalize_language
 from media_process import run_media_process
+from worker_protocol import MAX_TEXT_CHARS
 
 from runtime_manager import (
     DEFAULT_MODEL_PROFILE,
@@ -127,6 +129,7 @@ def register_generation_routes(app, ctx):
         try:
             if cancelled():
                 return
+            request.cancelled = cancelled
             job.update(
                 state="loading_runtime",
                 started_at=time.time(),
@@ -141,7 +144,7 @@ def register_generation_routes(app, ctx):
             ):
               if cancelled():
                 return
-              with runtime_manager.session(model_profile) as runtime:
+              with runtime_manager.session(model_profile, cancelled=cancelled) as runtime:
                 if cancelled():
                     return
                 channels = int(runtime_manager.profiles[model_profile]["channels"])
@@ -149,7 +152,7 @@ def register_generation_routes(app, ctx):
                 for event in synthesize_for_profile_runtime(runtime, request, output_dir=output_dir):
                     with job.status_lock:
                         if cancelled():
-                            if event.type == "result" and job.status.get("ephemeral_audio"):
+                            if event.type == "result":
                                 _remove_generated_result_files(event.data)
                             break
                     if event.type == "metadata":
@@ -157,32 +160,37 @@ def register_generation_routes(app, ctx):
                     elif event.type == "progress":
                         job.update(**event.data)
                     elif event.type == "audio":
-                        waveform = event.data["waveform"]
-                        channels = 1 if waveform.ndim == 1 else int(min(2, waveform.shape[0]))
-                        with job.status_lock:
-                            if job.status.get("first_audio_at") is None:
-                                job.status["first_audio_at"] = time.time()
+                        data = event.data
                         if streaming_generation:
-                            _put_stream_audio(job, _pcm16le_bytes(waveform, channels))
-                        job.update(
-                            generated_frames=event.data.get("generated_frames", job.snapshot().get("generated_frames", 0)),
-                            emitted_audio_seconds=event.data.get("emitted_audio_seconds", 0.0),
-                            generated_audio_seconds=event.data.get("generated_audio_seconds", 0.0),
-                            sample_rate=event.data.get("sample_rate", runtime.sample_rate),
-                            channels=channels,
-                            lead_seconds=event.data.get("lead_seconds", 0.0),
-                            generation_lead_seconds=event.data.get("generation_lead_seconds", 0.0),
-                            playback_lead_seconds=event.data.get("playback_lead_seconds"),
-                            generation_realtime_factor=event.data.get("generation_realtime_factor", 0.0),
-                            post_first_generation_realtime_factor=event.data.get(
-                                "post_first_generation_realtime_factor"
-                            ),
-                            first_audio_latency_seconds=event.data.get("first_audio_latency_seconds"),
-                            decode_chunks_submitted=event.data.get("decode_chunks_submitted", 0),
-                            decode_queue_depth=event.data.get("decode_queue_depth", 0),
-                            pending_decode_frames=event.data.get("pending_decode_frames", 0),
-                            chunk_frames=event.data.get("chunk_frames", 0),
-                        )
+                            pcm = data.get("pcm16")
+                            # Worker int16 mono bytes go to the client untouched
+                            # (bit-identical to the saved WAV); a float
+                            # ``waveform`` is still accepted from fakes.
+                            _put_stream_audio(job, _pcm16le_bytes(
+                                data["waveform"] if pcm is None else pcm, channels
+                            ))
+                        fields = {
+                            "emitted_audio_seconds": data.get("emitted_audio_seconds", 0.0),
+                            "generated_audio_seconds": data.get("generated_audio_seconds", 0.0),
+                            "sample_rate": data.get("sample_rate", runtime.sample_rate),
+                            "channels": channels,
+                            "generation_realtime_factor": data.get("generation_realtime_factor", 0.0),
+                            "first_audio_latency_seconds": data.get("first_audio_latency_seconds"),
+                            "decode_chunks_submitted": data.get("decode_chunks_submitted", 0),
+                            "chunk_frames": data.get("chunk_frames", 0),
+                        }
+                        if "generated_frames" in data:
+                            fields["generated_frames"] = data["generated_frames"]
+                        for optional in (
+                            "lead_seconds", "generation_lead_seconds", "playback_lead_seconds",
+                            "post_first_generation_realtime_factor", "decode_queue_depth",
+                            "pending_decode_frames",
+                        ):
+                            if optional in data:
+                                fields[optional] = data[optional]
+                        if job.status.get("first_audio_at") is None:
+                            fields["first_audio_at"] = time.time()
+                        job.update(**fields)
                     elif event.type == "result":
                         metadata = dict(event.data["metadata"])
                         task_seed_status = job.snapshot()
@@ -202,6 +210,7 @@ def register_generation_routes(app, ctx):
                         })
                         job.update(
                             state="finished",
+                            seed=metadata.get("seed"),
                             generated_frames=metadata.get("generated_frames", 0),
                             emitted_audio_seconds=metadata.get("duration_seconds", 0.0),
                             audio_path=event.data["audio_path"],
@@ -226,6 +235,7 @@ def register_generation_routes(app, ctx):
         max_new_tokens: int | None = Form(None),
         codec_chunk_frames: int | None = Form(None),
         seed: int | None = Form(None),
+        session_seed: int | None = Form(None),
         tokens_control: int = Form(0),
         tokens: int = Form(0),
         temperature: float | None = Form(None),
@@ -247,10 +257,11 @@ def register_generation_routes(app, ctx):
         ephemeral_audio: int = Form(0),
         expected_playback_epoch: int | None = Form(None),
     ) -> JSONResponse:
-        admission_epoch = int(getattr(ctx, "tts_epoch", 0))
+        admission_epoch = int(getattr(http_request.state, "tts_epoch_at_admission", getattr(ctx, "tts_epoch", 0)))
         if not _tts_admission_open(admission_epoch):
             raise HTTPException(status_code=503, detail="TTS service is stopped")
-        admission_playback_epoch = int(playback_coordinator.status()["playback_epoch"])
+        app.state.storage_policy.check_admission()
+        admission_playback_epoch = int(playback_coordinator.playback_epoch)
         if (
             expected_playback_epoch is not None
             and int(expected_playback_epoch) != admission_playback_epoch
@@ -259,10 +270,15 @@ def register_generation_routes(app, ctx):
         text = (text or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail="text must not be empty")
+        if len(text) > MAX_TEXT_CHARS:
+            raise HTTPException(status_code=413, detail="单次文本过长，请使用文档项目")
 
         mode = "voice_clone"
         caller_kind = str(getattr(http_request.state, "caller_kind", "external"))
-        language = "Chinese"
+        # Honour the requested language; empty/auto detects from the text.
+        language = normalize_language(language, text)
+        if language not in SUPPORTED_LANGUAGES.values():
+            language = detect_language(text)
         mode_name = MODE_CLONE
         service_settings = dict(active_service_settings().get("settings") or {})
         use_applied_service_settings = bool(
@@ -366,6 +382,12 @@ def register_generation_routes(app, ctx):
         configured_seed = _safe_int(seed, default=1234, minimum=-1, maximum=999999)
         seed_mode = "random" if configured_seed < 0 else "fixed"
         resolved_seed = secrets.randbelow(1_000_000) if configured_seed < 0 else configured_seed
+        if session_seed is not None:
+            if not 0 <= session_seed <= 999999:
+                if owned_prompt_path is not None:
+                    owned_prompt_path.unlink(missing_ok=True)
+                raise HTTPException(400, "invalid listening session seed")
+            resolved_seed = session_seed
         if not runtime_manager.profiles[model_profile]["streaming"]:
             streaming_generation_enabled = False
         try:
@@ -385,7 +407,7 @@ def register_generation_routes(app, ctx):
             mode="voice_clone",
             prompt_text="",
             prompt_audio_path=prompt_audio_path,
-            language="Chinese",
+            language=language,
             tokens_control=bool(int(tokens_control)),
             tokens=_safe_int(tokens, default=0, minimum=0),
             max_new_frames=max_new_tokens,
@@ -408,6 +430,7 @@ def register_generation_routes(app, ctx):
             qwen_min_new_tokens=_safe_int(
                 qwen_min_new_tokens, default=2, minimum=2, maximum=256
             ),
+            stream_audio=streaming_generation_enabled,
         )
         if not _tts_admission_open(admission_epoch):
             if owned_prompt_path is not None:
@@ -416,7 +439,7 @@ def register_generation_routes(app, ctx):
         if (
             expected_playback_epoch is not None
             and int(expected_playback_epoch)
-            != int(playback_coordinator.status()["playback_epoch"])
+            != int(playback_coordinator.playback_epoch)
         ):
             if owned_prompt_path is not None:
                 owned_prompt_path.unlink(missing_ok=True)
@@ -482,7 +505,7 @@ def register_generation_routes(app, ctx):
                 "configured_seed": configured_seed,
                 "seed_mode": seed_mode,
                 "caller_kind": caller_kind,
-                "playback_epoch": playback_coordinator.status()["playback_epoch"],
+                "playback_epoch": playback_coordinator.playback_epoch,
             }
         )
 
@@ -503,27 +526,36 @@ def register_generation_routes(app, ctx):
         request: Request,
         *,
         lease_timeout: float | None = None,
+        completed_result: bool = False,
     ) -> dict[str, object]:
         job.update(playback_state="waiting")
         disconnected = threading.Event()
-        expected_epoch = int(job.snapshot().get("playback_epoch", -1))
-        current_epoch = int(playback_coordinator.status()["playback_epoch"])
+        expected_epoch = int(
+            getattr(request.state, "playback_epoch_at_admission", -1)
+            if completed_result else job.snapshot().get("playback_epoch", -1)
+        )
+        requested_epoch = request.query_params.get("expected_playback_epoch")
+        if requested_epoch is not None:
+            expected_epoch = _safe_int(requested_epoch, default=-1, minimum=-1)
+        current_epoch = int(playback_coordinator.playback_epoch)
         if expected_epoch != current_epoch:
             job.update(playback_state="cancelled")
             raise HTTPException(status_code=409, detail="playback session is stale")
-        acquire_task = asyncio.create_task(
-            asyncio.to_thread(
-                playback_coordinator.acquire,
-                job.job_id,
-                str(job.snapshot().get("caller_kind") or "external"),
-                cancelled=lambda: (
-                    job.is_closed
-                    or disconnected.is_set()
-                    or int(playback_coordinator.status()["playback_epoch"]) != expected_epoch
-                ),
-                timeout=600.0,
-                lease_timeout=lease_timeout,
-            )
+        if completed_result:
+            job.update(playback_epoch=expected_epoch)
+        # Up to 64 waiters may block here for 600 s each: use the dedicated
+        # executor so they cannot starve asyncio's default thread pool.
+        acquire_task = ctx.run_blocking(
+            playback_coordinator.acquire,
+            job.job_id,
+            str(job.snapshot().get("caller_kind") or "external"),
+            cancelled=lambda: (
+                (job.is_closed and not (completed_result and job.result is not None and job.status.get("state") == "finished"))
+                or disconnected.is_set()
+                or int(playback_coordinator.playback_epoch) != expected_epoch
+            ),
+            timeout=600.0,
+            lease_timeout=lease_timeout,
         )
         while not acquire_task.done():
             await asyncio.wait({acquire_task}, timeout=0.25)
@@ -557,24 +589,46 @@ def register_generation_routes(app, ctx):
     @app.get("/api/generate-stream/{job_id}/audio")
     async def generate_stream_audio(job_id: str, request: Request) -> StreamingResponse:
         job = jobs.get(job_id)
+        if job.snapshot().get("stream_expired"):
+            raise HTTPException(410, "实时音频缓存已过期，请使用已保存的结果音频")
         playback_status = await _acquire_playback(job, request, lease_timeout=900.0)
 
         async def iterator():
+            with job.status_lock:
+                job.active_audio_readers += 1
+            delivered_bytes = 0
+            first_delivery: float | None = None
+            completed = False
             try:
                 while True:
                     if await request.is_disconnected():
                         break
                     try:
-                        item = await asyncio.to_thread(job.audio_queue.get, True, 0.25)
+                        item = await job.audio_queue.get_async(0.25)
                     except queue.Empty:
                         continue
                     if item is None:
+                        completed = True
                         break
+                    if first_delivery is None:
+                        first_delivery = time.monotonic()
+                    delivered_bytes += len(item)
                     yield item
             finally:
+                with job.status_lock:
+                    job.active_audio_readers = max(0, job.active_audio_readers - 1)
                 snapshot = job.snapshot()
                 if snapshot.get("state") not in {"finished", "error", "closed"}:
                     jobs.close(job_id)
+                elif completed:
+                    # The 900 s lease only covers generation. Once all PCM is
+                    # delivered, keep it for the remaining audible time + 10 s
+                    # so a client that never calls release cannot block other
+                    # playback for the rest of the 15 minutes.
+                    bytes_per_second = max(1, audio_sample_rate * audio_channels * 2)
+                    audible = delivered_bytes / bytes_per_second
+                    played = 0.0 if first_delivery is None else time.monotonic() - first_delivery
+                    playback_coordinator.shorten_lease(job_id, max(0.0, audible - played) + 10.0)
 
         snapshot = job.snapshot()
         # The PCM format comes from the model profile itself.  Reading it from
@@ -629,6 +683,7 @@ def register_generation_routes(app, ctx):
                 job,
                 request,
                 lease_timeout=_job_playback_lease_seconds(job),
+                completed_result=True,
             )
             headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
@@ -653,10 +708,14 @@ def register_generation_routes(app, ctx):
             raise HTTPException(status_code=404, detail="generated audio is missing")
         selected_bitrate = _safe_aac_bitrate(bitrate)
         target = reader_temp_dir / f"{job_id}-{selected_bitrate}.m4a"
-        conversion_epoch = getattr(ctx, "tts_epoch", 0)
+        conversion_epoch = getattr(request.state, "tts_epoch_at_admission", getattr(ctx, "tts_epoch", 0))
+        close_revision = int(job.status.get("close_revision", 0))
+        replaying_closed_result = job.is_closed and job.status.get("state") == "finished"
 
         def conversion_cancelled() -> bool:
-            return job.is_closed or conversion_epoch != getattr(ctx, "tts_epoch", 0)
+            return (job.result is None or int(job.status.get("close_revision", 0)) != close_revision
+                    or (job.is_closed and not replaying_closed_result)
+                    or conversion_epoch != getattr(ctx, "tts_epoch", 0))
 
         def encode_aac() -> Path:
             temporary = target.with_name(
@@ -748,6 +807,7 @@ def register_generation_routes(app, ctx):
                 job,
                 request,
                 lease_timeout=_job_playback_lease_seconds(job),
+                completed_result=True,
             )
             headers = {"X-Playback-Epoch": str(playback_status["playback_epoch"])}
         return FileResponse(
@@ -769,6 +829,8 @@ def register_generation_routes(app, ctx):
             job.status["ephemeral_cleaned"] = True
             job.status["updated_at"] = time.time()
         job.persist()
+
+    jobs.cleanup_callback = _remove_ephemeral_job_audio
 
     @app.delete("/api/generate-stream/{job_id}/ephemeral-audio")
     async def generate_stream_delete_ephemeral_audio(job_id: str) -> JSONResponse:

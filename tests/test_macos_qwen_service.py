@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import types
 import wave
@@ -38,6 +39,12 @@ def load_app_module():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._test_workspace = tempfile.TemporaryDirectory(prefix="qwen-test-defaults-")
+    default_root = Path(module._test_workspace.name)
+    module.DEFAULT_PRESET_DIR = default_root / "presets"
+    module.DEFAULT_DOCUMENT_PROJECT_DIR = default_root / "documents"
+    module.DEFAULT_SERVICE_JOB_DIR = default_root / "jobs"
+    module.DEFAULT_PERFORMANCE_TUNING_PATH = default_root / "performance.json"
     return module
 
 
@@ -113,7 +120,13 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert reader_icon.status_code == 200
         assert reader_icon.headers["content-type"] == "image/png"
         assert '"/api/service-settings"' in reader_script.text
-        assert '"/api/presets"' not in reader_script.text
+        # Books keep their own voice; presets are offered as choices for a book.
+        assert '"/api/presets"' in reader_script.text
+        assert 'form.append("use_service_settings", "0")' in reader_script.text
+        assert 'id="book-voice-dialog"' in reader.text
+        assert 'id="toc-search"' in reader.text
+        assert 'id="library-search"' in reader.text
+        assert 'name="import-mode"' in reader.text
         assert 'form.set("qwen_non_streaming_mode", "1")' in reader_script.text
         assert 'ephemeral-audio' in reader_script.text
         assert "queueQualityBlock" in reader_script.text
@@ -132,7 +145,7 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert "remainingListeningSegments" in reader_script.text
         assert "activatePlaybackChapter" in reader_script.text
         assert 'stopCurrentGeneration' in reader_script.text
-        assert "renameManagedBook" in reader_script.text
+        assert "saveManagedBook" in reader_script.text
         assert "deleteManagedBook" in reader_script.text
         assert 'method: "DELETE"' in reader_script.text
         performance = client.get("/api/performance")
@@ -161,7 +174,7 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert '"v1/audio/transcriptions"' in stt_source
         assert 'Label("保存", systemImage: "square.and.arrow.down")' in stt_source
         assert 'CommandLine.arguments.contains("--background")' in app_source
-        assert 'NSAttributedString(string: "TTS"' in app_source
+        assert 'image.accessibilityDescription = "Qwen TTS 语音工作台"' in app_source
         assert 'title: "强制停止所有音频与运算"' in app_source
         assert 'title: "启动本地服务"' in app_source
         assert 'title: "停止本地服务"' in app_source
@@ -174,8 +187,12 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert 'api/stt/\\(enabled ? "start" : "stop")' in native_source
         assert 'onTTSServiceToggleRequested' in native_source
         assert 'onSTTServiceToggleRequested' in native_source
-        assert '"应用当前设置"' in native_source
-        assert '.disabled(model.referenceAudioPath.isEmpty || model.isApplyingServiceSettings)' in native_source
+        assert '"设为服务默认"' in native_source
+        assert "model.referenceAudioPath.isEmpty\n                                || model.isApplyingServiceSettings" in native_source
+        # Loading/saving a preset never silently changes the service default.
+        assert "func makePresetServiceDefault(_ preset: NativePreset)" in native_source
+        assert "serviceActivePresetID" in native_source
+        assert 'Button("载入") { model.applySelectedPreset() }' in native_source
         assert '.disabled(model.outputAudioURL == nil || model.isApplyingServiceSettings)' not in native_source
         assert '?playback=1' in native_source
         assert 'voiceStatusItem?.title = "当前音色：' in app_source
@@ -194,7 +211,7 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         assert "prepareReferenceAudioForTrimming" in native_source
         assert 'panel.allowedContentTypes = [.audio, .movie, .video]' in native_source
         assert 'title: isVideo ? "裁剪视频音轨" : "裁剪导入音频"' in native_source
-        assert 'asset.tracks(withMediaType: .audio).isEmpty' in native_source
+        assert 'try await asset.loadTracks(withMediaType: .audio)' in native_source
         assert '"导入音频/视频"' in native_source
         assert "func trimReference(_ reference: NativeReferenceAudio)" in native_source
         assert 'Label("裁剪", systemImage: "scissors")' in native_source
@@ -246,6 +263,29 @@ def test_mac_app_only_exposes_qwen_profiles(tmp_path: Path) -> None:
         )
         assert renamed_book.status_code == 200
         assert renamed_book.json()["name"] == "重命名后的小说"
+        filed = client.put(f"/api/document-projects/{book_id}", json={"series": "测试系列"})
+        assert filed.status_code == 200
+        assert filed.json()["series"] == "测试系列"
+        assert filed.json()["name"] == "重命名后的小说"
+        appended = client.post(
+            f"/api/document-projects/{book_id}/append",
+            files={"document": ("下册.txt", "第二章 继续\n后续正文。", "text/plain")},
+            data={"volume_title": "下册"},
+        )
+        assert appended.status_code == 200
+        assert [volume["title"] for volume in appended.json()["volumes"]] == ["测试小说", "下册"]
+        book_settings = dict(appended.json()["settings"])
+        bitrate_only = client.put(
+            f"/api/document-projects/{book_id}/settings",
+            json={"settings": {**book_settings, "seed": book_settings["configured_seed"], "aac_bitrate": "64k"}},
+        )
+        assert bitrate_only.status_code == 200
+        assert bitrate_only.json()["audio_reset"] is False
+        assert bitrate_only.json()["settings"]["aac_bitrate"] == "64k"
+        assert client.put(f"/api/document-projects/{book_id}/settings", json={"settings": "x"}).status_code == 400
+        summaries = client.get("/api/document-projects").json()["projects"]
+        assert summaries[0]["series"] == "测试系列"
+        assert summaries[0]["volume_count"] == 2
         deleted_book = client.delete(f"/api/document-projects/{book_id}")
         assert deleted_book.status_code == 200
         assert client.get(f"/api/document-projects/{book_id}").status_code == 404
@@ -677,8 +717,8 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
     module = load_app_module()
     module.DEFAULT_SERVICE_JOB_DIR = tmp_path / "jobs"
     chunks = [
-        module.torch.tensor([[0.10, -0.10, 0.20, -0.20]], dtype=module.torch.float32),
-        module.torch.tensor([[0.30, -0.30, 0.40, -0.40]], dtype=module.torch.float32),
+        (np.array([0.10, -0.10, 0.20, -0.20]) * 32767.0).round().astype("<i2").tobytes(),
+        (np.array([0.30, -0.30, 0.40, -0.40]) * 32767.0).round().astype("<i2").tobytes(),
     ]
 
     class FakeRuntime:
@@ -693,12 +733,12 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
                 data={"sample_rate": 24000, "channels": 1},
             )
             elapsed = 0.0
-            for index, waveform in enumerate(chunks, start=1):
-                elapsed += waveform.shape[-1] / 24000
+            for index, pcm in enumerate(chunks, start=1):
+                elapsed += len(pcm) / 2 / 24000
                 yield types.SimpleNamespace(
                     type="audio",
                     data={
-                        "waveform": waveform,
+                        "pcm16": pcm,
                         "generated_frames": index,
                         "emitted_audio_seconds": elapsed,
                         "generated_audio_seconds": elapsed,
@@ -750,7 +790,7 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
             }
 
         @contextmanager
-        def session(self, _profile):
+        def session(self, _profile, **_kwargs):
             yield FakeRuntime()
 
         def status(self):
@@ -802,7 +842,7 @@ def test_tts_audio_endpoint_streams_generated_pcm_chunks(monkeypatch, tmp_path: 
             payload = b"".join(streamed.iter_raw())
             assert streamed.headers["x-audio-codec"] == "pcm_s16le"
             assert streamed.headers["x-audio-sample-rate"] == "24000"
-        expected = b"".join(module._pcm16le_bytes(chunk, 1) for chunk in chunks)
+        expected = b"".join(chunks)
         assert payload == expected
         status = client.get(f"/api/generate-stream/{job_id}/status").json()
         assert status["state"] == "finished"
@@ -952,7 +992,7 @@ def test_dead_qwen_worker_is_retired_and_restarted(tmp_path: Path) -> None:
         process = FakeProcess(9)
         closed = False
 
-        def generate(self, _payload):
+        def generate(self, _payload, **_kwargs):
             if False:
                 yield {}
             raise RuntimeError("worker crashed")
@@ -983,6 +1023,11 @@ def test_dead_qwen_worker_is_retired_and_restarted(tmp_path: Path) -> None:
     runtime._available.put(dead)
     runtime._worker_lock = threading.RLock()
     runtime._worker_config = {}
+    runtime._desired_lanes = 1
+    runtime._restart_epoch = 0
+    runtime._recovering = {}
+    runtime._lane_errors = {}
+    runtime._worker_wait_timeout = 2
     runtime.reference_audio_cache = {}
     runtime.reference_audio_cache_hits = 0
     runtime.reference_audio_cache_misses = 0
@@ -1045,6 +1090,8 @@ def test_ggml_worker_passes_effective_seed_to_native_stream(tmp_path: Path) -> N
     state.reference_keys = set()
     state.model = FakeModel()
     state.sample_rate = 24000
+    state.reference_roots = (Path(tempfile.gettempdir()).resolve(),)
+    state.output_roots = (Path(tempfile.gettempdir()).resolve(),)
 
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"test")
@@ -1095,6 +1142,8 @@ def make_worker_state(worker_module, model):
     state.reference_keys = set()
     state.model = model
     state.sample_rate = 24000
+    state.reference_roots = (Path(tempfile.gettempdir()).resolve(),)
+    state.output_roots = (Path(tempfile.gettempdir()).resolve(),)
     return state
 
 
@@ -1102,6 +1151,7 @@ def test_worker_retries_runaway_generation_with_fresh_seed(tmp_path: Path) -> No
     worker_module = load_worker_module()
     worker_module.RUNAWAY_MIN_BUDGET_SECONDS = 2.0
     worker_module.RUNAWAY_SECONDS_PER_CHAR = 0.0
+    worker_module.RUNAWAY_BASE_SECONDS = 0.0
     worker_module._retry_seed = lambda previous: 777777
 
     class RunawayThenHealthyModel:
@@ -1167,6 +1217,7 @@ def test_worker_aborts_when_runaway_persists_after_retry(tmp_path: Path) -> None
     worker_module = load_worker_module()
     worker_module.RUNAWAY_MIN_BUDGET_SECONDS = 2.0
     worker_module.RUNAWAY_SECONDS_PER_CHAR = 0.0
+    worker_module.RUNAWAY_BASE_SECONDS = 0.0
     worker_module._retry_seed = lambda previous: 777777
 
     class AlwaysRunawayModel:
@@ -1283,7 +1334,7 @@ def test_stream_audio_headers_report_profile_format_while_job_queued(
             }
 
         @contextmanager
-        def session(self, _profile):
+        def session(self, _profile, **_kwargs):
             # 让任务停在 loading_runtime：并发占满 lane 时客户端立刻拉流，
             # 修复前头部会泄露 48000/2 占位默认值
             gate.wait(timeout=10.0)

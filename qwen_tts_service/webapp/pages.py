@@ -1,23 +1,9 @@
 # coding=utf-8
-"""HTML rendering for the service login page and the studio workbench."""
+"""HTML rendering for the service login page."""
 
 from __future__ import annotations
 
 import html as html_lib
-import json
-from typing import Any
-
-from webapp.config import REPO_ROOT
-
-STUDIO_TEMPLATE_PATH = REPO_ROOT / "web" / "studio" / "index.html"
-_STUDIO_TEMPLATE_CACHE: str | None = None
-
-
-def _studio_template() -> str:
-    global _STUDIO_TEMPLATE_CACHE
-    if _STUDIO_TEMPLATE_CACHE is None:
-        _STUDIO_TEMPLATE_CACHE = STUDIO_TEMPLATE_PATH.read_text(encoding="utf-8")
-    return _STUDIO_TEMPLATE_CACHE
 
 
 def _login_html(*, next_path: str, error: str) -> str:
@@ -38,19 +24,3 @@ button{{width:100%;margin-top:16px;padding:11px;border:0;border-radius:7px;backg
 <input type="hidden" name="next_path" value="{safe_next}"><label for="password">服务密码</label>
 <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
 <button type="submit">登录</button></form></body></html>"""
-
-
-def _html(*, defaults: dict[str, Any], examples: list[dict[str, str]], voices: list[dict[str, str]], languages: list[str], runtime: dict[str, Any]) -> str:
-    replacements = {
-        "__DEFAULT_TEXT__": json.dumps(defaults["text"], ensure_ascii=False),
-        "__DEFAULT_MAX_NEW_TOKENS__": str(defaults["max_new_tokens"]),
-        "__DEFAULT_SEED__": str(defaults["seed"]),
-        "__EXAMPLES_JSON__": json.dumps(examples, ensure_ascii=False),
-        "__VOICES_JSON__": json.dumps(voices, ensure_ascii=False),
-        "__LANGUAGES_JSON__": json.dumps(languages, ensure_ascii=False),
-        "__RUNTIME_JSON__": json.dumps(runtime, ensure_ascii=False),
-    }
-    html = _studio_template()
-    for key, value in replacements.items():
-        html = html.replace(key, value)
-    return html

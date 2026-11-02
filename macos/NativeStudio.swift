@@ -357,16 +357,21 @@ struct NativeStudioView: View {
                         Picker("已保存", selection: $model.selectedPresetID) {
                             Text("选择预设…").tag("")
                             ForEach(model.presets) { preset in
-                                Text(preset.name).tag(preset.id)
+                                Text(
+                                    preset.id == model.serviceActivePresetID
+                                        ? "\(preset.name) · 服务默认"
+                                        : preset.name
+                                ).tag(preset.id)
                             }
                         }
                         TextField("预设名称", text: $model.presetName)
                             .textFieldStyle(.roundedBorder)
                             .frame(height: StudioTokens.compactControlHeight)
                         HStack(spacing: StudioTokens.space2) {
-                            Button("应用") { model.applySelectedPreset() }
+                            Button("载入") { model.applySelectedPreset() }
                                 .buttonStyle(StudioSecondaryButtonStyle())
                                 .disabled(model.selectedPresetID.isEmpty)
+                                .help("把预设参数载入编辑器试听；不会改变服务默认")
                             Button("保存新预设") { model.savePreset(update: false) }
                                 .buttonStyle(StudioTintedButtonStyle())
                                 .disabled(model.isSavingPreset)
@@ -374,6 +379,10 @@ struct NativeStudioView: View {
                                 .buttonStyle(StudioSecondaryButtonStyle())
                                 .disabled(model.selectedPresetID.isEmpty || model.isSavingPreset)
                         }
+                        Text("载入、保存、更新只影响编辑器和预设本身；要让 API 与新书使用，请点下方“设为服务默认”。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         Button("删除选中预设", role: .destructive) { model.deleteSelectedPreset() }
                             .buttonStyle(
                                 StudioSecondaryButtonStyle(
@@ -411,13 +420,19 @@ struct NativeStudioView: View {
                             model.applyCurrentAsServiceSettings()
                         } label: {
                             Label(
-                                model.isApplyingServiceSettings ? "正在应用…" : "应用当前设置",
+                                model.isApplyingServiceSettings
+                                    ? "正在应用…"
+                                    : model.editorIsServiceDefault ? "已是服务默认" : "设为服务默认",
                                 systemImage: "checkmark.seal.fill"
                             )
                             .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(StudioTintedButtonStyle())
-                        .disabled(model.referenceAudioPath.isEmpty || model.isApplyingServiceSettings)
+                        .disabled(
+                            model.referenceAudioPath.isEmpty
+                                || model.isApplyingServiceSettings
+                                || model.editorIsServiceDefault
+                        )
                         Text(model.serviceSettingsStatus)
                             .font(.caption)
                             .foregroundStyle(
@@ -425,6 +440,10 @@ struct NativeStudioView: View {
                                     ? Color.green
                                     : Color.secondary
                             )
+                        Text("服务默认用于 API 调用和新导入的书；已导入的书各自保存音色，可在声阅的“本书朗读设置”中修改。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         VStack(spacing: StudioTokens.space2) {
                             HStack(spacing: StudioTokens.space2) {
                                 Button {
@@ -578,25 +597,28 @@ struct NativeStudioView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: StudioTokens.space4) {
                 GroupBox("文本试听") {
-                    TextEditor(text: $model.text)
-                        .font(.system(size: 17))
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 205)
-                        .padding(StudioTokens.space3)
-                        .background(
-                            Color(nsColor: .textBackgroundColor).opacity(0.68),
-                            in: RoundedRectangle(
-                                cornerRadius: StudioTokens.elementRadius,
-                                style: .continuous
+                    VStack(alignment: .leading, spacing: StudioTokens.space3) {
+                        TextEditor(text: $model.text)
+                            .font(.system(size: 17))
+                            .scrollContentBackground(.hidden)
+                            .frame(minHeight: 205)
+                            .padding(StudioTokens.space3)
+                            .background(
+                                Color(nsColor: .textBackgroundColor).opacity(0.68),
+                                in: RoundedRectangle(
+                                    cornerRadius: StudioTokens.elementRadius,
+                                    style: .continuous
+                                )
                             )
-                        )
-                        .overlay {
-                            RoundedRectangle(
-                                cornerRadius: StudioTokens.elementRadius,
-                                style: .continuous
-                            )
-                                .strokeBorder(.primary.opacity(0.08), lineWidth: 0.7)
-                        }
+                            .overlay {
+                                RoundedRectangle(
+                                    cornerRadius: StudioTokens.elementRadius,
+                                    style: .continuous
+                                )
+                                    .strokeBorder(.primary.opacity(0.08), lineWidth: 0.7)
+                            }
+                        generationControls
+                    }
                 }
 
                 GroupBox {
@@ -741,55 +763,64 @@ struct NativeStudioView: View {
                         )
                     }
                 }
-
-                GroupBox("生成与试听") {
-                    VStack(alignment: .leading, spacing: StudioTokens.space3) {
-                        HStack(spacing: StudioTokens.space2) {
-                            Button {
-                                model.generate()
-                            } label: {
-                                Label(model.isGenerating ? "生成中…" : "生成语音", systemImage: "waveform.badge.plus")
-                            }
-                            .buttonStyle(StudioPrimaryButtonStyle())
-                            .frame(maxWidth: 300)
-                            .disabled(model.isGenerating || !model.serviceReady)
-                            Button("停止") { model.stopGeneration() }
-                                .buttonStyle(
-                                    StudioTintedButtonStyle(
-                                        destructive: true,
-                                        height: StudioTokens.primaryControlHeight
-                                    )
-                                )
-                                .frame(width: 110)
-                                .disabled(!model.isGenerating)
-                            Button {
-                                model.playOutput()
-                            } label: {
-                                Label("试听结果", systemImage: "play.circle.fill")
-                            }
-                            .buttonStyle(
-                                StudioSecondaryButtonStyle(
-                                    height: StudioTokens.primaryControlHeight
-                                )
-                            )
-                            .frame(width: 142)
-                            .disabled(model.outputAudioURL == nil)
-                        }
-                        ProgressView(value: model.generatedProgress)
-                            .tint(StudioTokens.accent)
-                        Text(model.generationSummary)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        if !model.errorMessage.isEmpty {
-                            Text(model.errorMessage)
-                                .font(.callout)
-                                .foregroundStyle(.red)
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
             }
             .padding(StudioTokens.space5)
+        }
+    }
+
+    /// Generate / stop / play buttons with progress and status, shown under the text editor.
+    private var generationControls: some View {
+        VStack(alignment: .leading, spacing: StudioTokens.space3) {
+            HStack(spacing: StudioTokens.space2) {
+                Button {
+                    model.generate()
+                } label: {
+                    Label(model.isGenerating ? "生成中…" : "生成语音", systemImage: "waveform.badge.plus")
+                }
+                .buttonStyle(StudioPrimaryButtonStyle())
+                .frame(maxWidth: 300)
+                .disabled(model.isGenerating || !model.serviceReady)
+                Button("停止") { model.stopGeneration() }
+                    .buttonStyle(
+                        StudioTintedButtonStyle(
+                            destructive: true,
+                            height: StudioTokens.primaryControlHeight
+                        )
+                    )
+                    .frame(width: 110)
+                    .disabled(!model.isGenerating && !model.isStreamPlaying)
+                Button {
+                    model.playOutput()
+                } label: {
+                    Label("试听结果", systemImage: "play.circle.fill")
+                }
+                .buttonStyle(
+                    StudioSecondaryButtonStyle(
+                        height: StudioTokens.primaryControlHeight
+                    )
+                )
+                .frame(width: 142)
+                .disabled(model.outputAudioURL == nil)
+                Picker("语速", selection: $model.playbackRate) {
+                    ForEach(NativeStudioViewModel.playbackRateOptions, id: \.self) { rate in
+                        Text(NativeStudioViewModel.playbackRateLabel(rate)).tag(rate)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 130)
+                .help("只调整播放速度（变速不变调），不影响生成内容；对流式播放和试听结果都生效")
+            }
+            ProgressView(value: model.generatedProgress)
+                .tint(StudioTokens.accent)
+            Text(model.generationSummary)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if !model.errorMessage.isEmpty {
+                Text(model.errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
         }
     }
 

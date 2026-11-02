@@ -14,8 +14,6 @@ import subprocess  # noqa: F401  (re-exported for tests)
 import sys
 from pathlib import Path
 
-import torch  # noqa: F401  (re-exported for tests)
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STREAMING_MODULE_DIR = REPO_ROOT / "qwen_tts_service"
 if str(STREAMING_MODULE_DIR) not in sys.path:

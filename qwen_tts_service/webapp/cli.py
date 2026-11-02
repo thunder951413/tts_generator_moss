@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import logging
+import logging.handlers
 import os
+import re
+from pathlib import Path
 
 import uvicorn
 
 from webapp.app_factory import create_app
 from webapp.config import (
+    REPO_ROOT,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PRESET_DIR,
     DEFAULT_QWEN_0_6B_MODEL_DIR,
@@ -25,6 +30,94 @@ from webapp.config import (
     DEFAULT_WHISPER_PORT,
     DEFAULT_WHISPER_SERVER,
 )
+
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_FILE_NAME = "service.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+# Polling endpoints that would otherwise dominate the access log (the menu-bar
+# app and reader poll these every few hundred milliseconds).
+_QUIET_ACCESS_PATHS = (
+    re.compile(r"^/api/health$"),
+    re.compile(r"^/api/playback/status$"),
+    re.compile(r"^/api/generate-stream/[^/]+/status$"),
+    re.compile(r"^/api/document-projects/[^/]+/progress$"),
+)
+
+
+class QuietPollingAccessFilter(logging.Filter):
+    """Drop successful (2xx/304) polling requests and HEAD probes from uvicorn.access."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        method, path, status = str(args[1]), str(args[2]), args[4]
+        try:
+            status_code = int(status)
+        except (TypeError, ValueError):
+            return True
+        successful = 200 <= status_code < 300 or status_code == 304
+        if not successful:
+            return True
+        if method.upper() == "HEAD":
+            return False
+        path = path.split("?", 1)[0]
+        return not any(pattern.match(path) for pattern in _QUIET_ACCESS_PATHS)
+
+
+def _resolve_log_dir() -> Path | None:
+    configured = os.environ.get("QWEN_TTS_LOG_DIR")
+    if configured is None:
+        return REPO_ROOT / "logs"
+    configured = configured.strip()
+    if not configured or configured.lower() in {"-", "none", "off"}:
+        return None
+    return Path(configured).expanduser()
+
+
+def configure_logging(log_dir: Path | None = None, *, level: int = logging.INFO) -> Path | None:
+    """Route root + uvicorn logs to stderr and a rotating ``service.log``.
+
+    Returns the log file path (None when file logging is disabled).
+    Idempotent: handlers installed by an earlier call are replaced.
+    """
+    formatter = logging.Formatter(LOG_FORMAT)
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if getattr(handler, "_qwen_service_handler", False):
+            root.removeHandler(handler)
+            handler.close()
+    # QWEN_TTS_LOG_STDERR=0 lets a launcher that already captures stderr into
+    # an unrotated file rely on service.log alone.
+    stderr_enabled = os.environ.get("QWEN_TTS_LOG_STDERR", "1").strip().lower() not in {"0", "false", "no", "off"}
+    handlers: list[logging.Handler] = [logging.StreamHandler()] if stderr_enabled or log_dir is None else []
+    log_path: Path | None = None
+    if log_dir is not None:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / LOG_FILE_NAME
+            handlers.append(logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+            ))
+        except OSError:
+            log_path = None
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        handler._qwen_service_handler = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+    root.setLevel(level)
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.propagate = True
+        logger.setLevel(level)
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, QuietPollingAccessFilter) for item in access.filters):
+        access.addFilter(QuietPollingAccessFilter())
+    return log_path
 
 
 def _is_loopback_bind_host(host: str) -> bool:
@@ -134,6 +227,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    log_path = configure_logging(_resolve_log_dir())
+    if log_path is not None:
+        logging.getLogger("qwen-service").info("logging to %s", log_path)
     try:
         _validate_bind_security(args.host, args.access_password)
     except ValueError as exc:
@@ -162,4 +258,6 @@ def main() -> None:
         whisper_port=args.whisper_port,
         whisper_threads=max(1, int(args.whisper_threads)),
     )
-    uvicorn.run(app, host=args.host, port=int(args.port))
+    # log_config=None keeps the handlers/filters configured above instead of
+    # uvicorn's dictConfig; access logging stays on but is filtered.
+    uvicorn.run(app, host=args.host, port=int(args.port), log_config=None, access_log=True)

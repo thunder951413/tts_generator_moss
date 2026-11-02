@@ -24,7 +24,7 @@ def test_novel_chapters_are_detected_and_mapped_to_segments(tmp_path: Path) -> N
 
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=lambda *_args, **_kwargs: iter(()),
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -84,7 +84,7 @@ def test_book_pipeline_uses_two_lanes_and_preserves_segment_order(tmp_path: Path
 
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=synthesize,
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -181,7 +181,7 @@ def test_book_pipeline_stop_finishes_active_blocks_then_pauses(tmp_path: Path) -
 
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=synthesize,
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -229,7 +229,7 @@ def test_book_pipeline_stop_finishes_active_blocks_then_pauses(tmp_path: Path) -
 def test_book_merge_failure_is_retryable_and_retains_completed_aac(tmp_path: Path) -> None:
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=lambda *_args, **_kwargs: iter(()),
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -279,7 +279,7 @@ def test_book_merge_failure_is_retryable_and_retains_completed_aac(tmp_path: Pat
 def test_stop_during_book_merge_preserves_pause_state(tmp_path: Path) -> None:
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=lambda *_args, **_kwargs: iter(()),
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -329,7 +329,7 @@ def test_scheduler_queue_cancellation_pauses_project_for_retry(tmp_path: Path) -
 
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=cancelled_synthesis,
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -354,7 +354,7 @@ def test_scheduler_queue_cancellation_pauses_project_for_retry(tmp_path: Path) -
 def test_reference_usage_includes_persisted_book_settings(tmp_path: Path) -> None:
     manager = DocumentProjectManager(
         root_dir=tmp_path / "projects",
-        runtime_session=lambda _profile: nullcontext(object()),
+        runtime_session=lambda _profile, **_kwargs: nullcontext(object()),
         synthesize_fn=lambda *_args, **_kwargs: iter(()),
         request_cls=StreamingRequest,
         generation_lock=nullcontext(),
@@ -375,3 +375,40 @@ def test_reference_usage_includes_persisted_book_settings(tmp_path: Path) -> Non
     )
     assert project["id"]
     assert manager.reference_usage(reference) == ["书籍《使用音色的书》"]
+
+
+def test_slow_encoder_bounds_pending_synthesis(tmp_path: Path) -> None:
+    """A blocked encoder must not let GPU generation fill disk with the book."""
+    encoded = threading.Event()
+    release = threading.Event()
+    produced = []
+    lock = threading.Lock()
+
+    def synthesize(_runtime, request, *, output_dir):
+        with lock:
+            produced.append(request.text)
+        source = Path(output_dir) / 'temporary.wav'
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b'wav')
+        yield SimpleNamespace(type='result', data={'audio_path':str(source),'metadata':{'duration_seconds':1}})
+
+    manager = DocumentProjectManager(root_dir=tmp_path/'projects',
+        runtime_session=lambda *_a,**_k:nullcontext(object()), synthesize_fn=synthesize,
+        request_cls=StreamingRequest,generation_lock=nullcontext(),ffmpeg_path='ffmpeg',synthesis_workers=2)
+    def encode(_project_id,index,_synthesis):
+        encoded.set()
+        assert release.wait(3)
+        return {'audio_file':f'segments/{index:06d}.m4a','duration_seconds':1,'generation_seconds':.1}
+    manager._encode_segment_aac = encode
+    manager._merge_final_audio = lambda manifest:manifest.update(final_audio='final/complete.m4a')
+    project=manager.create_project(name='转码背压',filename='test.txt',
+        data=('这是需要逐段生成的测试正文。'*60).encode(), settings={},max_chars=40)
+    manager.start(project['id'])
+    try:
+        assert encoded.wait(2)
+        time.sleep(.3)
+        assert len(produced) <= 4
+    finally:
+        release.set()
+    manager._threads[project['id']].join(3)
+    assert manager.get_project(project['id'])['state']=='completed'

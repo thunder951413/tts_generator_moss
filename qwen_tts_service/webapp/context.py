@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 
@@ -40,6 +42,7 @@ class ServiceContext:
         preset_payload: Callable[[dict[str, Any]], tuple[str, dict[str, Any]]],
         remove_generated_result_files: Callable[[dict[str, Any] | None], None],
         tts_enabled: bool = True,
+        blocking_executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.runtime_manager = runtime_manager
         self.performance_tuning = performance_tuning
@@ -67,3 +70,14 @@ class ServiceContext:
         self.stt_epoch = 0
         self.stt_requests = 0
         self.control_lock = asyncio.Lock()
+        # Long waits (playback admission up to 600 s x 64 waiters, queued STT,
+        # runtime warm-up) run here instead of asyncio's small default pool so
+        # they can never starve short ``asyncio.to_thread`` work.
+        self.blocking_executor = blocking_executor or ThreadPoolExecutor(
+            max_workers=96, thread_name_prefix="qwen-wait"
+        )
+
+    def run_blocking(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> "asyncio.Future[Any]":
+        """Run a long blocking wait on the dedicated executor."""
+        loop = asyncio.get_running_loop()
+        return loop.run_in_executor(self.blocking_executor, functools.partial(function, *args, **kwargs))

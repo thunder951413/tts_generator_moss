@@ -31,6 +31,13 @@ from runtime_manager import (
 )
 
 from streaming_jobs import DEFAULT_MAX_NEW_TOKENS
+from document_projects import (
+    DEFAULT_MAX_CHARS,
+    MAX_DOCUMENT_BYTES,
+    MAX_MAX_CHARS,
+    MIN_MAX_CHARS,
+    SettingsResetRequired,
+)
 
 from webapp.config import (
     DEFAULT_CLONE_AUDIO_PATH,
@@ -44,6 +51,28 @@ from webapp.util import (
     _safe_float,
     _safe_int,
 )
+
+def _document_language(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    return {
+        "chinese": "Chinese",
+        "english": "English",
+        "japanese": "Japanese",
+        "korean": "Korean",
+    }.get(key, "auto")
+
+
+async def read_document_upload(document: UploadFile) -> bytes:
+    data = bytearray()
+    try:
+        while chunk := await document.read(1024 * 1024):
+            data.extend(chunk)
+            if len(data) > MAX_DOCUMENT_BYTES:
+                raise HTTPException(status_code=413, detail="文档不能超过 30 MB")
+        return bytes(data)
+    finally:
+        await document.close()
+
 
 def register_documents_routes(app, ctx):
     runtime_manager = ctx.runtime_manager
@@ -68,6 +97,7 @@ def register_documents_routes(app, ctx):
     _remove_generated_result_files = ctx.remove_generated_result_files
 
     def require_tts_admission() -> None:
+        app.state.storage_policy.check_admission()
         if not ctx.tts_enabled or bool(getattr(ctx, "stopping", False)):
             raise HTTPException(status_code=503, detail="TTS service is stopping or disabled")
 
@@ -156,12 +186,14 @@ def register_documents_routes(app, ctx):
             "quant": str(runtime_manager.profiles[model_profile]["quant"]),
             "reference_audio_path": str(reference_candidate),
             "voice_name": str(incoming.get("voice_name") or "本地克隆音色")[:120],
-            "language": "Chinese",
-            "temperature": _safe_float(incoming.get("temperature"), default=1.7, minimum=0.1, maximum=3.0),
-            "top_p": _safe_float(incoming.get("top_p"), default=0.8, minimum=0.1, maximum=1.0),
-            "top_k": _safe_int(incoming.get("top_k"), default=25, minimum=1, maximum=200),
+            # "auto" lets each block detect its language at synthesis time.
+            "language": _document_language(incoming.get("language")),
+            # Qwen3-TTS defaults when nothing is configured.
+            "temperature": _safe_float(incoming.get("temperature"), default=0.9, minimum=0.1, maximum=3.0),
+            "top_p": _safe_float(incoming.get("top_p"), default=1.0, minimum=0.1, maximum=1.0),
+            "top_k": _safe_int(incoming.get("top_k"), default=50, minimum=1, maximum=200),
             "repetition_penalty": _safe_float(
-                incoming.get("repetition_penalty"), default=1.0, minimum=0.8, maximum=2.0
+                incoming.get("repetition_penalty"), default=1.05, minimum=0.8, maximum=2.0
             ),
             "max_new_tokens": _safe_int(
                 incoming.get("max_new_tokens"),
@@ -186,17 +218,24 @@ def register_documents_routes(app, ctx):
             "qwen_min_new_tokens": _safe_int(
                 incoming.get("qwen_min_new_tokens"), default=2, minimum=2, maximum=256
             ),
-            "aac_bitrate": _safe_aac_bitrate(incoming.get("aac_bitrate"), default="80k"),
-            "sample_rate": 48000,
+            "aac_bitrate": _safe_aac_bitrate(incoming.get("aac_bitrate"), default="96k"),
+            "sample_rate": 24000,
             "channels": 1,
         }
 
     @app.get("/api/document-projects")
-    async def list_document_projects() -> JSONResponse:
+    def list_document_projects() -> JSONResponse:
         return JSONResponse({"projects": document_projects.list_projects()})
 
+    @app.get("/api/document-projects/{project_id}/progress")
+    def get_document_project_progress(project_id: str, since: int = 0) -> JSONResponse:
+        try:
+            return JSONResponse(document_projects.get_progress(project_id, since=max(0, int(since))))
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+
     @app.get("/api/document-projects/{project_id}")
-    async def get_document_project(project_id: str) -> JSONResponse:
+    def get_document_project(project_id: str) -> JSONResponse:
         try:
             return JSONResponse(document_projects.get_project(project_id))
         except (FileNotFoundError, ValueError) as exc:
@@ -207,26 +246,44 @@ def register_documents_routes(app, ctx):
         document: UploadFile = File(...),
         name: str = Form(""),
         settings_json: str = Form("{}"),
-        max_chars: int = Form(200),
+        max_chars: int = Form(DEFAULT_MAX_CHARS),
+        series: str = Form(""),
+        voice_label: str = Form(""),
     ) -> JSONResponse:
+        app.state.storage_policy.check_admission()
         try:
-            project = document_projects.create_project(
+            data = await read_document_upload(document)
+            settings = await asyncio.to_thread(document_settings, settings_json)
+            project = await asyncio.to_thread(document_projects.create_project,
                 name=name,
                 filename=document.filename or "document.txt",
-                data=await document.read(),
-                settings=document_settings(settings_json),
-                max_chars=_safe_int(max_chars, default=200, minimum=40, maximum=500),
+                data=data,
+                settings=settings,
+                max_chars=_safe_int(
+                    max_chars, default=DEFAULT_MAX_CHARS, minimum=MIN_MAX_CHARS, maximum=MAX_MAX_CHARS
+                ),
+                series=series,
+                voice_label=voice_label,
             )
             return JSONResponse(project)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/document-projects/{project_id}/append")
-    async def append_document_project(project_id: str, document: UploadFile = File(...)) -> JSONResponse:
+    async def append_document_project(
+        project_id: str,
+        document: UploadFile = File(...),
+        volume_title: str = Form(""),
+    ) -> JSONResponse:
+        app.state.storage_policy.check_admission()
         try:
+            data = await read_document_upload(document)
             return JSONResponse(
-                document_projects.append_document(
-                    project_id, filename=document.filename or "document.txt", data=await document.read()
+                await asyncio.to_thread(document_projects.append_document,
+                    project_id,
+                    filename=document.filename or "document.txt",
+                    data=data,
+                    volume_title=volume_title,
                 )
             )
         except FileNotFoundError as exc:
@@ -235,10 +292,10 @@ def register_documents_routes(app, ctx):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/document-projects/{project_id}/start")
-    async def start_document_project(project_id: str) -> JSONResponse:
+    def start_document_project(project_id: str) -> JSONResponse:
         try:
             require_tts_admission()
-            project = document_projects.get_project(project_id)
+            project = document_projects.get_summary(project_id)
             apply_performance_profile(
                 str((project.get("settings") or {}).get("model_profile") or DEFAULT_MODEL_PROFILE)
             )
@@ -251,7 +308,7 @@ def register_documents_routes(app, ctx):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/document-projects/{project_id}/start-selection")
-    async def start_document_project_selection(
+    def start_document_project_selection(
         project_id: str,
         segment_start: int = Form(0),
         segment_end: int = Form(0),
@@ -259,7 +316,7 @@ def register_documents_routes(app, ctx):
     ) -> JSONResponse:
         try:
             require_tts_admission()
-            project = document_projects.get_project(project_id)
+            project = document_projects.get_summary(project_id)
             requested_settings = document_settings(settings_json) if settings_json.strip() else None
             apply_performance_profile(
                 str(
@@ -267,7 +324,7 @@ def register_documents_routes(app, ctx):
                     or DEFAULT_MODEL_PROFILE
                 )
             )
-            maximum = max(0, len(project.get("segments", [])) - 1)
+            maximum = max(0, int((project.get("stats") or {}).get("total_segments", 0)) - 1)
             start_index = _safe_int(segment_start, default=0, minimum=0, maximum=maximum)
             end_index = _safe_int(
                 segment_end,
@@ -288,14 +345,14 @@ def register_documents_routes(app, ctx):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/document-projects/{project_id}/stop")
-    async def stop_document_project(project_id: str) -> JSONResponse:
+    def stop_document_project(project_id: str) -> JSONResponse:
         try:
             return JSONResponse(document_projects.stop(project_id))
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
 
     @app.delete("/api/document-projects/{project_id}")
-    async def delete_document_project(project_id: str) -> JSONResponse:
+    def delete_document_project(project_id: str) -> JSONResponse:
         try:
             document_projects.delete(project_id)
             return JSONResponse({"ok": True})
@@ -305,36 +362,75 @@ def register_documents_routes(app, ctx):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/api/document-projects/{project_id}")
-    async def rename_document_project(
+    def update_document_project(
         project_id: str,
         payload: dict[str, Any] = Body(...),
     ) -> JSONResponse:
+        """Update book metadata; only the keys present are changed."""
+        volumes = payload.get("volumes")
         try:
             return JSONResponse(
-                document_projects.rename(project_id, name=str(payload.get("name") or ""))
+                document_projects.update_metadata(
+                    project_id,
+                    name=str(payload["name"]) if "name" in payload else None,
+                    series=str(payload.get("series") or "") if "series" in payload else None,
+                    volumes=volumes if isinstance(volumes, list) else None,
+                )
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.put("/api/document-projects/{project_id}/settings")
+    def update_document_settings(
+        project_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        """Change the book's own voice. The service default never changes a book
+        implicitly; a change that would discard audio needs ``confirm_reset``."""
+        incoming = payload.get("settings")
+        if not isinstance(incoming, dict):
+            raise HTTPException(status_code=400, detail="settings must be an object")
+        settings = document_settings(json.dumps(incoming))
+        try:
+            return JSONResponse(
+                document_projects.update_settings(
+                    project_id,
+                    settings,
+                    confirm_reset=bool(payload.get("confirm_reset")),
+                    voice_label=str(payload.get("voice_label") or ""),
+                )
+            )
+        except SettingsResetRequired as exc:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": str(exc), "code": "reset_required", "completed_segments": exc.completed},
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/document-projects/{project_id}/playback")
-    async def save_document_playback(
+    def save_document_playback(
         project_id: str,
         segment_index: int = Form(0),
         offset_seconds: float = Form(0.0),
+        captured_at: float = Form(0.0),
+        seed: int = Form(-1),
     ) -> JSONResponse:
         try:
             return JSONResponse(
                 document_projects.update_playback(
-                    project_id, segment_index=segment_index, offset_seconds=offset_seconds
+                    project_id, segment_index=segment_index, offset_seconds=offset_seconds, captured_at=captured_at, seed=seed
                 )
             )
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
 
     @app.put("/api/document-projects/{project_id}/segments/{segment_index}")
-    async def update_document_segment(
+    def update_document_segment(
         project_id: str,
         segment_index: int,
         payload: dict[str, Any] = Body(...),
@@ -361,7 +457,9 @@ def register_documents_routes(app, ctx):
         session_id: str = "",
     ) -> FileResponse:
         try:
-            media_path = document_projects.media_path(project_id, _decode_reference_path(path))
+            media_path = await asyncio.to_thread(
+                document_projects.media_path, project_id, _decode_reference_path(path)
+            )
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="media not found") from exc
         media_type = "audio/mp4" if media_path.suffix.lower() == ".m4a" else "application/octet-stream"

@@ -19,3 +19,10 @@ jobs:
           python -m pip install -e ".[ci]"
       - name: Run tests
         run: python -m pytest tests/ -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Reader playback behavior
+        run: node --test tests/test_reader_playback.cjs tests/test_reader_player.cjs tests/test_reader_library.cjs
+      - name: Native macOS behavior and reader compilation
+        run: ./scripts/test_native_macos.sh

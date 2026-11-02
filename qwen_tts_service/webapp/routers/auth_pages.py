@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hmac
-
 from fastapi import (
     Form,
     Request,
@@ -22,6 +20,7 @@ from webapp.config import (
 )
 
 from webapp.pages import _login_html
+from worker_protocol import secrets_equal
 
 def register_auth_pages_routes(app, ctx):
     runtime_manager = ctx.runtime_manager
@@ -50,7 +49,7 @@ def register_auth_pages_routes(app, ctx):
         if not resolved_access_password:
             return RedirectResponse(url="/", status_code=303)
         supplied = request.cookies.get(SERVICE_AUTH_COOKIE, "")
-        if hmac.compare_digest(supplied, expected_session):
+        if secrets_equal(supplied, expected_session):
             return RedirectResponse(url="/", status_code=303)
         next_path = request.query_params.get("next", "/")
         if not next_path.startswith("/") or next_path.startswith("//"):
@@ -61,7 +60,7 @@ def register_auth_pages_routes(app, ctx):
     async def login_submit(password: str = Form(""), next_path: str = Form("/")):
         if not resolved_access_password:
             return RedirectResponse(url="/", status_code=303)
-        if not hmac.compare_digest(str(password), resolved_access_password):
+        if not secrets_equal(str(password), resolved_access_password):
             return HTMLResponse(_login_html(next_path=next_path, error="密码不正确"), status_code=401)
         if not next_path.startswith("/") or next_path.startswith("//"):
             next_path = "/"

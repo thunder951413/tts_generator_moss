@@ -40,9 +40,28 @@ enum RenameTests {
     }
 
     static func main() {
+        let fixture = FileManager.default.temporaryDirectory.appendingPathComponent("qwen-build-test-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: fixture.appendingPathComponent("qwen_tts_service"), withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: fixture.appendingPathComponent("web/novel_reader"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        try! "pass\n".write(to: fixture.appendingPathComponent("qwen_tts_service/protocol.py"), atomically: true, encoding: .utf8)
+        try! "const version = 2;\n".write(to: fixture.appendingPathComponent("web/novel_reader/reader.js"), atomically: true, encoding: .utf8)
+        let expectedID = "19d175a3cbb71e69940586189c88cff577acfc194574a593cc2f0ae90e660dd8"
+        precondition(LocalService.sourceBuildID(repositoryRoot: fixture) == expectedID, "Source identity: \(LocalService.sourceBuildID(repositoryRoot: fixture) ?? "nil") expected \(expectedID)")
+        let compatibleService = LocalService(repositoryRoot: fixture)
+        let identity: [String: Any] = ["name": "qwen-local-speech", "api_version": 2,
+            "build_id": expectedID, "capabilities": ["worker-auth", "bounded-worker-recovery", "resumable-reader", "storage-policy"]]
+        precondition(compatibleService.compatibilityError(["service": identity]) == nil)
+        precondition(compatibleService.compatibilityError([:]) != nil)
+        var stale = identity
+        stale["build_id"] = "old"
+        precondition(compatibleService.compatibilityError(["service": stale]) != nil)
+
         URLProtocol.registerClass(RenameProtocol.self)
         let service = LocalService(repositoryRoot: FileManager.default.temporaryDirectory)
         let model = NativeStudioViewModel(service: service)
+        model.updateHealth(["state": "degraded", "tts_enabled": true])
+        precondition(model.ttsReady && model.serviceReady, "A healthy remaining lane must stay usable")
         let reference = NativeReferenceAudio(["id": RenameProtocol.referenceID, "name": "旧名字", "path": RenameProtocol.referencePath, "kind": "custom"])!
         model.referenceLibrary = [reference]
         model.voices = [NativeVoice(["name": reference.name, "audio_path": reference.path])!]

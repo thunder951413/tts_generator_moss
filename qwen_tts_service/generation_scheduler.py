@@ -101,6 +101,9 @@ class GpuGenerationScheduler:
                     self._waiting_interactive -= 1
                 else:
                     self._waiting_document -= 1
+                # Waiting counts gate other priorities; wake them now instead
+                # of leaving them to their poll timeout.
+                self._condition.notify_all()
 
     def _acquire_external(self, cancelled: Callable[[], bool] | None = None) -> None:
         with self._condition:
@@ -150,14 +153,6 @@ class GpuGenerationScheduler:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self._release()
-
-    @contextmanager
-    def interactive_slot(self):
-        self._acquire("interactive")
-        try:
-            yield
-        finally:
-            self._release()
 
     @contextmanager
     def document_slot(self, *, cancelled: Callable[[], bool] | None = None):

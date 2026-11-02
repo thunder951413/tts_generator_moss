@@ -122,7 +122,7 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate, WK
                     self.statusText = "正在启动本地 Metal 语音服务…"
                     self.launchAudioService()
                     try? await Task.sleep(for: .milliseconds(900))
-                    self.waitForLocalService(remainingAttempts: 30)
+                    self.waitForLocalService(startedAt: Date())
                 } else {
                     self.presentConnectionError()
                 }
@@ -130,10 +130,20 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate, WK
         }.resume()
     }
 
-    private func waitForLocalService(remainingAttempts: Int) {
-        guard remainingAttempts > 0 else {
+    /// The audio app may need several minutes on first launch (model download and warm-up;
+    /// it allows ~330 s itself). Keep waiting for 180 s, and up to 360 s while the Qwen TTS
+    /// app is still running, showing how long we have waited.
+    private func waitForLocalService(startedAt: Date) {
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let audioAppRunning = !NSRunningApplication
+            .runningApplications(withBundleIdentifier: "local.qwen-tts.audio-studio")
+            .isEmpty
+        guard elapsed < 180 || (audioAppRunning && elapsed < 360) else {
             presentConnectionError()
             return
+        }
+        if elapsed >= 5 {
+            statusText = "正在启动本地 Metal 语音服务…（已等待 \(Int(elapsed)) 秒，首次启动可能需要几分钟）"
         }
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1.2
@@ -144,8 +154,8 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate, WK
                    (200 ... 399).contains(response.statusCode) {
                     self.installLocalSessionCookieAndLoad()
                 } else {
-                    try? await Task.sleep(for: .milliseconds(450))
-                    self.waitForLocalService(remainingAttempts: remainingAttempts - 1)
+                    try? await Task.sleep(for: .milliseconds(elapsed < 30 ? 450 : 1_500))
+                    self.waitForLocalService(startedAt: startedAt)
                 }
             }
         }.resume()
@@ -254,7 +264,7 @@ final class ReaderAppModel: NSObject, ObservableObject, WKNavigationDelegate, WK
         let panel = NSOpenPanel()
         panel.title = "导入小说"
         panel.prompt = "导入"
-        panel.message = "选择 TXT、Markdown 或 DOCX 小说文件"
+        panel.message = "选择 TXT、Markdown 或 DOCX 小说文件；分卷文件可多选，会按文件名顺序导入"
         panel.canChooseFiles = true
         panel.canChooseDirectories = parameters.allowsDirectories
         panel.allowsMultipleSelection = parameters.allowsMultipleSelection

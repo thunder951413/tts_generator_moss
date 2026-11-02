@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import hmac
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,8 @@ from presets import VoicePresetStore
 from qwen_protocol import StreamingRequest
 from stt_runtime import STTUnavailableError, WhisperCppRuntime
 from runtime_manager import DEFAULT_MODEL_PROFILE, RuntimeManager
+from worker_protocol import secrets_equal, decode_header_secret
+from storage_policy import StoragePolicy
 from generation_scheduler import GpuGenerationScheduler
 from streaming_jobs import StreamingJobManager
 from webapp.config import (
@@ -61,6 +65,63 @@ from webapp.routers.voices_presets import register_voices_presets_routes
 from webapp.util import _resolve_allowed_reference_audio_path, _resolve_ffmpeg_path
 
 
+_LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+
+
+class ServiceLoginMiddleware:
+    """Pure ASGI auth/admission middleware.
+
+    Unlike ``@app.middleware("http")`` (BaseHTTPMiddleware) this does not pipe
+    every response body — including each streamed PCM chunk — through an
+    extra memory stream and task, and it reads the playback epoch lock-free.
+    """
+
+    def __init__(
+        self,
+        app,
+        *,
+        password: str,
+        expected_session: str,
+        playback_epoch,
+        tts_epoch,
+    ) -> None:
+        self.app = app
+        self.password = password
+        self.expected_session = expected_session
+        self.playback_epoch = playback_epoch
+        self.tts_epoch = tts_epoch
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        state = scope.setdefault("state", {})
+        state["playback_epoch_at_admission"] = int(self.playback_epoch())
+        state["tts_epoch_at_admission"] = int(self.tts_epoch())
+        client = scope.get("client")
+        state["caller_kind"] = "internal" if client and client[0] in _LOOPBACK_CLIENTS else "external"
+        path = scope.get("path") or "/"
+        if not self.password or scope.get("method") == "OPTIONS" or path in {"/login", "/api/health"}:
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        supplied = request.cookies.get(SERVICE_AUTH_COOKIE, "")
+        authorization = decode_header_secret(request.headers.get("authorization", ""))
+        bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        api_key = decode_header_secret(request.headers.get("x-api-key", ""))
+        session_ok = secrets_equal(supplied, self.expected_session)
+        if session_ok or secrets_equal(bearer, self.password) or secrets_equal(api_key, self.password):
+            state["caller_kind"] = "internal" if session_ok else "external"
+            await self.app(scope, receive, send)
+            return
+        if path.startswith("/api/"):
+            response = JSONResponse({"detail": "authentication required"}, status_code=401)
+        else:
+            next_path = path if path.startswith("/") else "/"
+            response = RedirectResponse(url=f"/login?next={next_path}", status_code=303)
+        await response(scope, receive, send)
+
+
 def create_app(
     *,
     qwen_python: str | Path = DEFAULT_QWEN_PYTHON,
@@ -74,7 +135,7 @@ def create_app(
     qwentts_library: str | Path = DEFAULT_QWENTTS_LIBRARY,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     upload_dir: str | Path = DEFAULT_UPLOAD_DIR,
-    preset_dir: str | Path = DEFAULT_PRESET_DIR,
+    preset_dir: str | Path | None = None,
     document_project_dir: str | Path | None = None,
     service_job_dir: str | Path | None = None,
     performance_tuning_path: str | Path | None = None,
@@ -90,8 +151,11 @@ def create_app(
     whisper_threads: int = 8,
 ) -> FastAPI:
     document_project_dir = Path(document_project_dir or DEFAULT_DOCUMENT_PROJECT_DIR)
+    preset_dir = Path(preset_dir or DEFAULT_PRESET_DIR)
     service_job_dir = Path(service_job_dir or DEFAULT_SERVICE_JOB_DIR)
     performance_tuning_path = Path(performance_tuning_path or DEFAULT_PERFORMANCE_TUNING_PATH)
+    output_dir = Path(output_dir)
+    upload_dir = Path(upload_dir)
     runtime_manager = RuntimeManager(
         qwen_python=str(qwen_python),
         qwen_worker_script=str(qwen_worker_script),
@@ -102,6 +166,8 @@ def create_app(
         qwen_backend=str(qwen_backend),
         qwen_quant=str(qwen_quant),
         qwentts_library=str(qwentts_library),
+        output_roots=tuple(str(p.resolve()) for p in (output_dir, document_project_dir)),
+        reference_roots=tuple(str(p.resolve()) for p in (REFERENCE_AUDIO_DIR, Path(preset_dir) / "reference_audio", upload_dir)),
     )
     performance_tuning = PerformanceTuningStore(performance_tuning_path)
     for profile_id, profile in runtime_manager.profiles.items():
@@ -114,6 +180,7 @@ def create_app(
         service_job_dir,
         max_active_jobs=64,
         close_callback=playback_coordinator.release,
+        playback_epoch=int(playback_coordinator.playback_epoch),
     )
     output_dir = Path(output_dir)
     upload_dir = Path(upload_dir)
@@ -121,6 +188,7 @@ def create_app(
     output_dir.mkdir(parents=True, exist_ok=True)
     upload_dir.mkdir(parents=True, exist_ok=True)
     reader_temp_dir.mkdir(parents=True, exist_ok=True)
+    storage_policy = StoragePolicy((output_dir, document_project_dir, service_job_dir, upload_dir))
     preset_store = VoicePresetStore(preset_dir)
     initial_recommendation = performance_tuning.recommendation(DEFAULT_MODEL_PROFILE)
     initial_parallel = (
@@ -144,6 +212,7 @@ def create_app(
     )
     should_preload_stt = bool(preload if stt_preload is None else stt_preload)
     def synthesize_for_profile_runtime(runtime: Any, request: StreamingRequest, *, output_dir: str | Path):
+        storage_policy.check_admission()
         # A queued request may target a different model from the one currently
         # resident. Apply shared scheduling only once its session is admitted.
         profile_id = getattr(runtime, "profile_id", None)
@@ -175,13 +244,20 @@ def create_app(
             recommendation["document_workers"] = min(recommendation["block_parallel"], max(1, int(document_parallel_generations)))
         else:
             runtime_manager.profiles[profile_id]["lanes"] = recommendation["block_parallel"]
-        if runtime_manager.status().get("active_profile") in {None, profile_id}:
+        active_profile = (
+            runtime_manager.active_profile
+            if hasattr(runtime_manager, "active_profile")
+            else runtime_manager.status().get("active_profile")
+        )
+        if active_profile in {None, profile_id}:
             generation_scheduler.configure_max_parallel(recommendation["block_parallel"])
             document_projects.configure_synthesis_workers(recommendation["document_workers"])
         return recommendation
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if getattr(ctx.blocking_executor, "_shutdown", False):
+            ctx.blocking_executor = ThreadPoolExecutor(max_workers=96, thread_name_prefix="qwen-wait")
         if preload:
             with runtime_manager.session(DEFAULT_MODEL_PROFILE):
                 pass
@@ -190,11 +266,52 @@ def create_app(
                 stt_runtime.start()
             except STTUnavailableError:
                 logging.exception("STT preload failed; TTS service will remain available")
+        def maintain_storage() -> None:
+            jobs.maintenance()
+            active_uploads = {str(Path(str(item.get("reference_audio_path"))).resolve())
+                              for item in jobs.list(limit=jobs.max_active_jobs + jobs.max_cached_jobs)
+                              if item.get("state") in {"queued", "loading_runtime", "running"}
+                              and item.get("reference_audio_path")}
+            cutoff = time.time() - 86400
+            for directory in (reader_temp_dir, upload_dir):
+                for path in directory.iterdir():
+                    try:
+                        if path.is_symlink() or not path.is_file() or str(path.resolve()) in active_uploads:
+                            continue
+                        if path.stat().st_mtime < cutoff:
+                            path.unlink(missing_ok=True)
+                    except OSError:
+                        logging.debug("temporary cache changed during maintenance: %s", path)
+            storage_policy.refresh()
+
+        async def maintenance_loop() -> None:
+            while True:
+                try:
+                    await asyncio.to_thread(maintain_storage)
+                except Exception:
+                    logging.exception("storage maintenance failed; retrying next minute")
+                await asyncio.sleep(60)
+
+        maintenance_task = asyncio.create_task(maintenance_loop())
         try:
             yield
         finally:
-            stt_runtime.close()
-            runtime_manager.close()
+            maintenance_task.cancel()
+            try:
+                await maintenance_task
+            except asyncio.CancelledError:
+                pass
+            ctx.stopping = True
+            ctx.tts_epoch += 1
+            ctx.stt_epoch += 1
+            playback_coordinator.force_stop()
+            generation_scheduler.cancel_pending()
+            jobs.shutdown()
+            document_projects.stop_all()
+            await asyncio.gather(asyncio.to_thread(stt_runtime.close), asyncio.to_thread(runtime_manager.close))
+            # Persist coalesced segment updates written while runs wound down.
+            await asyncio.to_thread(document_projects.close)
+            ctx.blocking_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Qwen3-TTS Apple Silicon Service", lifespan=lifespan)
     app.state.stt_runtime = stt_runtime
@@ -231,36 +348,15 @@ def create_app(
         resolved_access_password.encode("utf-8"), b"qwen-tts-service-session", hashlib.sha256
     ).hexdigest()
 
-    @app.middleware("http")
-    async def require_service_login(request: Request, call_next):
-        request.state.caller_kind = "internal" if request.client and request.client.host in {
-            "127.0.0.1", "::1", "localhost", "testclient"
-        } else "external"
-        if (
-            not resolved_access_password
-            or request.method == "OPTIONS"
-            or request.url.path in {"/login", "/api/health"}
-        ):
-            return await call_next(request)
-        supplied = request.cookies.get(SERVICE_AUTH_COOKIE, "")
-        authorization = request.headers.get("authorization", "")
-        bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
-        api_key = request.headers.get("x-api-key", "")
-        if (
-            hmac.compare_digest(supplied, expected_session)
-            or hmac.compare_digest(bearer, resolved_access_password)
-            or hmac.compare_digest(api_key, resolved_access_password)
-        ):
-            request.state.caller_kind = (
-                "internal"
-                if hmac.compare_digest(supplied, expected_session)
-                else "external"
-            )
-            return await call_next(request)
-        if request.url.path.startswith("/api/"):
-            return JSONResponse({"detail": "authentication required"}, status_code=401)
-        next_path = request.url.path if request.url.path.startswith("/") else "/"
-        return RedirectResponse(url=f"/login?next={next_path}", status_code=303)
+    # Added after CORS so it stays the outermost layer, as the former
+    # decorator-based middleware was.
+    app.add_middleware(
+        ServiceLoginMiddleware,
+        password=resolved_access_password,
+        expected_session=expected_session,
+        playback_epoch=lambda: playback_coordinator.playback_epoch,
+        tts_epoch=lambda: ctx.tts_epoch,
+    )
 
     def _remove_generated_result_files(result: dict[str, Any] | None) -> None:
         if not result:
@@ -374,7 +470,9 @@ def create_app(
         active_service_settings=active_service_settings,
         preset_payload=preset_payload,
         remove_generated_result_files=_remove_generated_result_files,
+        blocking_executor=ThreadPoolExecutor(max_workers=96, thread_name_prefix="qwen-wait"),
     )
+    app.state.storage_policy = storage_policy
     register_auth_pages_routes(app, ctx)
     register_generation_routes(app, ctx)
     register_voices_presets_routes(app, ctx)

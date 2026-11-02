@@ -175,6 +175,26 @@ class PlaybackCoordinator:
                 self._condition.notify_all()
             return released
 
+    @property
+    def playback_epoch(self) -> int:
+        """Lock-free read of the stop epoch (an int swap is atomic)."""
+        return self._stop_epoch
+
+    def shorten_lease(self, job_id: str, seconds: float) -> bool:
+        """Bring an active lease's deadline forward, never extend it.
+
+        A finished stream knows how much audio its client still has to play;
+        a client that never calls release then blocks others only that long.
+        """
+        with self._condition:
+            if self._active_job_id != str(job_id):
+                return False
+            deadline = time.monotonic() + max(0.0, float(seconds))
+            if self._active_deadline is None or deadline < self._active_deadline:
+                self._active_deadline = deadline
+                self._condition.notify_all()
+            return True
+
     def force_stop(self) -> dict[str, object]:
         with self._condition:
             active_job_id = self._active_job_id

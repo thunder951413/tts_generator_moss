@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The service itself imports torch at runtime; CI needs it plus the test runner.
-ci = ["torch>=2.2", "pytest>=8"]
+ci = ["torch>=2.2", "pytest>=8", "httpx2>=2,<3"]
 
 [tool.setuptools.packages.find]
 include = ["qwen_tts_service*"]

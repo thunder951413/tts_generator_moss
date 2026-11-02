@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-import torch
+import numpy as np
 
 def _safe_int(value: Any, *, default: int, minimum: int, maximum: int | None = None) -> int:
     try:
@@ -81,16 +81,32 @@ def _resolve_allowed_reference_audio_path(path: str, *roots: Path) -> Path:
     raise PermissionError("reference audio path is not allowed")
 
 
-def _pcm16le_bytes(waveform: torch.Tensor, channels: int = 2) -> bytes:
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
+def _pcm16le_bytes(audio: Any, channels: int = 2) -> bytes:
+    """Return interleaved little-endian int16 PCM for ``channels`` (1 or 2).
+
+    ``audio`` is either raw mono int16 bytes as produced by the worker (the
+    fast path: returned unchanged for mono, sample-duplicated for stereo), an
+    int16 numpy array, or a float waveform shaped ``(samples,)`` or
+    ``(channels, samples)`` in [-1, 1].
+    """
     target_channels = 1 if int(channels) == 1 else 2
+    if isinstance(audio, (bytes, bytearray, memoryview)):
+        if target_channels == 1:
+            return bytes(audio)
+        mono = np.frombuffer(audio, dtype="<i2")
+        return np.repeat(mono, 2).tobytes()
+    array = np.asarray(audio)
+    if array.ndim == 1:
+        array = array[np.newaxis, :]
+    if array.dtype != np.int16:
+        array = (np.clip(array.astype(np.float32, copy=False), -1.0, 1.0) * 32767.0).round().astype(np.int16)
     if target_channels == 1:
-        waveform = waveform.mean(dim=0, keepdim=True) if waveform.shape[0] > 1 else waveform[:1]
-    elif waveform.shape[0] == 1:
-        waveform = waveform.repeat(2, 1)
-    elif waveform.shape[0] > 2:
-        waveform = waveform[:2]
-    pcm = waveform.detach().cpu().to(torch.float32).clamp(-1.0, 1.0)
-    pcm = (pcm * 32767.0).round().to(torch.int16)
-    return pcm.transpose(0, 1).contiguous().numpy().tobytes()
+        if array.shape[0] > 1:
+            array = array.astype(np.int32).mean(axis=0, keepdims=True).round().astype(np.int16)
+        else:
+            array = array[:1]
+    elif array.shape[0] == 1:
+        array = np.repeat(array, 2, axis=0)
+    elif array.shape[0] > 2:
+        array = array[:2]
+    return np.ascontiguousarray(array.T).astype("<i2", copy=False).tobytes()

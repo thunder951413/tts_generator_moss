@@ -19,6 +19,8 @@ printf '%s\n' "$ROOT" > "$RESOURCES_DIR/repository-root.txt"
 xcrun swiftc \
   "$ROOT/macos/QwenReaderApp.swift" \
   -o "$MACOS_DIR/QwenReader" \
+  -O \
+  -whole-module-optimization \
   -parse-as-library \
   -target arm64-apple-macos13.0 \
   -framework AppKit \

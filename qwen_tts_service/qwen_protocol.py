@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass
@@ -33,6 +33,8 @@ class StreamingRequest:
     qwen_append_silence: bool = True
     qwen_instruct: str = ""
     qwen_min_new_tokens: int = 2
+    stream_audio: bool = True
+    cancelled: Callable[[], bool] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
-import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from presets import atomic_write_json
 
 
 DEFAULT_RECOMMENDATION = {
@@ -21,19 +23,34 @@ class PerformanceTuningStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._cache: tuple[tuple[int, int] | None, dict[str, Any]] | None = None
 
     def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"version": 1, "profiles": {}}
+        """Parsed store, re-read only when the file's mtime/size changes.
+
+        Every synthesis applies the performance profile, so this sits on the
+        hot path; callers receive a deep copy they may mutate.
+        """
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"version": 1, "profiles": {}}
+            stat = self.path.stat()
+            key: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = None
+        cached = self._cache
+        if cached is not None and cached[0] == key:
+            return copy.deepcopy(cached[1])
+        payload: Any = {"version": 1, "profiles": {}}
+        if key is not None:
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {"version": 1, "profiles": {}}
         if not isinstance(payload, dict):
-            return {"version": 1, "profiles": {}}
+            payload = {"version": 1, "profiles": {}}
         payload.setdefault("version", 1)
         payload.setdefault("profiles", {})
-        return payload
+        self._cache = (key, payload)
+        return copy.deepcopy(payload)
 
     def profile(self, profile_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -59,12 +76,8 @@ class PerformanceTuningStore:
             stored["profile_id"] = profile_id
             stored["updated_at"] = time.time()
             profiles[profile_id] = stored
-            temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.path)
+            atomic_write_json(self.path, payload)
+            self._cache = None
             return dict(stored)
 
     def public_payload(self) -> dict[str, Any]:

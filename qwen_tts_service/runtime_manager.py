@@ -13,8 +13,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-import torch
-
 from qwen_runtime import QwenWorkerRuntime
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +22,7 @@ MODEL_PROFILE_LABELS = {
     "qwen_1_7b": "Qwen3-TTS 1.7B（Metal 高质量克隆）",
 }
 DEFAULT_MODEL_PROFILE = "qwen_0_6b"
+AVAILABILITY_CACHE_SECONDS = 30.0
 
 
 class RuntimeSessionCancelled(RuntimeError):
@@ -43,6 +42,8 @@ class RuntimeManager:
         qwen_backend: str,
         qwen_quant: str,
         qwentts_library: str,
+        output_roots: tuple[str, ...] = (),
+        reference_roots: tuple[str, ...] = (),
     ) -> None:
         self.profiles = {
             "qwen_0_6b": {
@@ -79,6 +80,8 @@ class RuntimeManager:
         self.qwen_backend = str(qwen_backend)
         self.qwen_quant = str(qwen_quant)
         self.qwentts_library = str(qwentts_library)
+        self.output_roots = output_roots
+        self.reference_roots = reference_roots
         self.device = "metal"
         self.tts_device = "metal"
         self.codec_device = "metal"
@@ -102,6 +105,7 @@ class RuntimeManager:
         self._error: str | None = None
         self._load_started_at: float | None = None
         self._ready_at: float | None = None
+        self._availability: tuple[float, bool] | None = None
         self._session_wait_timeout = max(
             30.0,
             float(os.environ.get("QWEN_TTS_SESSION_WAIT_TIMEOUT", "600")),
@@ -116,6 +120,24 @@ class RuntimeManager:
                 self._ready_at = None
             elif state == "ready":
                 self._ready_at = time.time()
+
+    @property
+    def active_profile(self) -> str | None:
+        return self._active_profile
+
+    def _runtime_files_available(self) -> bool:
+        """File checks for /api/health, cached so polling never stats disks."""
+        cached = self._availability
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < AVAILABILITY_CACHE_SECONDS:
+            return cached[1]
+        available = (
+            Path(self.qwen_python).is_file()
+            and Path(self.qwen_worker_script).is_file()
+            and (not self.qwentts_library or Path(self.qwentts_library).expanduser().is_file())
+        )
+        self._availability = (now, available)
+        return available
 
     def status(self) -> dict[str, Any]:
         with self._status_lock:
@@ -137,9 +159,6 @@ class RuntimeManager:
                     "codec_weight_dtype": self.codec_weight_dtype,
                     "n_vq": None,
                     "sample_rate": None,
-                    "reference_cache_entries": 0,
-                    "reference_cache_hits": 0,
-                    "reference_cache_misses": 0,
                 }
             else:
                 runtime_status = {
@@ -147,16 +166,19 @@ class RuntimeManager:
                     "codec_weight_dtype": runtime.codec_weight_dtype,
                     "n_vq": int(runtime.n_vq),
                     "sample_rate": int(runtime.sample_rate),
-                    "reference_cache_entries": len(runtime.reference_audio_cache),
-                    "reference_cache_hits": int(runtime.reference_audio_cache_hits),
-                    "reference_cache_misses": int(runtime.reference_audio_cache_misses),
                 }
+            pool_status = runtime.pool_status() if runtime is not None and hasattr(runtime, "pool_status") else None
+        if pool_status is not None and state == "ready" and pool_status["state"] != "ready":
+            state = pool_status["state"]
+            error = pool_status.get("error")
+        available = self._runtime_files_available()
         elapsed = None
         if load_started_at is not None:
             elapsed = max(0.0, (ready_at or time.time()) - load_started_at)
         return {
             "state": state,
             "error": error,
+            "worker_pool": pool_status,
             "load_started_at": load_started_at,
             "ready_at": ready_at,
             "load_elapsed_seconds": elapsed,
@@ -174,43 +196,16 @@ class RuntimeManager:
             "codec_compute_dtype": self.codec_compute_dtype,
             "n_vq": runtime_status["n_vq"],
             "sample_rate": runtime_status["sample_rate"],
-            "reference_cache_entries": runtime_status["reference_cache_entries"],
-            "reference_cache_hits": runtime_status["reference_cache_hits"],
-            "reference_cache_misses": runtime_status["reference_cache_misses"],
             "profiles": [
                 {
                     "id": profile_id,
                     **profile,
-                    "available": (
-                        Path(self.qwen_python).is_file()
-                        and Path(self.qwen_worker_script).is_file()
-                        and (
-                            not self.qwentts_library
-                            or Path(self.qwentts_library).expanduser().is_file()
-                        )
-                    ),
+                    "available": available,
                     "loaded": profile_id == active_profile and runtime is not None,
                 }
                 for profile_id, profile in self.profiles.items()
             ],
         }
-
-    def preload_async(self) -> None:
-        with self._status_lock:
-            if self._runtime is not None or self._state == "loading":
-                return
-            if self._loader_thread is not None and self._loader_thread.is_alive():
-                return
-
-        def _load() -> None:
-            try:
-                with self.session(DEFAULT_MODEL_PROFILE):
-                    pass
-            except Exception:
-                logging.exception("failed to preload Qwen3-TTS Metal runtime")
-
-        self._loader_thread = threading.Thread(target=_load, name="qwen3-tts-metal-runtime-loader", daemon=True)
-        self._loader_thread.start()
 
     def _release_runtime(self) -> None:
         with self._session_condition:
@@ -227,8 +222,6 @@ class RuntimeManager:
             except Exception:
                 logging.exception("failed to close runtime")
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def close(self) -> None:
         # Invalidate current sessions and pending loads before waiting for the
@@ -254,11 +247,11 @@ class RuntimeManager:
 
     def interrupt_active(self) -> int:
         """Hard-stop active Metal worker processes without unloading the model controller."""
-        with self._lock:
+        with self._session_condition:
             runtime = self._runtime
-            if runtime is None or not hasattr(runtime, "interrupt_all"):
-                return 0
-            return int(runtime.interrupt_all())
+        if runtime is None or not hasattr(runtime, "interrupt_all"):
+            return 0
+        return int(runtime.interrupt_all())
 
     def _load(self, profile_id: str, generation: int | None = None) -> QwenWorkerRuntime:
         if profile_id not in self.profiles:
@@ -271,7 +264,7 @@ class RuntimeManager:
             with self._session_condition:
                 if generation != self._generation or self._closing:
                     raise RuntimeSessionCancelled("runtime session was invalidated")
-            if self._runtime is None or self._active_profile != profile_id:
+            if self._runtime is None or self._active_profile != profile_id or self._runtime_failed():
                 self._set_status(state="loading")
                 candidate: QwenWorkerRuntime | None = None
                 try:
@@ -291,6 +284,9 @@ class RuntimeManager:
                         lanes=int(profile.get("lanes") or 1),
                         base_port=int(profile["base_port"]),
                         log_dir=REPO_ROOT / "logs" / "qwen-workers",
+                        output_roots=self.output_roots,
+                        reference_roots=self.reference_roots,
+                        cancelled=lambda: generation != self._generation or self._closing,
                     )
                     with self._session_condition:
                         stale = generation != self._generation or self._closing
@@ -308,6 +304,10 @@ class RuntimeManager:
                     raise RuntimeSessionCancelled("runtime session was invalidated while loading")
                 self._set_status(state="ready")
             return self._runtime
+
+    def _runtime_failed(self) -> bool:
+        return bool(self._runtime is not None and hasattr(self._runtime, "pool_status")
+                    and self._runtime.pool_status()["state"] in {"error", "closed"})
 
     @contextmanager
     def session(
@@ -344,7 +344,7 @@ class RuntimeManager:
                     raise RuntimeSessionCancelled("runtime session was cancelled")
 
                 is_first = bool(self._session_waiters) and self._session_waiters[0] is waiter
-                same_runtime = self._active_profile == profile_id and self._runtime is not None
+                same_runtime = self._active_profile == profile_id and self._runtime is not None and not self._runtime_failed()
                 can_enter = (
                     is_first
                     and not self._closing
